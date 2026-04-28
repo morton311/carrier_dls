@@ -54,20 +54,22 @@ class dls_long_Config_3D_Flexible:
         )
 
 
-def _node_map() -> np.ndarray:
+def _node_map(opp=False) -> np.ndarray:
     # shape: (3, 8)
-    return np.array(
-        [
-            [1, 0, 1],
-            [1, 1, 1],
-            [1, 1, 0],
-            [1, 0, 0],
-            [0, 0, 1],
-            [0, 1, 1],
-            [0, 1, 0],
-            [0, 0, 0],
-        ]
-    ).T
+    IJK = np.array([
+        [1, 0, 1],
+        [1, 1, 1],
+        [1, 1, 0],
+        [1, 0, 0],
+        [0, 0, 1],
+        [0, 1, 1],
+        [0, 1, 0],
+        [0, 0, 0]
+        ]).T
+    if opp:
+        diag_opp_indx = [6, 7, 4, 5, 2, 3, 0, 1]
+        IJK = IJK[:, diag_opp_indx]
+    return IJK
 
 
 def _build_lltogl(
@@ -84,7 +86,7 @@ def _build_lltogl(
         indx_dof_start = (
             (i + IJK[0, node]) * ny_g * nz_g
             + (j + IJK[1, node]) * nz_g
-            + (k + IJK[2, node])
+            + (k + IJK[2, node]) 
         ) * dof_node
         idx_dof_end = indx_dof_start + dof_node
         lltogl[node * dof_node : (node + 1) * dof_node] = np.arange(indx_dof_start, idx_dof_end)
@@ -187,6 +189,7 @@ def gfem_3d_long_flexible(
     print("number of batches:", num_snaps // batch_size)
     print("nx:", nx)
     print("ny:", ny)
+    print("nz:", nz)
     print("num_vars:", ndim)
 
     print("Performing modal decomposition to get local modes")
@@ -294,9 +297,9 @@ def gfem_3d_long_flexible(
                                 Q_local_v_vec[iind, :] = Q_local_v[kx, ky, kz, :]
                                 Q_local_w_vec[iind, :] = Q_local_w[kx, ky, kz, :]
 
-                    L_u[lltogl, :] += modemat_local_u.T @ Q_local_u_vec
-                    L_v[lltogl, :] += modemat_local_v.T @ Q_local_v_vec
-                    L_w[lltogl, :] += modemat_local_w.T @ Q_local_w_vec
+                    L_u[lltogl, :] += modemat_local_wt_u.T @ Q_local_u_vec
+                    L_v[lltogl, :] += modemat_local_wt_v.T @ Q_local_v_vec
+                    L_w[lltogl, :] += modemat_local_wt_w.T @ Q_local_w_vec
 
         dof_u_all[snap_start:snap_end, :] = solve_M_u(L_u).T.astype(np.float32)
         dof_v_all[snap_start:snap_end, :] = solve_M_v(L_v).T.astype(np.float32)

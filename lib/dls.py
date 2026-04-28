@@ -161,6 +161,17 @@ def local_modemat_over_elem(x_grid, y_grid, z_grid, nskip, modes_vec, num_modes,
     F5 = list(range(0, mid_pt))
     F6 = list(range(mid_pt - 1, patch_size))
 
+    indices = [
+        (F2, F3, F6), # 1
+        (F2, F4, F6), # 2
+        (F2, F4, F5), # 3
+        (F2, F3, F5), # 4
+        (F1, F3, F6), # 5
+        (F1, F4, F6), # 6
+        (F1, F4, F5), # 7
+        (F1, F3, F5)  # 8
+    ]
+
     modes_grid_1_comp = np.zeros((mid_pt, mid_pt, mid_pt, num_modes))
     modes_grid_2_comp = np.zeros((mid_pt, mid_pt, mid_pt, num_modes))
     modes_grid_3_comp = np.zeros((mid_pt, mid_pt, mid_pt, num_modes))
@@ -497,9 +508,9 @@ def gfem_3d_long(data_path: str, field_name: str, latent_file: str, patch_size: 
                                     Q_local_v_vec[iind, :] = Q_local_v[kx, ky, kz, :]
                                     Q_local_w_vec[iind, :] = Q_local_w[kx, ky, kz, :]
                         
-                        L_local_u = modemat_local_u.T @ Q_local_u_vec
-                        L_local_v = modemat_local_v.T @ Q_local_v_vec
-                        L_local_w = modemat_local_w.T @ Q_local_w_vec
+                        L_local_u = modemat_local_wt_u.T @ Q_local_u_vec
+                        L_local_v = modemat_local_wt_v.T @ Q_local_v_vec
+                        L_local_w = modemat_local_wt_w.T @ Q_local_w_vec
 
                         L_u[lltogl, :] += L_local_u
                         L_v[lltogl, :] += L_local_v
@@ -576,7 +587,10 @@ def gfem_recon_long_3D(rec_path, config, dof_u=None, dof_v=None, dof_w=None, bat
         [0, 1, 0],
         [0, 0, 0]
         ]).T
-    
+
+    diag_opp_indx = [6, 7, 4, 5, 2, 3, 0, 1]
+    IJK = IJK[:, diag_opp_indx]
+
     nskip = config.nskip
     dof_node = config.dof_node # DOFs/node
     dof_elem = config.dof_elem # DOFs/element
@@ -614,6 +628,8 @@ def gfem_recon_long_3D(rec_path, config, dof_u=None, dof_v=None, dof_w=None, bat
                         dof_local_v = dof_v[lltogl, snap_start:snap_end]
                         dof_local_w = dof_w[lltogl, snap_start:snap_end]
 
+                        
+                        
                         Q_local_u_vec = config.modemat_local_u @ dof_local_u
                         Q_local_v_vec = config.modemat_local_v @ dof_local_v
                         Q_local_w_vec = config.modemat_local_w @ dof_local_w
