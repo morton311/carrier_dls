@@ -417,8 +417,8 @@ def gfem_recon_long_3D_flexible(
                     Q_rec_u[indx_cell:indx_cell + nskip + 1, indy_cell:indy_cell + nskip + 1, indz_cell:indz_cell + nskip + 1, :] = Q_local_u
                     Q_rec_v[indx_cell:indx_cell + nskip + 1, indy_cell:indy_cell + nskip + 1, indz_cell:indz_cell + nskip + 1, :] = Q_local_v
                     Q_rec_w[indx_cell:indx_cell + nskip + 1, indy_cell:indy_cell + nskip + 1, indz_cell:indz_cell + nskip + 1, :] = Q_local_w
-
-                    t_time += time.time() - start_time
+                    compute_time = time.time() 
+                    t_time += compute_time - start_time
 
         q_rec[snap_start:snap_end, :, :, :, 0] = Q_rec_u.transpose(3, 0, 1, 2)
         q_rec[snap_start:snap_end, :, :, :, 1] = Q_rec_v.transpose(3, 0, 1, 2)
@@ -434,6 +434,8 @@ def gfem_recon_long_3D_flexible(
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+    if batch_time < 1:
+        t_time = t_time/1000  # convert from ms if under 1s
     sys.stdout.write(f"Total reconstruction time not with saving to disk: {t_time:.2f}s\n\n")
 
     if rec_target is None:

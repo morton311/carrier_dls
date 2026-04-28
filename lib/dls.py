@@ -82,8 +82,7 @@ def random_patch_sampling(data, patch_size):
 
 
 def Modal_decomp(data, patch_size):
-    data_shape = 'fat' if data.shape[0] < data.shape[1] else 'tall'
-    print(f"NYI ----- Data shape: {data.shape}, treating as {data_shape} for SVD")
+    data_shape = 'fat' if data.shape[0] < data.shape[1] else 'tall' # not yet implemented
     P = random_patch_sampling(data, patch_size)
     local_modes, eigVal, _ = np.linalg.svd(P, full_matrices=False)
     return local_modes, eigVal
