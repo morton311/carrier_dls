@@ -49,9 +49,9 @@ if __name__ == "__main__":
     elif run.config['mode'] == 'latent':
         from lib.dls import latent_eval
         latent_eval(run)
-    elif run.config['mode'] == 'anim':
-        from lib.plotting import animate
-        animate(run)
+    # elif run.config['mode'] == 'anim':
+    #     from lib.plotting import animate
+    #     animate(run)
     
     # copy the config file to the model directory
     shutil.copy(args.c, run.paths_bib.model_dir + os.path.basename(args.c))
