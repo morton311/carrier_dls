@@ -11,33 +11,21 @@ class pathsBib:
         ############################
         # Data info initialization #
         ############################
-        for key in config['train_data'].keys():
-            data_path = config['train_data'][key].get('data_path')
-            data_name = config['train_data'][key].get('data_name')
+        data_sources = ['train_data', 'eval_data']
+        for data_source in data_sources:
+            for key in config[data_source].keys():
+                data_path = config[data_source][key].get('data_path')
+                data_name = config[data_source][key].get('data_name')
 
-            if data_path:
-                data_path_obj = Path(data_path).expanduser()
-                config['train_data'][key]['data_path'] = str(data_path_obj)
-                if not data_name:
-                    config['train_data'][key]['data_name'] = data_path_obj.stem
-            else:
-                if not data_name:
-                    raise ValueError(f"Config for train_data '{key}' must include either 'data_name' or 'data_path'.")
-                config['train_data'][key]['data_path'] = self.data_dir + data_name + '.h5'
-
-        for key in config['eval_data'].keys():
-            data_path = config['eval_data'][key].get('data_path')
-            data_name = config['eval_data'][key].get('data_name')
-
-            if data_path:
-                data_path_obj = Path(data_path).expanduser()
-                config['eval_data'][key]['data_path'] = str(data_path_obj)
-                if not data_name:
-                    config['eval_data'][key]['data_name'] = data_path_obj.stem
-            else:
-                if not data_name:
-                    raise ValueError(f"Config for eval_data '{key}' must include either 'data_name' or 'data_path'.")
-                config['eval_data'][key]['data_path'] = self.data_dir + data_name + '.h5'
+                if data_path:
+                    data_path_obj = Path(data_path).expanduser()
+                    config[data_source][key]['data_path'] = str(data_path_obj)
+                    if not data_name:
+                        config[data_source][key]['data_name'] = data_path_obj.stem
+                else:
+                    if not data_name:
+                        raise ValueError(f"Config for {data_source} '{key}' must include either 'data_name' or 'data_path'.")
+                    config[data_source][key]['data_path'] = self.data_dir + data_name + '.h5'
         
         ##############################
         # Latent info initialization #

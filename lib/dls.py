@@ -70,6 +70,40 @@ def _node_map(opp=False) -> np.ndarray:
     return IJK
 
 
+def _build_wt_vec(nskip: int) -> np.ndarray:
+    Wt = np.ones((nskip+1, nskip+1, nskip+1))
+    
+    # Face centers: 1/2
+    for i in range(nskip+1):
+        for j in range(nskip+1):
+            Wt[i, j, 0] = Wt[i, j, nskip] = 1/2
+            Wt[0, i, j] = Wt[nskip, i, j] = 1/2
+            Wt[i, 0, j] = Wt[i, nskip, j] = 1/2
+    
+    # Edge centers: 1/4
+    edges = [(0, 0), 
+             (0, nskip), 
+             (nskip, 0), 
+             (nskip, nskip)]
+    for i in range(nskip+1):
+        for a, b in edges:
+            Wt[i, a, b] = Wt[a, i, b] = Wt[a, b, i] = 1/4
+    
+    # Corner vertices: 1/8
+    corners = [(0, 0, 0), 
+               (nskip, 0, 0), 
+               (0, nskip, 0), 
+               (0, 0, nskip),
+               (nskip, nskip, 0), 
+               (nskip, 0, nskip), 
+               (0, nskip, nskip), 
+               (nskip, nskip, nskip)]
+    for corner in corners:
+        Wt[corner] = 1/8
+    
+    Wt_vec = Wt.reshape((nskip+1)**3, order='F')
+    return Wt_vec
+
 def _build_lltogl(
     i: int,
     j: int,
@@ -384,37 +418,7 @@ def local_modemat_over_elem(x_grid, y_grid, z_grid, nskip, modes_vec, num_modes,
         N8[:, np.newaxis], N8[:, np.newaxis]*modes_vec_comp2
     ])
 
-    Wt = np.ones((nskip+1, nskip+1, nskip+1))
-    
-    # Face centers: 1/2
-    for i in range(nskip+1):
-        for j in range(nskip+1):
-            Wt[i, j, 0] = Wt[i, j, nskip] = 1/2
-            Wt[0, i, j] = Wt[nskip, i, j] = 1/2
-            Wt[i, 0, j] = Wt[i, nskip, j] = 1/2
-    
-    # Edge centers: 1/4
-    edges = [(0, 0), 
-             (0, nskip), 
-             (nskip, 0), 
-             (nskip, nskip)]
-    for i in range(nskip+1):
-        for a, b in edges:
-            Wt[i, a, b] = Wt[a, i, b] = Wt[a, b, i] = 1/4
-    
-    # Corner vertices: 1/8
-    corners = [(0, 0, 0), 
-               (nskip, 0, 0), 
-               (0, nskip, 0), 
-               (0, 0, nskip),
-               (nskip, nskip, 0), 
-               (nskip, 0, nskip), 
-               (0, nskip, nskip), 
-               (nskip, nskip, nskip)]
-    for corner in corners:
-        Wt[corner] = 1/8
-    
-    Wt_vec = Wt.reshape((nskip+1)**3, order='F')
+    Wt_vec = _build_wt_vec(nskip)
 
     modemat_local_wt = modemat_local.copy()
     for kk in range(dof_elem):
@@ -428,8 +432,10 @@ def gfem_3d_compress_flexible(
     field_name: str,
     patch_size: int,
     num_modes: int,
+    group_name: Optional[str] = None,
     latent_target: Optional[Union[str, Dict[str, np.ndarray]]] = None,
     batch_size: int = 2500,
+    dls_config: Optional[dls_long_Config_3D_Flexible] = None
 ):
     """
     Flexible variant of gfem_3d_long.
@@ -468,23 +474,40 @@ def gfem_3d_compress_flexible(
     print("nz:", nz)
     print("num_vars:", ndim)
 
-    print("Performing modal decomposition to get local modes")
-    local_modes_u, _ = Modal_decomp(mode_data[..., 0], patch_size)
-    local_modes_v, _ = Modal_decomp(mode_data[..., 1], patch_size)
-    local_modes_w, _ = Modal_decomp(mode_data[..., 2], patch_size)
-    print("Modal decomposition done")
+    if dls_config is None:
+        print("Performing modal decomposition to get local modes")
+        local_modes_u, _ = Modal_decomp(mode_data[..., 0], patch_size)
+        local_modes_v, _ = Modal_decomp(mode_data[..., 1], patch_size)
+        local_modes_w, _ = Modal_decomp(mode_data[..., 2], patch_size)
+        print("Modal decomposition done")
 
-    print("Constructing local modal matrices")
-    modemat_local_u, modemat_local_wt_u = local_modemat_over_elem(
-        grid_x, grid_y, grid_z, nskip, local_modes_u, num_modes, patch_size
-    )
-    modemat_local_v, modemat_local_wt_v = local_modemat_over_elem(
-        grid_x, grid_y, grid_z, nskip, local_modes_v, num_modes, patch_size
-    )
-    modemat_local_w, modemat_local_wt_w = local_modemat_over_elem(
-        grid_x, grid_y, grid_z, nskip, local_modes_w, num_modes, patch_size
-    )
-    print("Local modal matrices constructed")
+        print("Constructing local modal matrices")
+        modemat_local_u, modemat_local_wt_u = local_modemat_over_elem(
+            grid_x, grid_y, grid_z, nskip, local_modes_u, num_modes, patch_size
+        )
+        modemat_local_v, modemat_local_wt_v = local_modemat_over_elem(
+            grid_x, grid_y, grid_z, nskip, local_modes_v, num_modes, patch_size
+        )
+        modemat_local_w, modemat_local_wt_w = local_modemat_over_elem(
+            grid_x, grid_y, grid_z, nskip, local_modes_w, num_modes, patch_size
+        )
+        print("Local modal matrices constructed")
+    else:
+        modemat_local_u = dls_config.modemat_local_u
+        modemat_local_v = dls_config.modemat_local_v
+        modemat_local_w = dls_config.modemat_local_w
+        print("Using provided local modal matrices from dls_config")
+
+        Wt_vec = _build_wt_vec(nskip)
+        modemat_local_wt_u = modemat_local_u.copy()
+        modemat_local_wt_v = modemat_local_v.copy()
+        modemat_local_wt_w = modemat_local_w.copy()
+        for kk in range(dof_elem):
+            modemat_local_wt_u[:, kk] *= Wt_vec
+            modemat_local_wt_v[:, kk] *= Wt_vec
+            modemat_local_wt_w[:, kk] *= Wt_vec
+        print("Constructed weighted local modal matrices from provided local modal matrices")
+
 
     # With a uniform/structured mesh in this formulation, one local mass matrix is reused.
     M_local_u = modemat_local_wt_u.T @ modemat_local_u
@@ -585,18 +608,6 @@ def gfem_3d_compress_flexible(
 
     print(f"Solved for dofs in {total_time:.2f} seconds")
 
-    if latent_target is None:
-        pass
-    elif isinstance(latent_target, str):
-        with h5py.File(latent_target, "w") as dof_file:
-            dof_file.create_dataset("dof_u", data=dof_u_all, dtype="float32")
-            dof_file.create_dataset("dof_v", data=dof_v_all, dtype="float32")
-            dof_file.create_dataset("dof_w", data=dof_w_all, dtype="float32")
-    else:
-        latent_target["dof_u"] = dof_u_all
-        latent_target["dof_v"] = dof_v_all
-        latent_target["dof_w"] = dof_w_all
-
     config = dls_long_Config_3D_Flexible(
         num_snaps=num_snaps,
         nx=nx,
@@ -610,7 +621,24 @@ def gfem_3d_compress_flexible(
         modemat_local_w=modemat_local_w,
     )
 
-    return config, dof_u_all, dof_v_all, dof_w_all
+    if latent_target is None:
+        return config, dof_u_all, dof_v_all, dof_w_all
+    elif isinstance(latent_target, str):
+        with h5py.File(latent_target, "w") as dof_file:
+            grp = dof_file.create_group(group_name if group_name else "dofs")
+            grp.create_dataset("dof_u", data=dof_u_all, dtype="float32")
+            grp.create_dataset("dof_v", data=dof_v_all, dtype="float32")
+            grp.create_dataset("dof_w", data=dof_w_all, dtype="float32")
+        return config
+    else:
+        latent_target["dof_u"] = dof_u_all
+        latent_target["dof_v"] = dof_v_all
+        latent_target["dof_w"] = dof_w_all
+        return config
+
+    
+
+    
 
 
 def gfem_3d_recon_flexible(
