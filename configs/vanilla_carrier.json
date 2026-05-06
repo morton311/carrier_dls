@@ -24,13 +24,13 @@
         {
             "name" : "carrier_dls",
             "path" : "placeholder",
-            "val_split" : 0,
+            "train_split" : 1,
             "test_split" : 0.1
         },
         {
             "name" : "carrier_dls2",
             "path" : "placeholder2",
-            "val_split" : 0.5,
+            "train_split" : 0.5,
             "test_split" : 0.1
         }
     ],
@@ -38,6 +38,6 @@
     "eval_data" : {
         "name" : "carrier_dls_eval",
         "path" : "placeholder_eval",
-        "pred_split" : -0.1
+        "pred_split" : 0.5
     }
 }

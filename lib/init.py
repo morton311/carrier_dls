@@ -68,6 +68,7 @@ class pathsBib:
 
         self.latent_dir = 'results/' + self.latent_id + '/'
         self.latent_path = self.latent_dir + 'latent_coeff.h5'
+        self.latent_config_path = self.latent_dir + 'latent_config.pkl'
         self.latent_model_path = self.latent_dir + 'latent_model.pth'
         self.model_dir = self.latent_dir + self.model_id + '/'
         self.log_dir = self.model_dir + 'logs/'
