@@ -31,9 +31,11 @@
         }
     ],
 
-    "eval_data" : {
-        "name" : "0aoa",
-        "path" : "gencarr_transpose",
-        "pred_split" : 0.1
-    }
+    "eval_data" : [
+        {
+            "name" : "0aoa",
+            "path" : "gencarr_transpose",
+            "pred_split" : 0.1
+        }
+]
 }

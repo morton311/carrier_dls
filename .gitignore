@@ -2,3 +2,5 @@
 *.png
 lib/__pycache__*
 *.out
+*.pkl
+results/*

@@ -110,9 +110,10 @@ class runner(nn.Module):
         print("Latent coefficient config saved")
 
         for data_source in self.data_sources:
+            print(f"Processing data source {data_source} for latent coefficient computation...")
             if self.config[data_source] is not None:
                 for id, source in enumerate(self.config[data_source]):
-                    print(source)
+                    source_config = source
                     path = source.get('path')
                     path = self.paths_bib.data_dir + path + '.h5'
                     data_name = source.get('name')
@@ -145,9 +146,9 @@ class runner(nn.Module):
                     snaps[data_source] = {}
                     if self.config[data_source] is not None:
                         for id, source in enumerate(self.config[data_source]):
-                            path = source.get('data_path')
+                            path = source.get('path')
                             path = self.paths_bib.data_dir + path + '.h5'
-                            data_name = source.get('data_name')
+                            data_name = source.get('name')
                             snaps[data_source][data_name] = {}
                             snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
                             print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]}")
