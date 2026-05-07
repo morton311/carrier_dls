@@ -91,8 +91,6 @@ class runner(nn.Module):
         print("Computing latent coefficients...")
         # compute the latent coefficients from source data
         print(f"Source path: {self.paths_bib.source_path}")
-        with h5py.File(self.paths_bib.source_path, 'r') as f:
-            self.config['ndim'] = f['UV'].shape[-1] 
 
         if self.config['latent_params']['type'] == 'dls':
             latent_config = dls.gfem_3d_compress_flexible(
@@ -164,7 +162,9 @@ class runner(nn.Module):
                                 indices = self._split_indices(snaps[data_source][data_name]['total'], 
                                                             train_split=1-source['pred_split'])
 
-                            snaps[data_source][data_name]['idx'] = indices
+                            snaps[data_source][data_name]['train_indices'] = indices['train_indices']
+                            snaps[data_source][data_name]['test_indices'] = indices['test_indices']
+                            snaps[data_source][data_name]['val_indices'] = indices['val_indices']
                 
                 with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
                     pickle.dump(snaps, f)
@@ -179,6 +179,7 @@ class runner(nn.Module):
             latent_keys = list(f.keys())
             if self.config['latent_params']['type'] == 'dls':
                 input_dim = 3 * f[latent_keys[0]]['dof_u'].shape[1]
+        print(f"Input dimension for model: {input_dim}")
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
             
@@ -367,33 +368,35 @@ class runner(nn.Module):
             self.test_sampler = {}
             
             with h5py.File(self.paths_bib.latent_path, 'r') as f:
-            
-                for name in self.config['group_names']['train_data']:
-                    
+                for id, source in enumerate(self.config['train_data']):
+                    name = source.get('name')
+                    print(f"indices keys {self.indices['train_data'].keys()}")
+                    train_indices = self.indices['train_data'][name]['train_indices']
+                    test_indices = self.indices['train_data'][name]['test_indices']
+
+
                     if self.config['latent_params']['type'] == 'dls':
                         dof_u = f[name]['dof_u']
                         dof_v = f[name]['dof_v']
-                        dof_w = f[name]['dof_w'] if self.config['ndim'] == 3 else None
+                        dof_w = f[name]['dof_w']
                         # Compute mean and std using only the training indices, in chunks to save memory
-                        dofs = torch.zeros(len(self.train_indices), dof_dim)
-                        for i, idx in enumerate(self.train_indices):
+                        dofs = torch.zeros(len(train_indices), dof_dim)
+                        for i, idx in enumerate(train_indices):
                             u = torch.from_numpy(dof_u[idx:idx+1]).float()
                             v = torch.from_numpy(dof_v[idx:idx+1]).float()
-                            w = torch.from_numpy(dof_w[idx:idx+1]).float() if dof_w is not None else None
-                            if w is not None:
-                                dofs[i] = torch.cat((u, v, w), dim=1)
-                            else:
-                                dofs[i] = torch.cat((u, v), dim=1)
+                            w = torch.from_numpy(dof_w[idx:idx+1]).float()
+                            dofs[i] = torch.cat((u, v, w), dim=1)
+
                     elif self.config['latent_params']['type'] == 'pod':
                         dofs_not_scaled = f[name]['dofs']
-                        dofs = torch.zeros(len(self.train_indices), dof_dim)
-                        for i, idx in enumerate(self.train_indices):
+                        dofs = torch.zeros(len(train_indices), dof_dim)
+                        for i, idx in enumerate(train_indices):
                             dofs[i] = torch.from_numpy(dofs_not_scaled[idx:idx+1, :dof_dim]).float()
 
                     elif self.config['latent_params']['type'] == 'bvae':
                         dofs_not_scaled = f[name]['dofs']
-                        dofs = torch.zeros(len(self.train_indices), dof_dim)
-                        for i, idx in enumerate(self.train_indices):
+                        dofs = torch.zeros(len(train_indices), dof_dim)
+                        for i, idx in enumerate(train_indices):
                             dofs[i] = torch.from_numpy(dofs_not_scaled[idx:idx+1, :dof_dim]).float()
                             
                     self.dof_mean[name] = torch.mean(dofs, dim=0)
@@ -406,11 +409,9 @@ class runner(nn.Module):
                         if latent_type == 'dls':
                             u = torch.from_numpy(dof_u[idx:idx+length]).float()
                             v = torch.from_numpy(dof_v[idx:idx+length]).float()
-                            w = torch.from_numpy(dof_w[idx:idx+length]).float() if dof_w is not None else None
-                            if w is not None:
-                                dof = torch.cat((u, v, w), dim=1)
-                            else:
-                                dof = torch.cat((u, v), dim=1)
+                            w = torch.from_numpy(dof_w[idx:idx+length]).float()
+                            dof = torch.cat((u, v, w), dim=1)
+
                         elif latent_type == 'pod':
                             dof = torch.from_numpy(dofs_not_scaled[idx:idx+length, :dof_dim]).float()
                         elif latent_type == 'bvae':
@@ -419,22 +420,22 @@ class runner(nn.Module):
                         return dof
 
                     # Prepare lists for X/Y, then stack at the end
-                    X_train, Y_train = torch.zeros(len(self.train_indices), tl, dof_dim), torch.zeros(len(self.train_indices), ta, dof_dim)
-                    for i, idx in enumerate(self.train_indices):
+                    X_train, Y_train = torch.zeros(len(train_indices), tl, dof_dim), torch.zeros(len(train_indices), ta, dof_dim)
+                    for i, idx in enumerate(train_indices):
                         dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
                         X_train[i] = dof_seq[:tl]
                         Y_train[i] = dof_seq[tl:tl+ta]
                         if i % 500 == 0:
-                            print(f"Got train data {i}/{len(self.train_indices)}")
+                            print(f"Got train data {i}/{len(train_indices)}")
                     print('Got train data')
 
-                    X_test, Y_test = torch.zeros(len(self.test_indices), tl, dof_dim), torch.zeros(len(self.test_indices), ta, dof_dim)
-                    for i, idx in enumerate(self.test_indices):
+                    X_test, Y_test = torch.zeros(len(test_indices), tl, dof_dim), torch.zeros(len(test_indices), ta, dof_dim)
+                    for i, idx in enumerate(test_indices):
                         dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
                         X_test[i] = dof_seq[:tl]
                         Y_test[i] = dof_seq[tl:tl+ta]
                         if i % 100 == 0:
-                            print(f"Got test data {i}/{len(self.test_indices)}")
+                            print(f"Got test data {i}/{len(test_indices)}")
                     print('Got test data')
 
 
@@ -485,7 +486,8 @@ class runner(nn.Module):
                     self.sampler.set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
 
                 ## --------------------------------------- Train ---------------------------------------
-                for loader in self.train_loader: 
+                for key in self.train_loader: 
+                    loader = self.train_loader[key]
                     for inputs, targets in loader: 
                         inputs, targets = inputs, targets
                         self.optimizer.zero_grad()
@@ -519,7 +521,8 @@ class runner(nn.Module):
                 self.model.eval()
                 test_loss = 0
                 with torch.no_grad():
-                    for loader in self.test_loader:
+                    for key in self.test_loader:
+                        loader = self.test_loader[key]
                         for inputs, targets in loader:
                             inputs, targets = inputs, targets
                             for n in range(targets.shape[1]):

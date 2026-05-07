@@ -1,16 +1,20 @@
 {
     "model_params" : {
-        "model_name" : "vanilla_carrier",
-        "model_type" : "tr_enc",
-        "time_lag" : 10,
+        "model_name" :  "vanilla_carrier",
+        "model_type" :  "tr_enc",
+        "time_lag" :    20,
         "train_ahead" : 5,
-        "num_layers" : 2,
-        "nhead" : 4,
-        "d_model" : 128,
-        "lr" : 0.001,
-        "batch_size" : 64,
-        "num_epochs" : 100,
-        "patience" : 10
+        "num_layers" :  4,
+        "nhead" :       4,
+        "d_model":      1024,
+        "ff_dim":       3072,
+        "lr" :          0.001,
+        "batch_size" :  64,
+        "num_epochs" :  1000,
+        "patience" :    10,
+        "gamma" :       1,
+        "activation":   "swiglu",
+        "prenorm":      false
     },
     
     "latent_params" : {
