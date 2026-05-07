@@ -13,6 +13,7 @@ parser.add_argument('-c', type=str, default='config.json', help='Name or whole p
 parser.add_argument('-o', choices=['l', 'm', 'r', 'x'], default='x', help="Overwrite: 'l' for latent space, 'm' for model, 'r' for results, or None")
 parser.add_argument('-m', choices=['train', 'eval', 'pred', 'test','latent', 'anim'], default='test', help="Mode: 'train' for training, 'eval' for evaluation")
 parser.add_argument('-log', choices=['file', 'terminal'], default='file', help="Log output to file or terminal")
+parser.add_argument('-d', choices=['True', 'False'], default='False', help="Run in distributed mode")
 args = parser.parse_args()
 
 # Check if arg contains directory name and/or .json
@@ -35,6 +36,10 @@ if __name__ == "__main__":
     config['mode'] = args.m 
     config['name'] = os.path.basename(args.c).replace('.json', '')
     config['log'] = args.log
+    if args.d == 'True':
+        config['distributed'] = True
+    else:
+        config['distributed'] = False
 
     device = ('cuda' if torch.cuda.is_available() else "cpu")
     config['device'] = device

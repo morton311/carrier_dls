@@ -14,32 +14,26 @@
     },
     
     "latent_params" : {
+        "type" : "dls",
         "patch_size" : 19,
         "num_modes" : 10,
         "source_name" : "0aoa",
-        "source_path" : "placeholder"
+        "source_path" : "gencarr_transpose",
+        "batch_size" : 64
     },
 
     "train_data" : [
         {
-            "name" : "carrier_dls",
-            "path" : "placeholder",
-            "train_split" : 1,
-            "test_split" : 0.1
-        },
-        {
-            "name" : "carrier_dls2",
-            "path" : "placeholder2",
-            "train_split" : 0.5,
+            "name" : "0aoa",
+            "path" : "gencarr_transpose",
+            "train_split" : 0.9,
             "test_split" : 0.1
         }
     ],
 
-    "eval_data" : [
-        {
-            "name" : "carrier_dls_eval",
-            "path" : "placeholder_eval",
-            "pred_split" : 0.5
-        }
-    ]
+    "eval_data" : {
+        "name" : "0aoa",
+        "path" : "gencarr_transpose",
+        "pred_split" : 0.1
+    }
 }

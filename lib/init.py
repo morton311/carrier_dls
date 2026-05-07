@@ -11,51 +11,51 @@ class pathsBib:
         ############################
         # Data info initialization #
         ############################
+        self.data_dir = 'data/'
         data_sources = ['train_data', 'eval_data']
+        data_dict = {}
         for data_source in data_sources:
-            for key in config[data_source].keys():
-                data_path = config[data_source][key].get('data_path')
-                data_name = config[data_source][key].get('data_name')
-
-                if data_path:
+            data_dict[data_source] = {}
+            for info in data_dict[data_source]:
+                print(f"Processing {data_source} entry: {info}")
+                data_path = info.get('path', False)
+                data_name = info.get('name', False)
+                
+                if data_name:
                     data_path_obj = Path(data_path).expanduser()
-                    config[data_source][key]['data_path'] = str(data_path_obj)
-                    if not data_name:
-                        config[data_source][key]['data_name'] = data_path_obj.stem
+                    data_dict[data_source][data_name] = info
+                    data_dict[data_source][data_name]['path'] = self.data_dir  + str(data_path_obj) + '.h5'
+                elif data_path:
+                    data_path_obj = Path(data_path).expanduser()
+                    data_name = data_path_obj.stem
+                    data_dict[data_source][data_name] = info
+                    data_dict[data_source][data_name]['path'] = self.data_dir  + str(data_path_obj) + '.h5'
                 else:
-                    if not data_name:
-                        raise ValueError(f"Config for {data_source} '{key}' must include either 'data_name' or 'data_path'.")
-                    config[data_source][key]['data_path'] = self.data_dir + data_name + '.h5'
-        
+                    print(f"Error: No data path or name specified for {data_source} entry: {info}")
+        self.data_dict = data_dict
         ##############################
         # Latent info initialization #
         ##############################
 
-        if config['latent_params'].get('source_path') or config['latent_params'].get('source_name'):
-            if not config['latent_params'].get('source_name'):
-                source_path_obj = Path(config['latent_params']['source_path']).expanduser()
-                source = source_path_obj.stem
-                config['latent_params']['source_name'] = source
-            elif not config['latent_params'].get('source_path'):
-                config['latent_params']['source_path'] = self.data_dir + config['latent_params']['source_name'] + '.h5'
+        source_name = config['latent_params'].get('source_name', None)
+        if source_name is None:
+            print("Error: No source name specified in latent_params")
+        source_path = config['latent_params'].get('source_path', None)
+        if source_path is None:
+            print("Error: No source path specified in latent_params")
 
-        else:
-            print("No source specified for latent parameters, using first train_data as source.")
-            keys = config['train_data'].keys()
-            source = config['train_data'][list(keys)[0]]['data_name']
-            config['latent_params']['source_name'] = source
-            config['latent_params']['source_path'] = config['train_data'][list(keys)[0]]['data_path']
-
-        if config['latent_type'] == 'dls':
-            self.latent_id = source + '_dls_p'  + str(config['latent_params']['patch_size']) + 'm' + str(config['latent_params']['num_modes'])
-        elif config['latent_type'] == 'bvae':
+        if config['latent_params']['type'] == 'dls':
+            self.latent_id = source_name + '_dls_p'  + str(config['latent_params']['patch_size']) + 'm' + str(config['latent_params']['num_modes'])
+        elif config['latent_params']['type'] == 'bvae':
             filters_str = '_'.join(str(f) for f in config['latent_params']['filters'])
             lins_str = '_'.join(str(l) for l in config['latent_params']['linear'])
             
-            self.latent_id = source + '_bvae_l' + str(config['latent_params']['latent_dim']) + '_b' + str(config['latent_params']['beta']) + '_f_' + filters_str + '_lin_' + lins_str
+            self.latent_id = source_name + '_bvae_l' + str(config['latent_params']['latent_dim']) + '_b' + str(config['latent_params']['beta']) + '_f_' + filters_str + '_lin_' + lins_str
         else:
-            self.latent_id = source + '_pod' # + str(config['latent_params']['num_modes'])
+            self.latent_id = source_name + '_pod' # + str(config['latent_params']['num_modes'])
         self.latent_id = self.latent_id.replace('.', '_')
+
+        self.source_path = self.data_dir + source_path + '.h5'
         
 
         #############################
@@ -64,7 +64,7 @@ class pathsBib:
         self.model_id = config['name']
         self.model_id = self.model_id.replace('.', '_')
         self.config_dir = 'configs/'
-        self.data_dir = 'data/'
+        
 
         self.latent_dir = 'results/' + self.latent_id + '/'
         self.latent_path = self.latent_dir + 'latent_coeff.h5'

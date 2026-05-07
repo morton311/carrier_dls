@@ -41,7 +41,7 @@ class runner(nn.Module):
 
     def _init_paths_and_logging(self, config):
         is_init_path, paths = init.init_path(config)
-
+        self.config['group_names'] = paths.data_dict
         if config['mode'] != 'compare':
             if config['log'] == 'file':
                 sys.stdout = open(paths.log_path, 'w')
@@ -52,13 +52,14 @@ class runner(nn.Module):
         return paths
     
     def _get_grid(self):
-        with h5py.File(self.config['latent_params']['source_path'], 'r') as f:
-            self.x = f['x'][:]
-            self.y = f['y'][:]
-            self.z = f['z'][:] if 'z' in f else None
+        with h5py.File(self.paths_bib.source_path, 'r') as f:
             self.x_grid = f['x_grid'][:]
             self.y_grid = f['y_grid'][:]
             self.z_grid = f['z_grid'][:] if 'z_grid' in f else None
+
+            self.x = self.x_grid.shape[0]
+            self.y = self.y_grid.shape[0]
+            self.z = self.z_grid.shape[0] if self.z_grid is not None else None
         
     def _log_config(self):
         print(f"{'#'*20} Configuration {'#'*20}")
@@ -88,12 +89,12 @@ class runner(nn.Module):
     def _compute_latent_coefficients(self):
         print("Computing latent coefficients...")
         # compute the latent coefficients from source data
-        with h5py.File(self.config['latent_params']['source_path'], 'r') as f:
+        with h5py.File(self.paths_bib.source_path, 'r') as f:
             self.config['ndim'] = f['UV'].shape[-1] 
 
-        if self.config['latent_type'] == 'dls':
+        if self.config['latent_params']['type'] == 'dls':
             latent_config = dls.gfem_3d_compress_flexible(
-                    data_source = self.config['latent_params']['source_path'],
+                    data_source = self.paths_bib.source_path,
                     field_name = 'UV',
                     group_name = self.config['latent_params']['source_name'],
                     patch_size = self.config['latent_params']['patch_size'],
@@ -105,23 +106,17 @@ class runner(nn.Module):
         with open(self.paths_bib.latent_config_path, 'wb') as f:
             pickle.dump(latent_config, f)
         print("Latent coefficient config saved")
-        
-        self.data_sources = ['train_data', 'eval_data']
-        self.config['group_names'] = {}
 
         for data_source in self.data_sources:
-            self.config['group_names'][data_source] = []
-            for key in self.config[data_source].keys():
-                name = self.config[data_source][key].get('data_name')
-                path = self.config[data_source][key].get('data_path')
-                self.config['group_names'][data_source].append(name)
+            for name in self.config[data_source].keys():
+                path = self.config[data_source][name].get('path')
                 
-                if path == self.config['latent_params']['source_path']:
+                if path == self.paths_bib.source_path:
                     print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
                     continue
                 else:
                     print(f"Computing latent coefficients for {name}...")
-                    if self.config['latent_type'] == 'dls':
+                    if self.config['latent_params']['type'] == 'dls':
                         dls.gfem_3d_compress_flexible(
                             data_source = path,
                             field_name = 'UV',
@@ -142,11 +137,10 @@ class runner(nn.Module):
                 snaps = {}
                 for data_source in self.data_sources:
                     snaps[data_source] = {}
-                    for key in self.config[data_source].keys():
-                        name = self.config[data_source][key].get('data_name')
-                        path = self.config[data_source][key].get('data_path')
+                    for name in self.config[data_source].keys():
+                        path = self.config[data_source][name].get('data_path')
                         snaps[data_source][name] = {}
-                        snaps[data_source][name]['total'] = f[name].shape[0]
+                        snaps[data_source][name]['total'] = f[name]['dof_u'].shape[0]
                         print(f"Total snapshots for {data_source} '{name}': {snaps[data_source][name]}")
                         print(f"Splitting data")
 
@@ -172,13 +166,14 @@ class runner(nn.Module):
                 print(f"Train, test, and validation indices loaded from {self.paths_bib.model_dir + 'split_ids.pkl'}")
             
         with h5py.File(self.paths_bib.latent_path, 'r') as f:
-            if self.config['latent_type'] == 'dls':
-                input_dim = 3 * f['dof_u'].shape[1]
-        self.config['params']['input_dim'] = input_dim
+            latent_keys = list(f.keys())
+            if self.config['latent_params']['type'] == 'dls':
+                input_dim = 3 * f[latent_keys[0]]['dof_u'].shape[1]
+        self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
             
 
-    def _split_indices(self, total_snaps, train_split=0.8, test_split=0.1):
+    def _split_indices(self, total_snaps, train_split=0.8, test_split=0.1, sample_train=0, sample_test=0):
         # find indices for train, test, and validation sets
         train_len = int(total_snaps * train_split)
         test_len = int(train_len * test_split)
@@ -186,10 +181,6 @@ class runner(nn.Module):
         train_indices = np.arange(0, train_len - test_len)
         test_indices = np.arange(train_len - test_len, train_len)
         val_indices = np.arange(train_len, total_snaps)
-        
-        # Print a table with the set info
-        sample_train = self.config['train']['sample_train']
-        sample_test = self.config['train']['sample_test']
 
         print(f"{'Set':<12}|{'Total':<10}|{'First Idx':<12}|{'Last Idx':<12}|{'Sampled':<10}")
         print("-" * 56)
@@ -204,14 +195,14 @@ class runner(nn.Module):
             indices['train_indices'] = np.sort(datas.sample_series_indices(
                                         train_len, 
                                         sample_train, 
-                                        time_lag=self.config['params']['time_lag'], 
-                                        train_ahead=self.config['train']['train_ahead'], 
+                                        time_lag=self.config['model_params']['time_lag'], 
+                                        train_ahead=self.config['model_params']['train_ahead'], 
                                         seed=42))
             indices['test_indices'] = np.sort(datas.sample_series_indices(
                                         len(test_indices), 
                                         sample_test, 
-                                        time_lag=self.config['params']['time_lag'], 
-                                        train_ahead=self.config['train']['train_ahead'], 
+                                        time_lag=self.config['model_params']['time_lag'], 
+                                        train_ahead=self.config['model_params']['train_ahead'], 
                                         seed=42))
             indices['val_indices'] = val_indices
 
@@ -233,31 +224,31 @@ class runner(nn.Module):
         """
         # Load the model
         print(f"{'#'*20}\t{'Loading model...':<20}\t{'#'*20}")
-        if self.config['model'] == 'tr_enc':
+        if self.config['model_params']['model_type'] == 'tr_enc':
             self.model = models.TransformerEncoderModel(
-                        time_lag=self.config['params']['time_lag'],
-                        input_dim=self.config['params']['input_dim'],
-                        d_model=self.config['params']['d_model'],
-                        ff_dim=self.config['params'].get('ff_dim', 4 * self.config['params']['d_model']),
-                        nhead=self.config['params']['nhead'],
-                        num_layers=self.config['params']['num_layers'],
-                        embed=self.config['params'].get('embed', 'lin'),
-                        activation=self.config['params'].get('activation', 'relu'),
-                        pre_norm=self.config['params'].get('prenorm', False)
+                        time_lag=self.config['model_params']['time_lag'],
+                        input_dim=self.config['model_params']['input_dim'],
+                        d_model=self.config['model_params']['d_model'],
+                        ff_dim=self.config['model_params'].get('ff_dim', 4 * self.config['model_params']['d_model']),
+                        nhead=self.config['model_params']['nhead'],
+                        num_layers=self.config['model_params']['num_layers'],
+                        embed=self.config['model_params'].get('embed', 'lin'),
+                        activation=self.config['model_params'].get('activation', 'relu'),
+                        pre_norm=self.config['model_params'].get('prenorm', False)
                         )
-        elif self.config['model'] == 'lstm':
+        elif self.config['model_params']['model_type'] == 'lstm':
             self.model = models.LSTMModel(
-                        time_lag=self.config['params']['time_lag'],
-                        input_dim=self.config['params']['input_dim'],
-                        hidden_dim=self.config['params']['d_model'],
-                        num_layers=self.config['params']['num_layers'],
-                        batch_size= self.config['train']['batch_size'],
+                        time_lag=self.config['model_params']['time_lag'],
+                        input_dim=self.config['model_params']['input_dim'],
+                        hidden_dim=self.config['model_params']['d_model'],
+                        num_layers=self.config['model_params']['num_layers'],
+                        batch_size= self.config['model_params']['batch_size'],
                         )
             
-        elif self.config['model'] == 'f_extrap':
+        elif self.config['model_params']['model_type'] == 'f_extrap':
             self.model = None
         else:
-            raise ValueError(f"Model {self.config['model']} not recognized. Please use 'tr_enc' or 'lstm'.")
+            raise ValueError(f"Model {self.config['model_params']['model_type']} not recognized. Please use 'tr_enc' or 'lstm'.")
         
         # Load the model weights if they exist and overwrite is not set to 'l' or 'm'
         if os.path.exists(self.paths_bib.model_path) and not self.config['overwrite'] in ['l', 'm']:
@@ -285,8 +276,8 @@ class runner(nn.Module):
         if self.model is not None: 
             
             self.criterion = nn.MSELoss()
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['train']['lr'])
-            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.config['train'].get('gamma', 0.9))
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['model_params']['lr'])
+            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.config['model_params'].get('gamma', 0.9))
 
             print(f"Loss function: {self.criterion}")
             print(f"Optimizer: {self.optimizer}")
@@ -313,6 +304,7 @@ class runner(nn.Module):
                 checkpoint['model_state_dict'] = {k.replace('module.', '', 1) if k.startswith('module.') else k: v for k, v in checkpoint['model_state_dict'].items()}
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if 'lr_scheduler_state_dict' in checkpoint:
                     self.scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
                 else: 
@@ -353,9 +345,9 @@ class runner(nn.Module):
         """
         if self.model is not None:
             print('Getting training and test data')
-            tl = self.config['params']['time_lag']
-            ta = self.config['train']['train_ahead']
-            dof_dim = self.config['params']['input_dim']
+            tl = self.config['model_params']['time_lag']
+            ta = self.config['model_params']['train_ahead']
+            dof_dim = self.config['model_params']['input_dim']
 
             self.dof_mean = {}
             self.dof_std = {}
@@ -368,7 +360,7 @@ class runner(nn.Module):
             
                 for name in self.config['group_names']['train_data']:
                     
-                    if self.config['latent_type'] == 'dls':
+                    if self.config['latent_params']['type'] == 'dls':
                         dof_u = f[name]['dof_u']
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w'] if self.config['ndim'] == 3 else None
@@ -382,13 +374,13 @@ class runner(nn.Module):
                                 dofs[i] = torch.cat((u, v, w), dim=1)
                             else:
                                 dofs[i] = torch.cat((u, v), dim=1)
-                    elif self.config['latent_type'] == 'pod':
+                    elif self.config['latent_params']['type'] == 'pod':
                         dofs_not_scaled = f[name]['dofs']
                         dofs = torch.zeros(len(self.train_indices), dof_dim)
                         for i, idx in enumerate(self.train_indices):
                             dofs[i] = torch.from_numpy(dofs_not_scaled[idx:idx+1, :dof_dim]).float()
 
-                    elif self.config['latent_type'] == 'bvae':
+                    elif self.config['latent_params']['type'] == 'bvae':
                         dofs_not_scaled = f[name]['dofs']
                         dofs = torch.zeros(len(self.train_indices), dof_dim)
                         for i, idx in enumerate(self.train_indices):
@@ -419,7 +411,7 @@ class runner(nn.Module):
                     # Prepare lists for X/Y, then stack at the end
                     X_train, Y_train = torch.zeros(len(self.train_indices), tl, dof_dim), torch.zeros(len(self.train_indices), ta, dof_dim)
                     for i, idx in enumerate(self.train_indices):
-                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_type'])
+                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
                         X_train[i] = dof_seq[:tl]
                         Y_train[i] = dof_seq[tl:tl+ta]
                         if i % 500 == 0:
@@ -428,7 +420,7 @@ class runner(nn.Module):
 
                     X_test, Y_test = torch.zeros(len(self.test_indices), tl, dof_dim), torch.zeros(len(self.test_indices), ta, dof_dim)
                     for i, idx in enumerate(self.test_indices):
-                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_type'])
+                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
                         X_test[i] = dof_seq[:tl]
                         Y_test[i] = dof_seq[tl:tl+ta]
                         if i % 100 == 0:
@@ -441,13 +433,13 @@ class runner(nn.Module):
 
                     # convert to data loader
                     if self.config['distributed']:
-                        self.train_loader[name], self.sampler[name] = datas.make_dataloader(X_train.to(self.device), Y_train.to(self.device), batch_size=self.config['train']['batch_size'], shuffle=True, distributed=True)
+                        self.train_loader[name], self.sampler[name] = datas.make_dataloader(X_train.to(self.device), Y_train.to(self.device), batch_size=self.config['model_params']['batch_size'], shuffle=True, distributed=True)
                     else:
-                        self.train_loader[name] = datas.make_dataloader(X_train.to(self.device), Y_train.to(self.device), batch_size=self.config['train']['batch_size'], shuffle=True)
+                        self.train_loader[name] = datas.make_dataloader(X_train.to(self.device), Y_train.to(self.device), batch_size=self.config['model_params']['batch_size'], shuffle=True)
 
                     print(f"Train loader created with {len(self.train_loader[name])} batches")
 
-                    self.test_loader[name] = datas.make_dataloader(X_test.to(self.device), Y_test.to(self.device), batch_size=self.config['train']['batch_size'], shuffle=False)
+                    self.test_loader[name] = datas.make_dataloader(X_test.to(self.device), Y_test.to(self.device), batch_size=self.config['model_params']['batch_size'], shuffle=False)
                     print(f"Test loader created with {len(self.test_loader[name])} batches")
 
                     with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as f:
@@ -476,7 +468,7 @@ class runner(nn.Module):
             
             max_norm = 0.2
 
-            for epoch in range(len(losses), self.config['train']['num_epochs']):
+            for epoch in range(len(losses), self.config['model_params']['num_epochs']):
                 self.model.train()
                 epoch_loss = 0
                 if self.config['distributed']:
@@ -544,7 +536,7 @@ class runner(nn.Module):
                         early_stop_counter = 0
                     else:
                         early_stop_counter += 1
-                        if early_stop_counter >= self.config['train']['patience']:
+                        if early_stop_counter >= self.config['model_params']['patience']:
                             print(f'Early stopping at epoch {epoch+1}')
                             self.model.load_state_dict(best_model)
                             print(f'Best model loaded from epoch {best_epoch}, with test loss: {best_test_loss:.4f}')
@@ -558,6 +550,7 @@ class runner(nn.Module):
                             'epoch': epoch,
                             'model_state_dict': self.model.state_dict(),
                             'optimizer_state_dict': self.optimizer.state_dict(),
+                            'scheduler_state_dict': self.scheduler.state_dict(),
                             'losses': losses,
                             'test_losses': test_losses,
                             'early_stop_counter': early_stop_counter,
@@ -567,7 +560,7 @@ class runner(nn.Module):
                     
                 best_flag = 'X' if (epoch + 1) == best_epoch else ' '
                 checkpoint_flag = 'X' if (epoch + 1) % 5 == 0 else ' '
-                print(f"| Epoch: {epoch+1:<4}/{self.config['train']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['train']['patience']} | Checkpoint: {checkpoint_flag:<1} |")
+                print(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} |")
 
             end_time = time.time()
             print('\n\nTime taken for training: ', end_time - start_time)
