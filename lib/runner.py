@@ -90,6 +90,7 @@ class runner(nn.Module):
     def _compute_latent_coefficients(self):
         print("Computing latent coefficients...")
         # compute the latent coefficients from source data
+        print(f"Source path: {self.paths_bib.source_path}")
         with h5py.File(self.paths_bib.source_path, 'r') as f:
             self.config['ndim'] = f['UV'].shape[-1] 
 
@@ -111,6 +112,7 @@ class runner(nn.Module):
         for data_source in self.data_sources:
             for id, source in enumerate(self.config[data_source]):
                 path = source.get('path')
+                path = self.paths_bib.data_dir + path + '.h5'
                 data_name = source.get('name')
                 
                 if path == self.paths_bib.source_path:
@@ -141,6 +143,7 @@ class runner(nn.Module):
                     snaps[data_source] = {}
                     for id, source in enumerate(self.config[data_source]):
                         path = source.get('data_path')
+                        path = self.paths_bib.data_dir + path + '.h5'
                         data_name = source.get('data_name')
                         snaps[data_source][data_name] = {}
                         snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
