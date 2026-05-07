@@ -109,9 +109,9 @@ class runner(nn.Module):
         print("Latent coefficient config saved")
 
         for data_source in self.data_sources:
-            for name in self.config[data_source]:
-                path = self.config[data_source][name].get('path')
-                data_name = self.config[data_source][name].get('name')
+            for id, source in enumerate(self.config[data_source]):
+                path = source.get('path')
+                data_name = source.get('name')
                 
                 if path == self.paths_bib.source_path:
                     print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
@@ -139,9 +139,9 @@ class runner(nn.Module):
                 snaps = {}
                 for data_source in self.data_sources:
                     snaps[data_source] = {}
-                    for name in self.config[data_source]:
-                        path = self.config[data_source][name].get('data_path')
-                        data_name = self.config[data_source][name].get('data_name')
+                    for id, source in enumerate(self.config[data_source]):
+                        path = source.get('data_path')
+                        data_name = source.get('data_name')
                         snaps[data_source][data_name] = {}
                         snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
                         print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]}")
@@ -150,12 +150,12 @@ class runner(nn.Module):
                         if data_source == 'train_data':
                             
                             indices = self._split_indices(snaps[data_source][data_name]['total'], 
-                                                          train_split=self.config[data_source][name]['train_split'], 
-                                                          test_split=self.config[data_source][name]['test_split'])
+                                                          train_split=source['train_split'], 
+                                                          test_split=source['test_split'])
                         elif data_source == 'eval_data':
 
                             indices = self._split_indices(snaps[data_source][data_name]['total'], 
-                                                          train_split=1-self.config[data_source][name]['pred_split'])
+                                                          train_split=1-source['pred_split'])
 
                         snaps[data_source][data_name]['idx'] = indices
                 
