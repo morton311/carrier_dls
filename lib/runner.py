@@ -110,27 +110,28 @@ class runner(nn.Module):
         print("Latent coefficient config saved")
 
         for data_source in self.data_sources:
-            for id, source in enumerate(self.config[data_source]):
-                path = source.get('path')
-                path = self.paths_bib.data_dir + path + '.h5'
-                data_name = source.get('name')
-                
-                if path == self.paths_bib.source_path:
-                    print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
-                    continue
-                else:
-                    print(f"Computing latent coefficients for {data_source} {data_name}...")
-                    if self.config['latent_params']['type'] == 'dls':
-                        dls.gfem_3d_compress_flexible(
-                            data_source = path,
-                            field_name = 'UV',
-                            group_name = data_name,
-                            patch_size = self.config['latent_params']['patch_size'],
-                            num_modes = self.config['latent_params']['num_modes'],
-                            latent_target = self.paths_bib.latent_path,
-                            batch_size = self.config['latent_params']['batch_size'],
-                            dls_config = latent_config
-                        )
+            if self.config[data_source] is not None:
+                for id, source in enumerate(self.config[data_source]):
+                    path = source.get('path')
+                    path = self.paths_bib.data_dir + path + '.h5'
+                    data_name = source.get('name')
+                    
+                    if path == self.paths_bib.source_path:
+                        print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
+                        continue
+                    else:
+                        print(f"Computing latent coefficients for {data_source} {data_name}...")
+                        if self.config['latent_params']['type'] == 'dls':
+                            dls.gfem_3d_compress_flexible(
+                                data_source = path,
+                                field_name = 'UV',
+                                group_name = data_name,
+                                patch_size = self.config['latent_params']['patch_size'],
+                                num_modes = self.config['latent_params']['num_modes'],
+                                latent_target = self.paths_bib.latent_path,
+                                batch_size = self.config['latent_params']['batch_size'],
+                                dls_config = latent_config
+                            )
         
 
     def _latent_split(self):
@@ -141,26 +142,27 @@ class runner(nn.Module):
                 snaps = {}
                 for data_source in self.data_sources:
                     snaps[data_source] = {}
-                    for id, source in enumerate(self.config[data_source]):
-                        path = source.get('data_path')
-                        path = self.paths_bib.data_dir + path + '.h5'
-                        data_name = source.get('data_name')
-                        snaps[data_source][data_name] = {}
-                        snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
-                        print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]}")
-                        print(f"Splitting data")
+                    if self.config[data_source] is not None:
+                        for id, source in enumerate(self.config[data_source]):
+                            path = source.get('data_path')
+                            path = self.paths_bib.data_dir + path + '.h5'
+                            data_name = source.get('data_name')
+                            snaps[data_source][data_name] = {}
+                            snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
+                            print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]}")
+                            print(f"Splitting data")
 
-                        if data_source == 'train_data':
-                            
-                            indices = self._split_indices(snaps[data_source][data_name]['total'], 
-                                                          train_split=source['train_split'], 
-                                                          test_split=source['test_split'])
-                        elif data_source == 'eval_data':
+                            if data_source == 'train_data':
+                                
+                                indices = self._split_indices(snaps[data_source][data_name]['total'], 
+                                                            train_split=source['train_split'], 
+                                                            test_split=source['test_split'])
+                            elif data_source == 'eval_data':
 
-                            indices = self._split_indices(snaps[data_source][data_name]['total'], 
-                                                          train_split=1-source['pred_split'])
+                                indices = self._split_indices(snaps[data_source][data_name]['total'], 
+                                                            train_split=1-source['pred_split'])
 
-                        snaps[data_source][data_name]['idx'] = indices
+                            snaps[data_source][data_name]['idx'] = indices
                 
                 with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
                     pickle.dump(snaps, f)
