@@ -41,6 +41,7 @@ class runner(nn.Module):
 
     def _init_paths_and_logging(self, config):
         is_init_path, paths = init.init_path(config)
+        self.data_sources = ['train_data', 'eval_data']
         self.config['group_names'] = paths.data_dict
         if config['mode'] != 'compare':
             if config['log'] == 'file':
