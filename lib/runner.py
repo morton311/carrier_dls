@@ -109,19 +109,20 @@ class runner(nn.Module):
         print("Latent coefficient config saved")
 
         for data_source in self.data_sources:
-            for name in self.config[data_source].keys():
+            for name in self.config[data_source]:
                 path = self.config[data_source][name].get('path')
+                data_name = self.config[data_source][name].get('name')
                 
                 if path == self.paths_bib.source_path:
                     print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
                     continue
                 else:
-                    print(f"Computing latent coefficients for {name}...")
+                    print(f"Computing latent coefficients for {data_source} {name}...")
                     if self.config['latent_params']['type'] == 'dls':
                         dls.gfem_3d_compress_flexible(
                             data_source = path,
                             field_name = 'UV',
-                            group_name = name,
+                            group_name = data_name,
                             patch_size = self.config['latent_params']['patch_size'],
                             num_modes = self.config['latent_params']['num_modes'],
                             latent_target = self.paths_bib.latent_path,
