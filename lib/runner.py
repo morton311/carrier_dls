@@ -117,7 +117,7 @@ class runner(nn.Module):
                     print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
                     continue
                 else:
-                    print(f"Computing latent coefficients for {data_source} {name}...")
+                    print(f"Computing latent coefficients for {data_source} {data_name}...")
                     if self.config['latent_params']['type'] == 'dls':
                         dls.gfem_3d_compress_flexible(
                             data_source = path,
@@ -139,24 +139,25 @@ class runner(nn.Module):
                 snaps = {}
                 for data_source in self.data_sources:
                     snaps[data_source] = {}
-                    for name in self.config[data_source].keys():
+                    for name in self.config[data_source]:
                         path = self.config[data_source][name].get('data_path')
-                        snaps[data_source][name] = {}
-                        snaps[data_source][name]['total'] = f[name]['dof_u'].shape[0]
-                        print(f"Total snapshots for {data_source} '{name}': {snaps[data_source][name]}")
+                        data_name = self.config[data_source][name].get('data_name')
+                        snaps[data_source][data_name] = {}
+                        snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
+                        print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]}")
                         print(f"Splitting data")
 
                         if data_source == 'train_data':
                             
-                            indices = self._split_indices(snaps[data_source][name]['total'], 
+                            indices = self._split_indices(snaps[data_source][data_name]['total'], 
                                                           train_split=self.config[data_source][name]['train_split'], 
                                                           test_split=self.config[data_source][name]['test_split'])
                         elif data_source == 'eval_data':
 
-                            indices = self._split_indices(snaps[data_source][name]['total'], 
+                            indices = self._split_indices(snaps[data_source][data_name]['total'], 
                                                           train_split=1-self.config[data_source][name]['pred_split'])
 
-                        snaps[data_source][name]['idx'] = indices
+                        snaps[data_source][data_name]['idx'] = indices
                 
                 with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
                     pickle.dump(snaps, f)
