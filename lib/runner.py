@@ -112,6 +112,7 @@ class runner(nn.Module):
         for data_source in self.data_sources:
             if self.config[data_source] is not None:
                 for id, source in enumerate(self.config[data_source]):
+                    print(source)
                     path = source.get('path')
                     path = self.paths_bib.data_dir + path + '.h5'
                     data_name = source.get('name')
