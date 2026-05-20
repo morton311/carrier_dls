@@ -15,7 +15,8 @@
         "num_epochs" :  5,
         "patience" :    10,
         "activation":   "swiglu",
-        "prenorm":      false
+        "prenorm":      false,
+        "profile":      true
     },
     
     "latent_params" : {

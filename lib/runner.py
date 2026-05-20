@@ -38,6 +38,7 @@ class runner(nn.Module):
         self._get_data()
         self._get_model()
         self._compile_model()
+        
 
     def _init_paths_and_logging(self, config):
         is_init_path, paths = init.init_path(config)
@@ -272,7 +273,8 @@ class runner(nn.Module):
         if os.path.exists(self.paths_bib.model_path) and not self.config['overwrite'] in ['l', 'm']:
             self.model.load_state_dict(torch.load(self.paths_bib.model_path, weights_only=True, map_location=self.device))
         if self.model is not None:
-            print(f"Model initialized with {sum(p.numel() for p in self.model.parameters())} parameters")
+            self.num_params = sum(p.numel() for p in self.model.parameters())
+            print(f"Model initialized with {self.num_params} parameters")
 
         if self.config['distributed']:
             from torch.nn.parallel import DistributedDataParallel as DDP
@@ -300,7 +302,6 @@ class runner(nn.Module):
                 mode='min',
                 factor=self.config['model_params'].get('lr_factor', 0.5),
                 patience=self.config['model_params'].get('lr_patience', 5),
-                verbose=False,
                 min_lr=1e-7
             )
 
@@ -353,6 +354,26 @@ class runner(nn.Module):
             else:
                 print(f"Model does not exist at {self.paths_bib.model_path}. Training from scratch.")
                 self.checkpointed = False
+    
+    def estimate_vram_usage(self, batch_size):
+        # Very rough estimate of VRAM usage based on model parameters and train loader size
+        param_size = self.num_params * 4 / 1e9  # assuming float32, convert to GB
+        tl = self.config['model_params']['time_lag']
+        ta = self.config['model_params']['train_ahead']
+        nx, ny, nz = self.l_config.nx_g, self.l_config.ny_g, self.l_config.nz_g # num elems
+        dof_elem = self.l_config.dof_elem # dof per elem
+        total_snaps = sum(len(self.indices['train_data'][name]['train_indices']) for name in self.indices['train_data'])
+        total_snaps+= sum(len(self.indices['train_data'][name]['test_indices']) for name in self.indices['train_data'])
+        loader_shape = (total_snaps * nx * ny * nz, tl + ta, dof_elem * 3)  # total samples, time lag, input dim
+        batch_shape = (batch_size, tl  + ta, dof_elem * 3)
+
+        data_size = np.prod(batch_shape) * 4 / 1e9  # size of one batch in GB
+        loader_size = np.prod(loader_shape) * 4 / 1e9  # size of entire loader in GB (if loaded in memory)
+        activations = param_size * 2  # very rough estimate of activations size (can be much larger depending on model architecture)
+        
+        print(f"Estimated VRAM usage per batch: {data_size:.2f} GB")
+        print(f"Estimated size of entire data loader if loaded in memory: {loader_size:.2f} GB")
+        print(f"Model parameter size: {param_size:.2f}) GB")
 
 
     def train(self):
@@ -411,6 +432,7 @@ class runner(nn.Module):
                         # Precompute lltogl_mat for all elements (vectorized)
                         num_unique_elems = nx * ny * nz // 8  # number of unique GFEM elements in the grid
                         dof_elem = 8 * dof_node
+                        print()
                         lltogl_mat = np.empty((num_unique_elems, dof_elem), dtype=int)
                         elem_idx = 0
                         for kx in range(0,nx-1,2):
@@ -476,9 +498,6 @@ class runner(nn.Module):
                         for iind in range(num_unique_elems):
                             X_train[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
                             Y_train[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
-                        
-                        if (t + 1) % max(1, len(train_indices) // 10) == 0:
-                            print(f"Processed {t+1}/{len(train_indices)} train samples")
                     
                     for t, idx in enumerate(test_indices):
                         dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
@@ -486,11 +505,9 @@ class runner(nn.Module):
                         for iind in range(num_unique_elems):
                             X_test[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
                             Y_test[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
-                        
-                        if (t + 1) % max(1, len(test_indices) // 10) == 0:
-                            print(f"Processed {t+1}/{len(test_indices)} test samples")
 
 
+                    print(f"Data loaded for {name}. Shapes before stacking: X_train {X_train.shape}, Y_train {Y_train.shape}, X_test {X_test.shape}, Y_test {Y_test.shape}")
                     print(f"X_train shape: {X_train.shape}, Y_train shape: {Y_train.shape}, dtype: {X_train.dtype}")
                     print(f"X_test shape: {X_test.shape}, Y_test shape: {Y_test.shape}, dtype: {X_test.dtype}")
 
@@ -530,6 +547,10 @@ class runner(nn.Module):
             start_time = time.time()
             
             max_norm = 0.2
+            new_lr = self.scheduler.get_last_lr() if self.scheduler is not None else self.config['train']['lr']
+            if new_lr is list:
+                new_lr = new_lr[0]
+
 
             for epoch in range(len(losses), self.config['model_params']['num_epochs']):
                 self.model.train()
@@ -587,7 +608,7 @@ class runner(nn.Module):
                 
                 # Step scheduler based on test loss (plateau detection)
                 self.scheduler.step(test_loss)
-                new_lr = self.optimizer.param_groups[0]['lr']
+                new_lr = self.scheduler.get_last_lr()[0] if isinstance(new_lr, list) else new_lr
                 
                 
                 ## ------------------------------- Early stop and Checkpoint -------------------------------
@@ -649,3 +670,10 @@ class runner(nn.Module):
         else:
             print("No training required for f_extrap model")
             self.pred()
+
+    def pred(self):
+        """
+        Make predictions with the model
+        """
+        print(f"{'#'*20}\t{'Predicting...':<20}\t{'#'*20}")
+
