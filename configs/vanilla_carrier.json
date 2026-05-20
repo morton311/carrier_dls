@@ -16,6 +16,7 @@
     "latent_params" : {
         "patch_size" : 19,
         "num_modes" : 10,
+        "localized": true,
         "source_name" : "0aoa",
         "source_path" : "placeholder"
     },

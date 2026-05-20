@@ -81,11 +81,14 @@ class runner(nn.Module):
         
         if not os.path.exists(self.paths_bib.latent_path) or self.config['overwrite'] == 'l':
             self._compute_latent_coefficients()
-        self._latent_split()
 
         # load latent_config 
         with open(self.paths_bib.latent_config_path, 'rb') as f:
             self.l_config = pickle.load(f)
+
+        self._latent_split()
+
+        
 
     def _compute_latent_coefficients(self):
         print("Computing latent coefficients...")
@@ -178,7 +181,10 @@ class runner(nn.Module):
         with h5py.File(self.paths_bib.latent_path, 'r') as f:
             latent_keys = list(f.keys())
             if self.config['latent_params']['type'] == 'dls':
-                input_dim = 3 * f[latent_keys[0]]['dof_u'].shape[1]
+                if self.config['latent_params'].get('localized', False):
+                    input_dim = 3 * self.l_config['dof_elem'] 
+                else:
+                    input_dim = 3 * self.l_config['num_gfem_elems'] * self.l_config['dof_node']
         print(f"Input dimension for model: {input_dim}")
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
@@ -240,7 +246,7 @@ class runner(nn.Module):
                         time_lag=self.config['model_params']['time_lag'],
                         input_dim=self.config['model_params']['input_dim'],
                         d_model=self.config['model_params']['d_model'],
-                        ff_dim=self.config['model_params'].get('ff_dim', 4 * self.config['model_params']['d_model']),
+                        ff_dim=self.config['model_params'].get('ff_dim', None),
                         nhead=self.config['model_params']['nhead'],
                         num_layers=self.config['model_params']['num_layers'],
                         embed=self.config['model_params'].get('embed', 'lin'),
@@ -359,6 +365,13 @@ class runner(nn.Module):
             tl = self.config['model_params']['time_lag']
             ta = self.config['model_params']['train_ahead']
             dof_dim = self.config['model_params']['input_dim']
+            num_gfem_elems = self.l_config['num_gfem_elems']
+            dof_node = self.l_config['dof_node']
+            nx = self.l_config['nx_g']
+            ny = self.l_config['ny_g']
+            nz = self.l_config['nz_g']
+
+            IJK = dls.node_map()
 
             self.dof_mean = {}
             self.dof_std = {}
@@ -380,63 +393,58 @@ class runner(nn.Module):
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w']
                         # Compute mean and std using only the training indices, in chunks to save memory
-                        dofs = torch.zeros(len(train_indices), dof_dim)
-                        for i, idx in enumerate(train_indices):
-                            u = torch.from_numpy(dof_u[idx:idx+1]).float()
-                            v = torch.from_numpy(dof_v[idx:idx+1]).float()
-                            w = torch.from_numpy(dof_w[idx:idx+1]).float()
-                            dofs[i] = torch.cat((u, v, w), dim=1)
-
-                    elif self.config['latent_params']['type'] == 'pod':
-                        dofs_not_scaled = f[name]['dofs']
-                        dofs = torch.zeros(len(train_indices), dof_dim)
-                        for i, idx in enumerate(train_indices):
-                            dofs[i] = torch.from_numpy(dofs_not_scaled[idx:idx+1, :dof_dim]).float()
-
-                    elif self.config['latent_params']['type'] == 'bvae':
-                        dofs_not_scaled = f[name]['dofs']
-                        dofs = torch.zeros(len(train_indices), dof_dim)
-                        for i, idx in enumerate(train_indices):
-                            dofs[i] = torch.from_numpy(dofs_not_scaled[idx:idx+1, :dof_dim]).float()
+                        dofs = torch.zeros(len(train_indices), num_gfem_elems, dof_dim)
+                        for kx in range(nx-1):
+                             for ky in range(ny-1):
+                                for kz in range(nz-1):
+                                    iind = kx * (ny-1) * (nz-1) + ky * (nz-1) + kz
+                                    lltogl = dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
+                                    
+                                    for t, idx in enumerate(train_indices):
+                                        u = torch.from_numpy(dof_u[idx:idx+1, lltogl]).float()
+                                        v = torch.from_numpy(dof_v[idx:idx+1, lltogl]).float()
+                                        w = torch.from_numpy(dof_w[idx:idx+1, lltogl]).float()
+                                        dofs[t, iind] = torch.cat((u, v, w), dim=1)
                             
-                    self.dof_mean[name] = torch.mean(dofs, dim=0)
-                    self.dof_std[name] = torch.std(dofs, dim=0)
+                    self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))
+                    self.dof_std[name] = torch.std(dofs, dim=(0, 1))
 
                     
 
                     # Helper to get normalized dof sequence as torch tensor
                     def get_dof_seq(idx, length, latent_type='dls'):
                         if latent_type == 'dls':
-                            u = torch.from_numpy(dof_u[idx:idx+length]).float()
-                            v = torch.from_numpy(dof_v[idx:idx+length]).float()
-                            w = torch.from_numpy(dof_w[idx:idx+length]).float()
+                            u = torch.from_numpy(dof_u[idx:idx+length, lltogl]).float()
+                            v = torch.from_numpy(dof_v[idx:idx+length, lltogl]).float()
+                            w = torch.from_numpy(dof_w[idx:idx+length, lltogl]).float()
                             dof = torch.cat((u, v, w), dim=1)
 
-                        elif latent_type == 'pod':
-                            dof = torch.from_numpy(dofs_not_scaled[idx:idx+length, :dof_dim]).float()
-                        elif latent_type == 'bvae':
-                            dof = torch.from_numpy(dofs_not_scaled[idx:idx+length, :dof_dim]).float()
                         dof = (dof - self.dof_mean[name]) / self.dof_std[name]
                         return dof
 
                     # Prepare lists for X/Y, then stack at the end
-                    X_train, Y_train = torch.zeros(len(train_indices), tl, dof_dim), torch.zeros(len(train_indices), ta, dof_dim)
-                    for i, idx in enumerate(train_indices):
-                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                        X_train[i] = dof_seq[:tl]
-                        Y_train[i] = dof_seq[tl:tl+ta]
-                        if i % 500 == 0:
-                            print(f"Got train data {i}/{len(train_indices)}")
-                    print('Got train data')
+                    X_train = torch.zeros(len(train_indices) * num_gfem_elems, tl, dof_dim)
+                    Y_train = torch.zeros(len(train_indices) * num_gfem_elems, ta, dof_dim)
 
-                    X_test, Y_test = torch.zeros(len(test_indices), tl, dof_dim), torch.zeros(len(test_indices), ta, dof_dim)
-                    for i, idx in enumerate(test_indices):
-                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                        X_test[i] = dof_seq[:tl]
-                        Y_test[i] = dof_seq[tl:tl+ta]
-                        if i % 100 == 0:
-                            print(f"Got test data {i}/{len(test_indices)}")
-                    print('Got test data')
+                    X_test = torch.zeros(len(test_indices) * num_gfem_elems, tl, dof_dim)
+                    Y_test = torch.zeros(len(test_indices) * num_gfem_elems, ta, dof_dim)
+
+                    for kx in range(nx-1):
+                        for ky in range(ny-1):
+                            for kz in range(nz-1):
+                                iind = kx * (ny-1) * (nz-1) + ky * (nz-1) + kz
+                                lltogl = dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
+                                for t, idx in enumerate(train_indices):
+                                    dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                                    X_train[t*num_gfem_elems + iind] = dof_seq[:tl]
+                                    Y_train[t*num_gfem_elems + iind] = dof_seq[tl:tl+ta]
+                                
+                                for t, idx in enumerate(test_indices):
+                                    dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                                    X_test[t*num_gfem_elems + iind] = dof_seq[:tl]
+                                    Y_test[t*num_gfem_elems + iind] = dof_seq[tl:tl+ta]
+                                
+                                print(f"Got data for element {iind} ({kx}, {ky}, {kz})")
 
 
                     print(f"X_train shape: {X_train.shape}, Y_train shape: {Y_train.shape}, dtype: {X_train.dtype}")

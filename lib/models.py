@@ -92,9 +92,9 @@ class TimeSpaceEmbedding(nn.Module):
         out     = self.act(self.time_compress(tau))
         return out
 
-######################################
-# SwiGLU Activation Function for FFN #
-######################################
+##############################
+# SwiGLU Activation Function #
+##############################
 class SwiGLU(nn.Module):
     def __init__(self, dimension):
         super().__init__()
@@ -108,6 +108,86 @@ class SwiGLU(nn.Module):
 
         return swiglu
     
+
+#####################
+# FFN_SwiGLU module #
+#####################
+class FFN_SwiGLU(nn.Module):
+    def __init__(self, d_model, ff_dim):
+        super().__init__()
+        self.W = nn.Linear(d_model, ff_dim, bias=False)
+        self.V = nn.Linear(d_model, ff_dim, bias=False)
+        self.W2 = nn.Linear(ff_dim, d_model, bias=False)
+
+    def forward(self, x):
+        x = self.W(x)
+        swish = x * torch.sigmoid(x)
+        x = swish * self.V(x)
+        out = self.W2(x)
+
+        return out
+    
+##############################################
+# Rotary Positional Embeddings for attention #
+##############################################
+class RotaryPositionalEmbeddings(nn.Module):
+
+  def __init__(self, d: int, base: int = 10_000):
+
+    super().__init__()
+    self.base = base
+    self.d = d
+    self.cos_cached = None
+    self.sin_cached = None
+
+  def _build_cache(self, x: torch.Tensor):
+
+    if self.cos_cached is not None and x.shape[0] <= self.cos_cached.shape[0]:
+      return
+
+    seq_len = x.shape[0]
+
+    theta = 1. / (self.base ** (torch.arange(0, self.d, 2).float() / self.d)).to(x.device) # THETA = 10,000^(-2*i/d) or 1/10,000^(2i/d)
+
+    seq_idx = torch.arange(seq_len, device=x.device).float().to(x.device) #Position Index -> [0,1,2...seq-1]
+
+    idx_theta = torch.einsum('n,d->nd', seq_idx, theta)  #Calculates m*(THETA) = [ [0, 0...], [THETA_1, THETA_2...THETA_d/2], ... [seq-1*(THETA_1), seq-1*(THETA_2)...] ]
+
+    idx_theta2 = torch.cat([idx_theta, idx_theta], dim=1) # [THETA_1, THETA_2...THETA_d/2] -> [THETA_1, THETA_2...THETA_d]
+
+
+    self.cos_cached = idx_theta2.cos()[:, None, None, :] #Cache [cosTHETA_1, cosTHETA_2...cosTHETA_d]
+    self.sin_cached = idx_theta2.sin()[:, None, None, :] #cache [sinTHETA_1, sinTHETA_2...sinTHETA_d]
+
+  def _neg_half(self, x: torch.Tensor):
+
+    d_2 = self.d // 2 #
+
+    return torch.cat([-x[:, :, :, d_2:], x[:, :, :, :d_2]], dim=-1) # [x_1, x_2,...x_d] -> [-x_d/2, ... -x_d, x_1, ... x_d/2]
+
+
+  def forward(self, x: torch.Tensor):
+
+    self._build_cache(x)
+
+    neg_half_x = self._neg_half(x)
+
+    x_rope = (x * self.cos_cached[:x.shape[0]]) + (neg_half_x * self.sin_cached[:x.shape[0]]) # [x_1*cosTHETA_1 - x_d/2*sinTHETA_d/2, ....]
+
+    return x_rope
+
+###################################
+# RoPE Multihead Attention module #
+###################################
+class RoPEMultiheadAttention(nn.Module):
+    pass
+    
+    
+########################################
+# RoPE-based Transformer Encoder Layer #
+########################################
+
+    
 ## ====================================== Transformer ============================================
 # Define the Transformer Encoder model
 class TransformerEncoderModel(nn.Module):
@@ -119,6 +199,18 @@ class TransformerEncoderModel(nn.Module):
         elif embed == 'lin':
             self.positional_encoding = PositionalEncoding(d_model, max_len=time_lag)
             self.input_projection = nn.Linear(input_dim, d_model)
+        elif embed == 'alibi':
+            # ALiBi: no explicit positional embeddings; use identity and mark flag
+            self.positional_encoding = nn.Identity()
+            self.input_projection = nn.Linear(input_dim, d_model)
+            self.use_alibi = True
+        elif embed == 'rope':
+            # RoPE: use sinusoidal positional encoding as a fallback placeholder
+            self.positional_encoding = nn.Identity()
+            self.input_projection = nn.Linear(input_dim, d_model)
+            self.use_rope = True
+        else:
+            raise RuntimeError(f"embed should be one of 'TS'/'lin'/'alibi'/'rope', not {embed}")
 
         if isinstance(activation, str):
             activation = activation.lower()
@@ -127,17 +219,21 @@ class TransformerEncoderModel(nn.Module):
 
         self.encoder_layers = nn.ModuleList([])
         for _ in range(num_layers):
-            base_activation = 'relu' if activation == 'swiglu' else activation
-            layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                dim_feedforward=ff_dim,
-                nhead=nhead,
-                batch_first=True,
-                activation=base_activation,
-                norm_first=pre_norm,
-            )
-            if activation == 'swiglu':
-                layer.activation = SwiGLU(ff_dim)
+            
+            if self.use_rope:
+                layer = RoPETransformerEncoderLayer(d_model=d_model, nhead=nhead, ff_dim=ff_dim)
+            else:
+                base_activation = 'relu' if activation == 'swiglu' else activation
+                layer = nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    dim_feedforward=ff_dim,
+                    nhead=nhead,
+                    batch_first=True,
+                    activation=base_activation,
+                    norm_first=pre_norm,
+                )
+                if activation == 'swiglu':
+                    layer.activation = SwiGLU(ff_dim)
             self.encoder_layers.append(layer)
         self.fc = nn.Linear(d_model, input_dim)
 
@@ -152,6 +248,28 @@ class TransformerEncoderModel(nn.Module):
         def wrap(*args, **kwargs):
             kwargs["need_weights"] = True
             kwargs["average_attn_weights"] = False
+
+            # If ALiBi is enabled, add an attention mask bias
+            if getattr(self, 'use_alibi', False):
+                # args[0] is query of shape (batch, seq_len, dim) in batch_first=True
+                q = args[0]
+                tgt_len = q.size(1)
+                src_len = tgt_len
+                nhead = m.num_heads
+
+                # compute slopes per head (approximation)
+                def get_slopes(n):
+                    def get_pow(i):
+                        return 2 ** (-(2 ** -(math.log2(n) - 3)) * i)
+                    return [get_pow(i) for i in range(n)]
+
+                slopes = torch.tensor(get_slopes(nhead), device=q.device).unsqueeze(1).unsqueeze(2)
+                pos = torch.arange(src_len, device=q.device).unsqueeze(0) - torch.arange(tgt_len, device=q.device).unsqueeze(1)
+                pos = pos.abs().unsqueeze(0)
+                alibi = -slopes * pos  # (nhead, tgt_len, src_len)
+
+                kwargs['attn_mask'] = alibi
+
             return forward_orig(*args, **kwargs)
 
         m.forward = wrap

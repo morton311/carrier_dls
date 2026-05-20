@@ -41,6 +41,7 @@ class dls_long_Config_3D_Flexible:
         self.ny_g = len(self.sample_y)
         self.nz_g = len(self.sample_z)
         self.num_gfem_nodes = self.nx_g * self.ny_g * self.nz_g
+        self.num_gfem_elems = (self.nx_g - 1) * (self.ny_g - 1) * (self.nz_g - 1)
         self.dof_node = self.num_modes + 1
         self.dof_elem = 8 * self.dof_node
         self.compression_ratio = (
@@ -52,7 +53,7 @@ class dls_long_Config_3D_Flexible:
         )
 
 
-def _node_map(opp=False) -> np.ndarray:
+def node_map(opp=False) -> np.ndarray:
     # shape: (3, 8)
     IJK = np.array([
         [1, 0, 1],
@@ -104,7 +105,7 @@ def _build_wt_vec(nskip: int) -> np.ndarray:
     Wt_vec = Wt.reshape((nskip+1)**3, order='F')
     return Wt_vec
 
-def _build_lltogl(
+def build_lltogl(
     i: int,
     j: int,
     k: int,
@@ -518,13 +519,13 @@ def gfem_3d_compress_flexible(
     M_v = lil_matrix((num_gfem_nodes * dof_node, num_gfem_nodes * dof_node))
     M_w = lil_matrix((num_gfem_nodes * dof_node, num_gfem_nodes * dof_node))
 
-    IJK = _node_map()
+    IJK = node_map()
 
     print("Constructing global M GFEM matrices")
     for i in range(nx_g - 1):
         for j in range(ny_g - 1):
             for k in range(nz_g - 1):
-                lltogl = _build_lltogl(i, j, k, ny_g, nz_g, dof_node, IJK)
+                lltogl = build_lltogl(i, j, k, ny_g, nz_g, dof_node, IJK)
                 M_u[np.ix_(lltogl, lltogl)] += M_local_u
                 M_v[np.ix_(lltogl, lltogl)] += M_local_v
                 M_w[np.ix_(lltogl, lltogl)] += M_local_w
@@ -557,7 +558,7 @@ def gfem_3d_compress_flexible(
         for i in range(nx_g - 1):
             for j in range(ny_g - 1):
                 for k in range(nz_g - 1):
-                    lltogl = _build_lltogl(i, j, k, ny_g, nz_g, dof_node, IJK)
+                    lltogl = build_lltogl(i, j, k, ny_g, nz_g, dof_node, IJK)
 
                     indx_cell = i * nskip
                     indy_cell = j * nskip
@@ -673,7 +674,7 @@ def gfem_3d_recon_flexible(
     num_snaps = dof_u_arr.shape[0]
     num_batches = num_snaps // batch_size + (1 if num_snaps % batch_size else 0)
 
-    IJK = _node_map()
+    IJK = node_map()
     nskip = config.nskip
     dof_node = config.dof_node
     dof_elem = config.dof_elem
@@ -700,7 +701,7 @@ def gfem_3d_recon_flexible(
         for i in range(config.nx_g - 1):
             for j in range(config.ny_g - 1):
                 for k in range(config.nz_g - 1):
-                    lltogl = _build_lltogl(i, j, k, config.ny_g, config.nz_g, dof_node, IJK)
+                    lltogl = build_lltogl(i, j, k, config.ny_g, config.nz_g, dof_node, IJK)
 
                     dof_local_u = dof_u_arr[snap_start:snap_end, :][:, lltogl].T
                     dof_local_v = dof_v_arr[snap_start:snap_end, :][:, lltogl].T

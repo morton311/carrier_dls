@@ -41,5 +41,5 @@
             "path" : "gencarr_transpose",
             "pred_split" : 0.1
         }
-]
+    ]
 }
