@@ -41,7 +41,15 @@ if __name__ == "__main__":
     else:
         config['distributed'] = False
 
-    device = ('cuda' if torch.cuda.is_available() else "cpu")
+    if config['distributed']:
+            import torch.distributed as dist
+            dist.init_process_group(backend='nccl')
+            local_rank = int(os.environ["LOCAL_RANK"]) # automatically set by torchrun
+            device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else "cpu")
+    else:
+
+        device = ('cuda' if torch.cuda.is_available() else "cpu")
+    # device = 'cpu'
     config['device'] = device
     
     run = runner(config)
