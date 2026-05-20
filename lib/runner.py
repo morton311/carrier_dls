@@ -554,11 +554,12 @@ class runner(nn.Module):
             for epoch in range(len(losses), self.config['model_params']['num_epochs']):
                 self.model.train()
                 epoch_loss = 0
-                if self.config['distributed']:
-                    self.sampler.set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
+                
 
                 ## --------------------------------------- Train ---------------------------------------
                 for key in self.train_loader: 
+                    if self.config['distributed']:
+                        self.sampler[key].set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
                     loader = self.train_loader[key]
                     for inputs, targets in loader: 
                         inputs, targets = inputs, targets
