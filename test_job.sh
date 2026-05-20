@@ -1,0 +1,16 @@
+#!/bin/bash
+# JOB HEADERS HERE
+#SBATCH --job-name=carrier
+#SBATCH --account=NAWCP24632466
+#SBATCH --qos=debug
+#SBATCH --constraint=mla
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 01:00:00
+#SBATCH --output=out_test.out
+
+module use $HOME/my_modules
+module load torch_module
+source $HOME/.venv/bin/activate
+
+python3 main.py -c 'test_local' -m 'train' -d "True"

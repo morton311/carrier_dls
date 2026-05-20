@@ -12,9 +12,8 @@
         "lr_factor":    0.5,
         "lr_patience":  5,
         "batch_size" :  2048,
-        "num_epochs" :  1000,
+        "num_epochs" :  5,
         "patience" :    10,
-        "gamma" :       1,
         "activation":   "swiglu",
         "prenorm":      false
     },
