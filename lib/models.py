@@ -186,13 +186,15 @@ class RoPEMultiheadAttention(nn.Module):
 ########################################
 # RoPE-based Transformer Encoder Layer #
 ########################################
-
+class RoPETransformerEncoderLayer(nn.Module):
+    pass
     
 ## ====================================== Transformer ============================================
 # Define the Transformer Encoder model
 class TransformerEncoderModel(nn.Module):
     def __init__(self, time_lag, input_dim, d_model=256, ff_dim=2048, nhead=4, num_layers=4, embed='lin', activation='relu', pre_norm=False):
         super(TransformerEncoderModel, self).__init__()
+        self.use_rope = False
         if embed == 'TS':
             self.positional_encoding = nn.Identity()
             self.input_projection = TimeSpaceEmbedding(time_lag, input_dim, d_expand=2 * time_lag, d_model=d_model)

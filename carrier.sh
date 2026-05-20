@@ -6,11 +6,11 @@
 #SBATCH --constraint=mla
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH -t 04:00:00
+#SBATCH -t 24:00:00
 #SBATCH --output=out_carrier.out
 
 module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-python3 main.py -c 'test' -m 'train'
+python3 main.py -c 'distributed' -m 'train' -d "True"

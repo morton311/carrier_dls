@@ -45,6 +45,7 @@ class runner(nn.Module):
         self.config['group_names'] = paths.data_dict
         if config['mode'] != 'compare':
             if config['log'] == 'file':
+                print(f"To follow the log in real time, run 'tail -f {paths.log_path}'")
                 sys.stdout = open(paths.log_path, 'w')
                 sys.stderr = open(paths.log_path, 'a')
         
@@ -182,9 +183,9 @@ class runner(nn.Module):
             latent_keys = list(f.keys())
             if self.config['latent_params']['type'] == 'dls':
                 if self.config['latent_params'].get('localized', False):
-                    input_dim = 3 * self.l_config['dof_elem'] 
+                    input_dim = 3 * self.l_config.dof_elem
                 else:
-                    input_dim = 3 * self.l_config['num_gfem_elems'] * self.l_config['dof_node']
+                    input_dim = 3 * self.l_config.num_gfem_elems * self.l_config.dof_node
         print(f"Input dimension for model: {input_dim}")
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
@@ -294,10 +295,18 @@ class runner(nn.Module):
             
             self.criterion = nn.MSELoss()
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['model_params']['lr'])
-            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.config['model_params'].get('gamma', 0.9))
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=self.config['model_params'].get('lr_factor', 0.5),
+                patience=self.config['model_params'].get('lr_patience', 5),
+                verbose=False,
+                min_lr=1e-7
+            )
 
             print(f"Loss function: {self.criterion}")
             print(f"Optimizer: {self.optimizer}")
+            print(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)})")
 
             # Helper function to remap 'embed' keys to 'input_projection'
             def remap_embed_keys(state_dict):
@@ -365,11 +374,17 @@ class runner(nn.Module):
             tl = self.config['model_params']['time_lag']
             ta = self.config['model_params']['train_ahead']
             dof_dim = self.config['model_params']['input_dim']
-            num_gfem_elems = self.l_config['num_gfem_elems']
-            dof_node = self.l_config['dof_node']
-            nx = self.l_config['nx_g']
-            ny = self.l_config['ny_g']
-            nz = self.l_config['nz_g']
+            num_gfem_elems = self.l_config.num_gfem_elems
+            dof_node = self.l_config.dof_node
+            nx = self.l_config.nx_g
+            ny = self.l_config.ny_g
+            nz = self.l_config.nz_g
+
+            # print l_config attributes
+            print(f"l_config attributes:")
+            for attr in dir(self.l_config):
+                if not attr.startswith('modemat') and not attr.startswith('_'):
+                    print(f"  {attr}: {getattr(self.l_config, attr)}")
 
             IJK = dls.node_map()
 
@@ -392,65 +407,94 @@ class runner(nn.Module):
                         dof_u = f[name]['dof_u']
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w']
-                        # Compute mean and std using only the training indices, in chunks to save memory
-                        dofs = torch.zeros(len(train_indices), num_gfem_elems, dof_dim)
-                        for kx in range(nx-1):
-                             for ky in range(ny-1):
-                                for kz in range(nz-1):
-                                    iind = kx * (ny-1) * (nz-1) + ky * (nz-1) + kz
-                                    lltogl = dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
+
+                        # Precompute lltogl_mat for all elements (vectorized)
+                        num_unique_elems = nx * ny * nz // 8  # number of unique GFEM elements in the grid
+                        dof_elem = 8 * dof_node
+                        lltogl_mat = np.empty((num_unique_elems, dof_elem), dtype=int)
+                        elem_idx = 0
+                        for kx in range(0,nx-1,2):
+                            for ky in range(0,ny-1,2):
+                                for kz in range(0,nz-1,2):
+                                    lltogl_mat[elem_idx] = dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
+                                    elem_idx += 1
                                     
-                                    for t, idx in enumerate(train_indices):
-                                        u = torch.from_numpy(dof_u[idx:idx+1, lltogl]).float()
-                                        v = torch.from_numpy(dof_v[idx:idx+1, lltogl]).float()
-                                        w = torch.from_numpy(dof_w[idx:idx+1, lltogl]).float()
-                                        dofs[t, iind] = torch.cat((u, v, w), dim=1)
+                        print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
+
+                        # Compute mean and std: loop over time snapshots (not elements)
+                        dofs = torch.zeros(len(train_indices), num_unique_elems, 3 * dof_elem)
+                        for t, idx in enumerate(train_indices):
+                            # Read one snapshot row per h5py call (vectorized)
+                            u_row = np.array(dof_u[idx, :])
+                            v_row = np.array(dof_v[idx, :])
+                            w_row = np.array(dof_w[idx, :])
                             
-                    self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))
+                            # Extract per-element in NumPy (all elements at once)
+                            u_sel = u_row[lltogl_mat]  # shape: (num_unique_elems, dof_elem)
+                            v_sel = v_row[lltogl_mat]
+                            w_sel = w_row[lltogl_mat]
+                            
+                            # Concatenate and convert to torch
+                            dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=1)
+                            dofs[t] = torch.from_numpy(dofs_cat).float()
+                            
+                    self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))  # scalar normalization
                     self.dof_std[name] = torch.std(dofs, dim=(0, 1))
+                    print(f"Mean/std shapes: {self.dof_mean[name].shape}, {self.dof_std[name].shape}")
 
-                    
-
-                    # Helper to get normalized dof sequence as torch tensor
+                    # Helper to get normalized dof sequence as torch tensor (vectorized batch read)
                     def get_dof_seq(idx, length, latent_type='dls'):
                         if latent_type == 'dls':
-                            u = torch.from_numpy(dof_u[idx:idx+length, lltogl]).float()
-                            v = torch.from_numpy(dof_v[idx:idx+length, lltogl]).float()
-                            w = torch.from_numpy(dof_w[idx:idx+length, lltogl]).float()
-                            dof = torch.cat((u, v, w), dim=1)
-
+                            # Read batch of rows once from HDF5
+                            u_rows = np.array(dof_u[idx:idx+length, :])
+                            v_rows = np.array(dof_v[idx:idx+length, :])
+                            w_rows = np.array(dof_w[idx:idx+length, :])
+                            
+                            # Extract per-element, all at once in NumPy
+                            u_sel = u_rows[:, lltogl_mat]  # shape: (length, num_unique_elems, dof_elem)
+                            v_sel = v_rows[:, lltogl_mat]
+                            w_sel = w_rows[:, lltogl_mat]
+                            
+                            # Concatenate along last axis
+                            dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=2)  # (length, num_unique_elems, 3*dof_elem)
+                            dof = torch.from_numpy(dofs_cat).float()
+                        
                         dof = (dof - self.dof_mean[name]) / self.dof_std[name]
                         return dof
 
                     # Prepare lists for X/Y, then stack at the end
-                    X_train = torch.zeros(len(train_indices) * num_gfem_elems, tl, dof_dim)
-                    Y_train = torch.zeros(len(train_indices) * num_gfem_elems, ta, dof_dim)
+                    X_train = torch.zeros(len(train_indices) * num_unique_elems, tl, dof_dim)
+                    Y_train = torch.zeros(len(train_indices) * num_unique_elems, ta, dof_dim)
 
-                    X_test = torch.zeros(len(test_indices) * num_gfem_elems, tl, dof_dim)
-                    Y_test = torch.zeros(len(test_indices) * num_gfem_elems, ta, dof_dim)
+                    X_test = torch.zeros(len(test_indices) * num_unique_elems, tl, dof_dim)
+                    Y_test = torch.zeros(len(test_indices) * num_unique_elems, ta, dof_dim)
 
-                    for kx in range(nx-1):
-                        for ky in range(ny-1):
-                            for kz in range(nz-1):
-                                iind = kx * (ny-1) * (nz-1) + ky * (nz-1) + kz
-                                lltogl = dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
-                                for t, idx in enumerate(train_indices):
-                                    dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                                    X_train[t*num_gfem_elems + iind] = dof_seq[:tl]
-                                    Y_train[t*num_gfem_elems + iind] = dof_seq[tl:tl+ta]
-                                
-                                for t, idx in enumerate(test_indices):
-                                    dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                                    X_test[t*num_gfem_elems + iind] = dof_seq[:tl]
-                                    Y_test[t*num_gfem_elems + iind] = dof_seq[tl:tl+ta]
-                                
-                                print(f"Got data for element {iind} ({kx}, {ky}, {kz})")
+                    # Vectorized data loading: loop over time indices (not elements)
+                    for t, idx in enumerate(train_indices):
+                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                        # dof_seq shape: (tl+ta, num_unique_elems, 3*dof_elem)
+                        for iind in range(num_unique_elems):
+                            X_train[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
+                            Y_train[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
+                        
+                        if (t + 1) % max(1, len(train_indices) // 10) == 0:
+                            print(f"Processed {t+1}/{len(train_indices)} train samples")
+                    
+                    for t, idx in enumerate(test_indices):
+                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                        # dof_seq shape: (tl+ta, num_unique_elems, 3*dof_elem)
+                        for iind in range(num_unique_elems):
+                            X_test[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
+                            Y_test[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
+                        
+                        if (t + 1) % max(1, len(test_indices) // 10) == 0:
+                            print(f"Processed {t+1}/{len(test_indices)} test samples")
 
 
                     print(f"X_train shape: {X_train.shape}, Y_train shape: {Y_train.shape}, dtype: {X_train.dtype}")
                     print(f"X_test shape: {X_test.shape}, Y_test shape: {Y_test.shape}, dtype: {X_test.dtype}")
 
-                    # convert to data loader
+                    # convert to data loader (keep on CPU, move batch-by-batch during training)
                     if self.config['distributed']:
                         self.train_loader[name], self.sampler[name] = datas.make_dataloader(X_train.to(self.device), Y_train.to(self.device), batch_size=self.config['model_params']['batch_size'], shuffle=True, distributed=True)
                     else:
@@ -520,7 +564,6 @@ class runner(nn.Module):
 
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
                         self.optimizer.step()
-                        self.scheduler.step()
 
                 losses.append(epoch_loss)
 
@@ -541,6 +584,11 @@ class runner(nn.Module):
                                 inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
 
                 test_losses.append(test_loss)
+                
+                # Step scheduler based on test loss (plateau detection)
+                self.scheduler.step(test_loss)
+                new_lr = self.optimizer.param_groups[0]['lr']
+                
                 
                 ## ------------------------------- Early stop and Checkpoint -------------------------------
                 # Early stopping and saving the best model
@@ -581,7 +629,7 @@ class runner(nn.Module):
                     
                 best_flag = 'X' if (epoch + 1) == best_epoch else ' '
                 checkpoint_flag = 'X' if (epoch + 1) % 5 == 0 else ' '
-                print(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} |")
+                print(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} | LR: {new_lr:.2e} | Time: {(time.time() - start_time)/60:10.2f} min |")
 
             end_time = time.time()
             print('\n\nTime taken for training: ', end_time - start_time)
