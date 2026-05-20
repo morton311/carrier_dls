@@ -413,8 +413,7 @@ class runner(nn.Module):
             self.dof_std = {}
             self.train_loader = {}
             self.test_loader = {}
-            self.train_sampler = {}
-            self.test_sampler = {}
+            self.sampler = {}
             
             with h5py.File(self.paths_bib.latent_path, 'r') as f:
                 for id, source in enumerate(self.config['train_data']):
