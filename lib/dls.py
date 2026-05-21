@@ -15,7 +15,7 @@ DataInput = Union[str, ArrayDict]
 
 
 @dataclass
-class dls_long_Config_3D_Flexible:
+class dls_long_Config_Flexible:
     num_snaps: int
     nx: int
     ny: int
@@ -223,28 +223,8 @@ def Modal_decomp(data, patch_size):
     return local_modes, eigVal
 
 
-def FEM_shape_calculator_2D_ortho_gfemlr(x, y, xpt, ypt):
-    sumxpt = np.sum(xpt) / 4
-    sumypt = np.sum(ypt) / 4
 
-    dxpt = (-xpt[0] + xpt[1] + xpt[2] - xpt[3]) / 2
-    dypt = (ypt[0] + ypt[1] - ypt[2] - ypt[3]) / 2
-
-    zeta_i = [-1, 1, 1, -1]
-    eta_i = [1, 1, -1, -1]
-
-    # Inverse transform for parallelogram elements, bilinear shape functions
-    zeta = 2 * (x - sumxpt) / dxpt
-    eta = 2 * (y - sumypt) / dypt
-
-    N = np.zeros((4,1))
-    # shape function values
-    for i in range(4):
-        N[i] = (1 / 4) * (1 + zeta_i[i] * zeta) * (1 + eta_i[i] * eta)
-    return N
-
-
-def FEM_shape_calculator_3D_ortho_gfemlr(x, y, z, xpt, ypt, zpt):
+def FEM_shape_calculator_ortho_gfemlr(x, y, z, xpt, ypt, zpt):
 
     sumxpt = np.sum(xpt) / 8
     sumypt = np.sum(ypt) / 8
@@ -398,7 +378,7 @@ def local_modemat_over_elem(x_grid, y_grid, z_grid, nskip, modes_vec, num_modes,
                 y_val = y_grid[kx, ky, kz]
                 z_val = z_grid[kx, ky, kz]
                 iind = kz*(nskip+1)**2 + ky*(nskip+1) + kx
-                N = FEM_shape_calculator_3D_ortho_gfemlr(x_val, y_val, z_val, xpt, ypt, zpt)
+                N = FEM_shape_calculator_ortho_gfemlr(x_val, y_val, z_val, xpt, ypt, zpt)
                 N1[iind] = N[0][0]
                 N2[iind] = N[1][0]
                 N3[iind] = N[2][0]
@@ -428,7 +408,7 @@ def local_modemat_over_elem(x_grid, y_grid, z_grid, nskip, modes_vec, num_modes,
     return modemat_local, modemat_local_wt
 
 
-def gfem_3d_compress_flexible(
+def gfem_compress_flexible(
     data_source: DataInput,
     field_name: str,
     patch_size: int,
@@ -436,7 +416,7 @@ def gfem_3d_compress_flexible(
     group_name: Optional[str] = None,
     latent_target: Optional[Union[str, Dict[str, np.ndarray]]] = None,
     batch_size: int = 2500,
-    dls_config: Optional[dls_long_Config_3D_Flexible] = None
+    dls_config: Optional[dls_long_Config_Flexible] = None
 ):
     """
     Flexible variant of gfem_3d_long.
@@ -609,7 +589,7 @@ def gfem_3d_compress_flexible(
 
     print(f"Solved for dofs in {total_time:.2f} seconds")
 
-    config = dls_long_Config_3D_Flexible(
+    config = dls_long_Config_Flexible(
         num_snaps=num_snaps,
         nx=nx,
         ny=ny,
@@ -642,9 +622,9 @@ def gfem_3d_compress_flexible(
     
 
 
-def gfem_3d_recon_flexible(
+def gfem_recon_flexible(
     rec_target: Optional[Union[str, Dict[str, np.ndarray]]],
-    config: dls_long_Config_3D_Flexible,
+    config: dls_long_Config_Flexible,
     dof_u: Union[str, np.ndarray],
     dof_v: Optional[np.ndarray] = None,
     dof_w: Optional[np.ndarray] = None,

@@ -16,7 +16,6 @@ print = partial(print, flush=True)
 builtins.print = print
 
 import lib.init as init
-import lib.dls as dls
 import lib.pod as pod
 import lib.models as models
 import lib.datas as datas
@@ -33,6 +32,15 @@ class runner(nn.Module):
         self._log_config()
 
         self._get_grid()
+
+        print(self.dim)
+        if self.dim == 3:
+            print("Using 3D DLS for latent coefficient computation")
+            import lib.dls as dls
+        else:
+            print("Using 2D DLS for latent coefficient computation")
+            import lib.dls_2d as dls
+        self.dls = dls
 
         # get model info
         self._get_data()
@@ -56,13 +64,19 @@ class runner(nn.Module):
     
     def _get_grid(self):
         with h5py.File(self.paths_bib.source_path, 'r') as f:
+            self.dim = 3 if 'z_grid' in f else 2
             self.x_grid = f['x_grid'][:]
             self.y_grid = f['y_grid'][:]
-            self.z_grid = f['z_grid'][:] if 'z_grid' in f else None
+            self.z_grid = f['z_grid'][:] if self.dim == 3 else None
 
-            self.x = self.x_grid.shape[0]
-            self.y = self.y_grid.shape[0]
-            self.z = self.z_grid.shape[0] if self.z_grid is not None else None
+            if 'x' in f:
+                self.x = f['x'][:]
+                self.y = f['y'][:]
+                self.z = f['z'][:] if 'z' in f else None
+            else:
+                self.x = self.x_grid.shape[0]
+                self.y = self.y_grid.shape[0]
+                self.z = self.z_grid.shape[0] if self.dim == 3 else None
         
     def _log_config(self):
         print(f"{'#'*20} Configuration {'#'*20}")
@@ -96,9 +110,9 @@ class runner(nn.Module):
         print("Computing latent coefficients...")
         # compute the latent coefficients from source data
         print(f"Source path: {self.paths_bib.source_path}")
-
+        
         if self.config['latent_params']['type'] == 'dls':
-            latent_config = dls.gfem_3d_compress_flexible(
+            latent_config = self.dls.gfem_compress_flexible(
                     data_source = self.paths_bib.source_path,
                     field_name = 'UV',
                     group_name = self.config['latent_params']['source_name'],
@@ -127,7 +141,7 @@ class runner(nn.Module):
                     else:
                         print(f"Computing latent coefficients for {data_source} {data_name}...")
                         if self.config['latent_params']['type'] == 'dls':
-                            dls.gfem_3d_compress_flexible(
+                            self.dls.gfem_compress_flexible(
                                 data_source = path,
                                 field_name = 'UV',
                                 group_name = data_name,
@@ -184,9 +198,9 @@ class runner(nn.Module):
             latent_keys = list(f.keys())
             if self.config['latent_params']['type'] == 'dls':
                 if self.config['latent_params'].get('localized', False):
-                    input_dim = 3 * self.l_config.dof_elem
+                    input_dim = self.dim * self.l_config.dof_elem
                 else:
-                    input_dim = 3 * self.l_config.num_gfem_elems * self.l_config.dof_node
+                    input_dim = self.dim * self.l_config.num_gfem_elems * self.l_config.dof_node
         print(f"Input dimension for model: {input_dim}")
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
@@ -334,8 +348,6 @@ class runner(nn.Module):
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if 'lr_scheduler_state_dict' in checkpoint:
                     self.scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-                else: 
-                    self.scheduler = None
                 self.epoch = checkpoint['epoch']
                 self.losses = checkpoint['losses']
                 self.test_losses = checkpoint['test_losses']
@@ -354,26 +366,7 @@ class runner(nn.Module):
             else:
                 print(f"Model does not exist at {self.paths_bib.model_path}. Training from scratch.")
                 self.checkpointed = False
-    
-    def estimate_vram_usage(self, batch_size):
-        # Very rough estimate of VRAM usage based on model parameters and train loader size
-        param_size = self.num_params * 4 / 1e9  # assuming float32, convert to GB
-        tl = self.config['model_params']['time_lag']
-        ta = self.config['model_params']['train_ahead']
-        nx, ny, nz = self.l_config.nx_g, self.l_config.ny_g, self.l_config.nz_g # num elems
-        dof_elem = self.l_config.dof_elem # dof per elem
-        total_snaps = sum(len(self.indices['train_data'][name]['train_indices']) for name in self.indices['train_data'])
-        total_snaps+= sum(len(self.indices['train_data'][name]['test_indices']) for name in self.indices['train_data'])
-        loader_shape = (total_snaps * nx * ny * nz, tl + ta, dof_elem * 3)  # total samples, time lag, input dim
-        batch_shape = (batch_size, tl  + ta, dof_elem * 3)
 
-        data_size = np.prod(batch_shape) * 4 / 1e9  # size of one batch in GB
-        loader_size = np.prod(loader_shape) * 4 / 1e9  # size of entire loader in GB (if loaded in memory)
-        activations = param_size * 2  # very rough estimate of activations size (can be much larger depending on model architecture)
-        
-        print(f"Estimated VRAM usage per batch: {data_size:.2f} GB")
-        print(f"Estimated size of entire data loader if loaded in memory: {loader_size:.2f} GB")
-        print(f"Model parameter size: {param_size:.2f}) GB")
 
 
     def train(self):
@@ -397,9 +390,10 @@ class runner(nn.Module):
             dof_dim = self.config['model_params']['input_dim']
             num_gfem_elems = self.l_config.num_gfem_elems
             dof_node = self.l_config.dof_node
+            dof_elem = self.l_config.dof_elem
             nx = self.l_config.nx_g
             ny = self.l_config.ny_g
-            nz = self.l_config.nz_g
+            nz = self.l_config.nz_g if self.dim == 3 else 1
 
             # print l_config attributes
             print(f"l_config attributes:")
@@ -407,7 +401,7 @@ class runner(nn.Module):
                 if not attr.startswith('modemat') and not attr.startswith('_'):
                     print(f"  {attr}: {getattr(self.l_config, attr)}")
 
-            IJK = dls.node_map()
+            IJK = self.dls.node_map()
 
             self.dof_mean = {}
             self.dof_std = {}
@@ -426,38 +420,58 @@ class runner(nn.Module):
                     if self.config['latent_params']['type'] == 'dls':
                         dof_u = f[name]['dof_u']
                         dof_v = f[name]['dof_v']
-                        dof_w = f[name]['dof_w']
+                        dof_w = f[name]['dof_w'] if self.dim == 3 else None
 
                         # Precompute lltogl_mat for all elements (vectorized)
-                        num_unique_elems = nx * ny * nz // 8  # number of unique GFEM elements in the grid
-                        dof_elem = 8 * dof_node
-                        print()
-                        lltogl_mat = np.empty((num_unique_elems, dof_elem), dtype=int)
+                        num_unique_elems = (nx//2) * (ny//2) * (nz//2) if self.dim == 3 else (nx//2) * (ny//2)
+                        dof_elem = self.l_config.dof_elem
+
+                        lltogl_mat = np.zeros((num_unique_elems, dof_elem), dtype=int)
                         elem_idx = 0
-                        for kx in range(0,nx-1,2):
-                            for ky in range(0,ny-1,2):
-                                for kz in range(0,nz-1,2):
-                                    lltogl_mat[elem_idx] = dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
+                        if self.dim == 3:
+                            for kx in range(0,nx-1,2):
+                                for ky in range(0,ny-1,2):
+                                    for kz in range(0,nz-1,2):
+                                        lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
+                                        elem_idx += 1
+                        else:
+                            for kx in range(0,nx-1, 2):
+                                for ky in range(0,ny-1, 2):
+                                    lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, ny, dof_node, IJK)
                                     elem_idx += 1
                                     
                         print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
 
                         # Compute mean and std: loop over time snapshots (not elements)
-                        dofs = torch.zeros(len(train_indices), num_unique_elems, 3 * dof_elem)
-                        for t, idx in enumerate(train_indices):
-                            # Read one snapshot row per h5py call (vectorized)
-                            u_row = np.array(dof_u[idx, :])
-                            v_row = np.array(dof_v[idx, :])
-                            w_row = np.array(dof_w[idx, :])
-                            
-                            # Extract per-element in NumPy (all elements at once)
-                            u_sel = u_row[lltogl_mat]  # shape: (num_unique_elems, dof_elem)
-                            v_sel = v_row[lltogl_mat]
-                            w_sel = w_row[lltogl_mat]
-                            
-                            # Concatenate and convert to torch
-                            dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=1)
-                            dofs[t] = torch.from_numpy(dofs_cat).float()
+                        dofs = torch.zeros(len(train_indices), num_unique_elems, self.dim * dof_elem)
+                        if self.dim == 3:
+                            for t, idx in enumerate(train_indices):
+                                # Read one snapshot row per h5py call (vectorized)
+                                u_row = np.array(dof_u[idx, :])
+                                v_row = np.array(dof_v[idx, :])
+                                w_row = np.array(dof_w[idx, :])
+                                
+                                # Extract per-element in NumPy (all elements at once)
+                                u_sel = u_row[lltogl_mat]  # shape: (num_unique_elems, dof_elem)
+                                v_sel = v_row[lltogl_mat]
+                                w_sel = w_row[lltogl_mat]
+                                
+                                # Concatenate and convert to torch
+                                dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=1)
+                                dofs[t] = torch.from_numpy(dofs_cat).float()
+                        else:
+                            for t, idx in enumerate(train_indices):
+                                # Read one snapshot row per h5py call (vectorized)
+                                u_row = np.array(dof_u[idx, :])
+                                v_row = np.array(dof_v[idx, :])
+                                
+                                # Extract per-element in NumPy (all elements at once)
+                                u_sel = u_row[lltogl_mat]  # shape: (num_unique_elems, dof_elem)
+                                v_sel = v_row[lltogl_mat]
+                                
+                                # Concatenate and convert to torch
+                                dofs_cat = np.concatenate([u_sel, v_sel], axis=1)
+                                dofs[t] = torch.from_numpy(dofs_cat).float()
                             
                     self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))  # scalar normalization
                     self.dof_std[name] = torch.std(dofs, dim=(0, 1))
@@ -469,15 +483,18 @@ class runner(nn.Module):
                             # Read batch of rows once from HDF5
                             u_rows = np.array(dof_u[idx:idx+length, :])
                             v_rows = np.array(dof_v[idx:idx+length, :])
-                            w_rows = np.array(dof_w[idx:idx+length, :])
+                            w_rows = np.array(dof_w[idx:idx+length, :]) if self.dim == 3 else None
                             
                             # Extract per-element, all at once in NumPy
                             u_sel = u_rows[:, lltogl_mat]  # shape: (length, num_unique_elems, dof_elem)
                             v_sel = v_rows[:, lltogl_mat]
-                            w_sel = w_rows[:, lltogl_mat]
+                            w_sel = w_rows[:, lltogl_mat] if self.dim == 3 else None
                             
                             # Concatenate along last axis
-                            dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=2)  # (length, num_unique_elems, 3*dof_elem)
+                            if self.dim == 3:
+                                dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=2)  # (length, num_unique_elems, 3*dof_elem)  
+                            else:
+                                dofs_cat = np.concatenate([u_sel, v_sel], axis=2)  # (length, num_unique_elems, 2*dof_elem)
                             dof = torch.from_numpy(dofs_cat).float()
                         
                         dof = (dof - self.dof_mean[name]) / self.dof_std[name]
@@ -493,14 +510,14 @@ class runner(nn.Module):
                     # Vectorized data loading: loop over time indices (not elements)
                     for t, idx in enumerate(train_indices):
                         dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                        # dof_seq shape: (tl+ta, num_unique_elems, 3*dof_elem)
+                        # dof_seq shape: (tl+ta, num_unique_elems, dim*dof_elem)
                         for iind in range(num_unique_elems):
                             X_train[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
                             Y_train[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
                     
                     for t, idx in enumerate(test_indices):
                         dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                        # dof_seq shape: (tl+ta, num_unique_elems, 3*dof_elem)
+                        # dof_seq shape: (tl+ta, num_unique_elems, dim*dof_elem)
                         for iind in range(num_unique_elems):
                             X_test[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
                             Y_test[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
@@ -512,13 +529,13 @@ class runner(nn.Module):
 
                     # convert to data loader (keep on CPU, move batch-by-batch during training)
                     if self.config['distributed']:
-                        self.train_loader[name], self.sampler[name] = datas.make_dataloader(X_train.to(self.device), Y_train.to(self.device), batch_size=self.config['model_params']['batch_size'], shuffle=True, distributed=True)
+                        self.train_loader[name], self.sampler[name] = datas.make_dataloader(X_train, Y_train, batch_size=self.config['model_params']['batch_size'], shuffle=True, distributed=True)
                     else:
-                        self.train_loader[name] = datas.make_dataloader(X_train.to(self.device), Y_train.to(self.device), batch_size=self.config['model_params']['batch_size'], shuffle=True)
+                        self.train_loader[name] = datas.make_dataloader(X_train, Y_train, batch_size=self.config['model_params']['batch_size'], shuffle=True)
 
                     print(f"Train loader created with {len(self.train_loader[name])} batches")
 
-                    self.test_loader[name] = datas.make_dataloader(X_test.to(self.device), Y_test.to(self.device), batch_size=self.config['model_params']['batch_size'], shuffle=False)
+                    self.test_loader[name] = datas.make_dataloader(X_test, Y_test, batch_size=self.config['model_params']['batch_size'], shuffle=False)
                     print(f"Test loader created with {len(self.test_loader[name])} batches")
 
                     with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as f:
@@ -546,7 +563,7 @@ class runner(nn.Module):
             start_time = time.time()
             
             max_norm = 0.2
-            new_lr = self.scheduler.get_last_lr() if self.scheduler is not None else self.config['train']['lr']
+            new_lr = self.scheduler.get_last_lr() if self.scheduler is not None else self.config['model_params']['lr']
             if new_lr is list:
                 new_lr = new_lr[0]
 
@@ -562,7 +579,7 @@ class runner(nn.Module):
                         self.sampler[key].set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
                     loader = self.train_loader[key]
                     for inputs, targets in loader: 
-                        inputs, targets = inputs, targets
+                        inputs, targets = inputs.to(self.device), targets.to(self.device)
                         self.optimizer.zero_grad()
                         total_loss = 0.0
 
@@ -596,7 +613,7 @@ class runner(nn.Module):
                     for key in self.test_loader:
                         loader = self.test_loader[key]
                         for inputs, targets in loader:
-                            inputs, targets = inputs, targets
+                            inputs, targets = inputs.to(self.device), targets.to(self.device)
                             for n in range(targets.shape[1]):
                                 target = targets[:, n, :]
                                 outputs = self.model(inputs)
@@ -673,7 +690,16 @@ class runner(nn.Module):
 
     def pred(self):
         """
-        Make predictions with the model
+        Make predictions with the model for all sets in config['eval_data']
         """
         print(f"{'#'*20}\t{'Predicting...':<20}\t{'#'*20}")
+
+        for id, source in enumerate(self.config['eval_data']):
+            name = source.get('name')
+            path = source.get('path')
+            pred_split = source.get('pred_split', 0.1)
+            path = self.paths_bib.data_dir + path + '.h5'
+            print(f"Predicting for {name} from {path}...")
+
+                    
 
