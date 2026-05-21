@@ -422,25 +422,9 @@ class runner(nn.Module):
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w'] if self.dim == 3 else None
 
-                        # Precompute lltogl_mat for all elements (vectorized)
-                        num_unique_elems = (nx//2) * (ny//2) * (nz//2) if self.dim == 3 else (nx//2) * (ny//2)
-                        dof_elem = self.l_config.dof_elem
+                        lltogl_mat = self._compute_lltogl_mat(skip=self.config['latent_params'].get('skip', 2))
 
-                        lltogl_mat = np.zeros((num_unique_elems, dof_elem), dtype=int)
-                        elem_idx = 0
-                        if self.dim == 3:
-                            for kx in range(0,nx-1,2):
-                                for ky in range(0,ny-1,2):
-                                    for kz in range(0,nz-1,2):
-                                        lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, IJK)
-                                        elem_idx += 1
-                        else:
-                            for kx in range(0,nx-1, 2):
-                                for ky in range(0,ny-1, 2):
-                                    lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, ny, dof_node, IJK)
-                                    elem_idx += 1
-                                    
-                        print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
+                        num_unique_elems = lltogl_mat.shape[0]
 
                         # Compute mean and std: loop over time snapshots (not elements)
                         dofs = torch.zeros(len(train_indices), num_unique_elems, self.dim * dof_elem)
@@ -688,18 +672,133 @@ class runner(nn.Module):
             print("No training required for f_extrap model")
             self.pred()
 
+    def _compute_lltogl_mat(self, skip=1):
+        nx = self.l_config.nx_g
+        ny = self.l_config.ny_g
+        nz = self.l_config.nz_g if self.dim == 3 else 1
+        dof_node = self.l_config.dof_node
+        num_unique_elems = (nx//skip) * (ny//skip) * (nz//skip) if self.dim == 3 else (nx//skip) * (ny//skip)
+        dof_elem = self.l_config.dof_elem
+        lltogl_mat = np.zeros((num_unique_elems, dof_elem), dtype=int)
+        elem_idx = 0
+        if self.dim == 3:
+            for kx in range(0,nx-1,skip):
+                for ky in range(0,ny-1,skip):
+                    for kz in range(0,nz-1,skip):
+                        lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, self.dls.node_map())
+                        elem_idx += 1
+        else:
+            for kx in range(0,nx-1, skip):
+                for ky in range(0,ny-1, skip):
+                    lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, ny, dof_node, self.dls.node_map())
+                    elem_idx += 1
+        print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
+        return lltogl_mat
+
+
     def pred(self):
         """
-        Make predictions with the model for all sets in config['eval_data']
+        Make predictions over the validation data with the model for all sets in config['eval_data']
         """
         print(f"{'#'*20}\t{'Predicting...':<20}\t{'#'*20}")
 
         for id, source in enumerate(self.config['eval_data']):
             name = source.get('name')
+            val_id = self.indices['eval_data'][name]['val_indices']
+            time_lag = self.config['model_params']['time_lag']
+            init_id = val_id[:time_lag]
             path = source.get('path')
-            pred_split = source.get('pred_split', 0.1)
             path = self.paths_bib.data_dir + path + '.h5'
+            pred_path = self.paths_bib.pred_dir + name + '_pred.h5'
+
+
             print(f"Predicting for {name} from {path}...")
+            with h5py.File(self.paths_bib.latent_path, 'r') as f:
+                dof_u = f[name]['dof_u'][init_id, :]
+                dof_v = f[name]['dof_v'][init_id, :]
+                dof_w = f[name]['dof_w'][init_id, :] if self.dim == 3 else None
+            # Precompute lltogl_mat shape: (num_unique_elems, dof_elem)
+            lltogl_mat = self._compute_lltogl_mat(skip=1)
+            num_unique_elems = lltogl_mat.shape[0]
 
-                    
+            
+            dof_input = np.zeros((num_unique_elems, len(init_id), self.dim * self.l_config.dof_elem))
+            # Extract per-element for initial condition
+            if self.dim == 3:
+                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_unique_elems, dof_elem)
+                v_sel = dof_v[:, lltogl_mat]
+                w_sel = dof_w[:, lltogl_mat]
+                # reshape to (num_unique_elems, time_lag, dim*dof_elem)
+                dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2))
+            else:
+                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_unique_elems, dof_elem)
+                v_sel = dof_v[:, lltogl_mat]
+                dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2))
+            dof_input = (dof_input - self.dof_mean[name].numpy()) / self.dof_std[name].numpy()
 
+            dof_input = torch.from_numpy(dof_input).float().to(self.device)
+            self.model.eval()
+            predictions = np.zeros((len(val_id), num_unique_elems, self.dim * self.l_config.dof_elem))
+            with torch.no_grad():
+                for t in range(len(val_id) - time_lag):
+                    output = self.model(dof_input)
+                    predictions[:, t + time_lag, :] = output.cpu().numpy()
+                    dof_input = torch.cat((dof_input[:, 1:, :], output.unsqueeze(1)), dim=1)
+            # Rescale predictions back to original scale
+            predictions = predictions * self.dof_std[name].numpy() + self.dof_mean[name].numpy() 
+
+            num_dofs = self.l_config.num_gfem_nodes * self.l_config.dof_node
+            # Reshape predictions to original dof_u, dof_v, dof_w format
+            if self.dim == 3:
+                dof_u_pred = np.zeros((len(val_id), num_dofs))
+                dof_v_pred = np.zeros((len(val_id), num_dofs))
+                dof_w_pred = np.zeros((len(val_id), num_dofs))
+                ndof = self.l_config.dof_elem
+                for i in range(num_unique_elems):
+                    dof_u_pred[:, lltogl_mat[i]] = predictions[:, i, :ndof]
+                    dof_v_pred[:, lltogl_mat[i]] = predictions[:, i, ndof:2*ndof]
+                    dof_w_pred[:, lltogl_mat[i]] = predictions[:, i, 2*ndof:]
+            else:
+                dof_u_pred = np.zeros((len(val_id), num_dofs))
+                dof_v_pred = np.zeros((len(val_id), num_dofs))
+                ndof = self.l_config.dof_elem
+                for i in range(num_unique_elems):
+                    dof_u_pred[:, lltogl_mat[i]] = predictions[:, i, :ndof]
+                    dof_v_pred[:, lltogl_mat[i]] = predictions[:, i, ndof:2*ndof]
+
+            # Save predictions to HDF5
+            with h5py.File(pred_path, 'w') as f:
+                f.create_dataset('dof_u', data=dof_u_pred)
+                f.create_dataset('dof_v', data=dof_v_pred)
+                if self.dim == 3:
+                    f.create_dataset('dof_w', data=dof_w_pred)
+            print(f"Predictions saved to {pred_path}")
+
+        print("Prediction complete")
+        print(f"\nReconstructing all predictions")
+        self._pred_rec()
+
+
+    def _pred_rec(self):
+        """
+        Reconstruct the full field predictions from the predicted dofs and save to HDF5.
+        """
+        print(f"{'#'*20}\t{'Reconstructing predictions...':<20}\t{'#'*20}")
+        # get all files in pred directory and loop through them
+        for id, source in enumerate(self.config['eval_data']):
+            name = source.get('name')
+            pred_path = self.paths_bib.pred_dir + name + '_pred.h5'
+            print(f"Reconstructing for {name} from {pred_path}...")
+            with h5py.File(pred_path, 'r') as f:
+                dof_u_pred = f['dof_u'][:]
+                dof_v_pred = f['dof_v'][:]
+                dof_w_pred = f['dof_w'][:] if self.dim == 3 else None
+
+            self.dls.gfem_recon_flexible(
+                    rec_target=pred_path.replace('.h5', '_rec.h5'),
+                    config=self.l_config,
+                    dof_u=dof_u_pred,
+                    dof_v=dof_v_pred,
+                    dof_w=dof_w_pred,
+                    batch_size=self.config['latent_params'].get('batch_size', 100)
+                )
