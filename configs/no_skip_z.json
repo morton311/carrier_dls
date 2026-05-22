@@ -20,7 +20,7 @@
     
     "latent_params" : {
         "type" : "dls",
-        "patch_size" : 19,
+        "patch_size" : 21,
         "num_modes" : 25,
         "localized": true,
         "source_name" : "0aoa",
