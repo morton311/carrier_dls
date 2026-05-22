@@ -21,7 +21,7 @@
     "latent_params" : {
         "type" : "dls",
         "patch_size" : 19,
-        "num_modes" : 50,
+        "num_modes" : 25,
         "localized": true,
         "source_name" : "0aoa",
         "source_path" : "gencarr_transpose",

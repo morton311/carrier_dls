@@ -933,19 +933,24 @@ class runner(nn.Module):
                 RMS_rec = RMS_rec.reshape(nx, ny, nz, 3) if self.dim == 3 else RMS_rec.reshape(nx, ny, 2)
                 f.create_dataset('RMS_rec', data=RMS_rec)
 
+
+        nx = self.l_config.nx
+        ny = self.l_config.ny
+        nz = self.l_config.nz if self.dim == 3 else 1
+
         with h5py.File(gt_path, 'r') as f:
             if 'RMS_gt_'+self.latent_id in f:
                 print(f"RMS for GT already computed and found in {gt_path}. Skipping computation...")
             else:
                 if self.dim == 3:
-                    mean_gt = f['mean'][:nx, :ny, :nz, :]
-                    Q_gt = f['Q_gt'][val_id[time_lag:], :nx, :ny, :nz, :] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+                    mean_gt = f['mean'][:]
+                    Q_gt = f['Q_gt'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
                     Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
                     RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=-1)) # shape: (snaps, ...)
                     RMS_gt = RMS_gt.reshape(nx, ny, nz, 3) 
                 else:
-                    mean_gt = f['mean'][:nx, :ny, :]
-                    Q_gt = f['Q_gt'][val_id[time_lag:], :nx, :ny, :] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+                    mean_gt = f['mean'][:]
+                    Q_gt = f['Q_gt'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
                     Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
                     RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=-1)) # shape: (snaps, ...)
                     RMS_gt = RMS_gt.reshape(nx, ny, 2)
