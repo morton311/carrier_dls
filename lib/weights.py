@@ -27,7 +27,7 @@ def hex_volume(vertices):
             tet_volume(v[3], v[4], v[6], v[7]) +
             tet_volume(v[1], v[4], v[5], v[6]))
 
-def generate_weights_grid(x_grid, y_grid, z_grid):
+def generate_weights_grid_3d(x_grid, y_grid, z_grid):
     """
     Compute volume weights for a general hexahedral mesh.
     
@@ -255,6 +255,73 @@ def generate_weights_grid(x_grid, y_grid, z_grid):
     return weights_grid
 
 
+def generate_weights_grid_2d(x_grid, y_grid):
+    """
+    Compute area weights for a general quadrilateral mesh.
+    
+    Parameters
+    ----------
+    x_grid, y_grid : ndarray, shape (nx, ny)
+        Original grid coordinates
+    
+    Returns
+    -------
+    weights_grid : ndarray, shape (nx, ny)
+        Area of each quadrilateral element
+    """
+    nx, ny = x_grid.shape
+    
+    # Create control grid (cell face centers/vertices) - one larger in each dimension
+    xc = np.zeros((nx + 1, ny + 1))
+    yc = np.zeros((nx + 1, ny + 1))
+
+    # Interior points: average of 4 surrounding grid points
+    xc[1:nx, 1:ny] = 0.25 * (
+        x_grid[:-1, :-1] + x_grid[1:, :-1] +
+        x_grid[1:, 1:] + x_grid[:-1, 1:]
+    )
+    yc[1:nx, 1:ny] = 0.25 * (
+        y_grid[:-1, :-1] + y_grid[1:, :-1] +
+        y_grid[1:, 1:] + y_grid[:-1, 1:]
+    )
+
+    # Face centers: average of 2 surrounding grid points
+    xc[1:nx, 0] = 0.5 * (x_grid[:-1, 0] + x_grid[1:, 0])
+    xc[1:nx, ny] = 0.5 * (x_grid[:-1, -1] + x_grid[1:, -1])
+    yc[1:nx, 0] = 0.5 * (y_grid[:-1, 0] + y_grid[1:, 0])
+    yc[1:nx, ny] = 0.5 * (y_grid[:-1, -1] + y_grid[1:, -1])
+    xc[0, 1:ny] = 0.5 * (x_grid[0, :-1] + x_grid[0, 1:])
+    xc[nx, 1:ny] = 0.5 * (x_grid[-1, :-1] + x_grid[-1, 1:])
+    yc[0, 1:ny] = 0.5 * (y_grid[0, :-1] + y_grid[0, 1:])
+    yc[nx, 1:ny] = 0.5 * (y_grid[-1, :-1] + y_grid[-1, 1:])
+
+    # Corners: just copy from original grid
+    xc[0, 0] = x_grid[0, 0]
+    yc[0, 0] = y_grid[0, 0]
+    xc[nx, 0] = x_grid[-1, 0]
+    yc[nx, 0] = y_grid[-1, 0]
+    xc[0, ny] = x_grid[0, -1]
+    yc[0, ny] = y_grid[0, -1]
+    xc[nx, ny] = x_grid[-1, -1]
+    yc[nx, ny] = y_grid[-1, -1]
+
+    # Compute quadrilateral areas using convex hull
+    weights_grid = np.zeros((nx, ny))
+    for i in range(nx):
+        for j in range(ny):
+            vertices = np.array([
+                [xc[i+1, j], yc[i+1, j]],
+                [xc[i+1, j+1], yc[i+1, j+1]],
+                [xc[i, j+1], yc[i, j+1]],
+                [xc[i, j], yc[i, j]],
+            ])
+            hull = ConvexHull(vertices)
+            weights_grid[i, j] = hull.volume  # In 2D, 'volume' is the area
+
+    
+    return weights_grid
+
+
 if __name__ == "__main__":
     # Load grid from MATLAB file
     data = sio.loadmat("grid.mat")
@@ -265,7 +332,7 @@ if __name__ == "__main__":
     print(f"Grid shape: {x_grid.shape}")
     
     # Compute weights
-    weights_grid = generate_weights_grid(x_grid, y_grid, z_grid)
+    weights_grid = generate_weights_grid_3d(x_grid, y_grid, z_grid)
     
     print(f"Weights shape: {weights_grid.shape}")
     print(f"Min weight: {weights_grid.min():.6e}")
@@ -276,3 +343,6 @@ if __name__ == "__main__":
     # Save to MATLAB file
     sio.savemat("weights_grid.mat", {"weights_grid": weights_grid})
     print("\nSaved to weights_grid.mat")
+
+
+

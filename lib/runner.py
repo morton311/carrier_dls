@@ -46,6 +46,8 @@ class runner(nn.Module):
         self._get_data()
         self._get_model()
         self._compile_model()
+
+        
         
 
     def _init_paths_and_logging(self, config):
@@ -103,6 +105,16 @@ class runner(nn.Module):
             self.l_config = pickle.load(f)
 
         self._latent_split()
+
+        # load dof scaler if exists
+        scaler_path = os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl')
+        if os.path.exists(scaler_path):
+            with open(scaler_path, 'rb') as f:
+                self.dof_mean, self.dof_std = pickle.load(f)
+            print(f"DOF scaler loaded from {scaler_path}")
+        else:
+            print(f"No DOF scaler found at {scaler_path}. Will compute before training.")
+
 
         
 
@@ -395,6 +407,10 @@ class runner(nn.Module):
             ny = self.l_config.ny_g
             nz = self.l_config.nz_g if self.dim == 3 else 1
 
+            skipx = self.config['latent_params'].get('skipx', 1)
+            skipy = self.config['latent_params'].get('skipy', 1)
+            skipz = self.config['latent_params'].get('skipz', 1) if self.dim == 3 else 1
+
             # print l_config attributes
             print(f"l_config attributes:")
             for attr in dir(self.l_config):
@@ -422,7 +438,12 @@ class runner(nn.Module):
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w'] if self.dim == 3 else None
 
-                        lltogl_mat = self._compute_lltogl_mat(skip=self.config['latent_params'].get('skip', 2))
+
+
+                        lltogl_mat = self._compute_lltogl_mat(skipx=skipx, 
+                                                              skipy=skipy, 
+                                                              skipz=skipz
+                                                              ) 
 
                         num_unique_elems = lltogl_mat.shape[0]
 
@@ -672,24 +693,24 @@ class runner(nn.Module):
             print("No training required for f_extrap model")
             self.pred()
 
-    def _compute_lltogl_mat(self, skip=1):
+    def _compute_lltogl_mat(self, skipx=1, skipy=1, skipz=1):
         nx = self.l_config.nx_g
         ny = self.l_config.ny_g
         nz = self.l_config.nz_g if self.dim == 3 else 1
         dof_node = self.l_config.dof_node
-        num_unique_elems = (nx//skip) * (ny//skip) * (nz//skip) if self.dim == 3 else (nx//skip) * (ny//skip)
+        num_unique_elems = (nx//skipx) * (ny//skipy) * (nz//skipz) if self.dim == 3 else (nx//skipx) * (ny//skipy)
         dof_elem = self.l_config.dof_elem
         lltogl_mat = np.zeros((num_unique_elems, dof_elem), dtype=int)
         elem_idx = 0
         if self.dim == 3:
-            for kx in range(0,nx-1,skip):
-                for ky in range(0,ny-1,skip):
-                    for kz in range(0,nz-1,skip):
+            for kx in range(0,nx-1,skipx):
+                for ky in range(0,ny-1,skipy):
+                    for kz in range(0,nz-1,skipz):
                         lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, kz, ny, nz, dof_node, self.dls.node_map())
                         elem_idx += 1
         else:
-            for kx in range(0,nx-1, skip):
-                for ky in range(0,ny-1, skip):
+            for kx in range(0,nx-1, skipx):
+                for ky in range(0,ny-1, skipy):
                     lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, ny, dof_node, self.dls.node_map())
                     elem_idx += 1
         print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
@@ -717,28 +738,28 @@ class runner(nn.Module):
                 dof_u = f[name]['dof_u'][init_id, :]
                 dof_v = f[name]['dof_v'][init_id, :]
                 dof_w = f[name]['dof_w'][init_id, :] if self.dim == 3 else None
-            # Precompute lltogl_mat shape: (num_unique_elems, dof_elem)
-            lltogl_mat = self._compute_lltogl_mat(skip=1)
-            num_unique_elems = lltogl_mat.shape[0]
+            # Precompute lltogl_mat shape: (num_elems, dof_elem)
+            lltogl_mat = self._compute_lltogl_mat()
+            num_elems = lltogl_mat.shape[0]
 
             
-            dof_input = np.zeros((num_unique_elems, len(init_id), self.dim * self.l_config.dof_elem))
+            dof_input = np.zeros((num_elems, len(init_id), self.dim * self.l_config.dof_elem))
             # Extract per-element for initial condition
             if self.dim == 3:
-                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_unique_elems, dof_elem)
+                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_elems, dof_elem)
                 v_sel = dof_v[:, lltogl_mat]
                 w_sel = dof_w[:, lltogl_mat]
-                # reshape to (num_unique_elems, time_lag, dim*dof_elem)
+                # reshape to (num_elems, time_lag, dim*dof_elem)
                 dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2))
             else:
-                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_unique_elems, dof_elem)
+                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_elems, dof_elem)
                 v_sel = dof_v[:, lltogl_mat]
                 dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2))
             dof_input = (dof_input - self.dof_mean[name].numpy()) / self.dof_std[name].numpy()
 
             dof_input = torch.from_numpy(dof_input).float().to(self.device)
             self.model.eval()
-            predictions = np.zeros((len(val_id), num_unique_elems, self.dim * self.l_config.dof_elem))
+            predictions = np.zeros((len(val_id), num_elems, self.dim * self.l_config.dof_elem))
             with torch.no_grad():
                 for t in range(len(val_id) - time_lag):
                     output = self.model(dof_input)
@@ -754,7 +775,7 @@ class runner(nn.Module):
                 dof_v_pred = np.zeros((len(val_id), num_dofs))
                 dof_w_pred = np.zeros((len(val_id), num_dofs))
                 ndof = self.l_config.dof_elem
-                for i in range(num_unique_elems):
+                for i in range(num_elems):
                     dof_u_pred[:, lltogl_mat[i]] = predictions[:, i, :ndof]
                     dof_v_pred[:, lltogl_mat[i]] = predictions[:, i, ndof:2*ndof]
                     dof_w_pred[:, lltogl_mat[i]] = predictions[:, i, 2*ndof:]
@@ -762,7 +783,7 @@ class runner(nn.Module):
                 dof_u_pred = np.zeros((len(val_id), num_dofs))
                 dof_v_pred = np.zeros((len(val_id), num_dofs))
                 ndof = self.l_config.dof_elem
-                for i in range(num_unique_elems):
+                for i in range(num_elems):
                     dof_u_pred[:, lltogl_mat[i]] = predictions[:, i, :ndof]
                     dof_v_pred[:, lltogl_mat[i]] = predictions[:, i, ndof:2*ndof]
 
@@ -802,3 +823,136 @@ class runner(nn.Module):
                     dof_w=dof_w_pred,
                     batch_size=self.config['latent_params'].get('batch_size', 100)
                 )
+            
+
+    def eval(self):
+        """
+        Evaluate the model predictions against the ground truth for all sets in config['eval_data'], save metrics, then generate plots
+        """
+        print(f"{'#'*20}\t{'Evaluating...':<20}\t{'#'*20}")
+        # get all files in pred directory and loop through them
+        for id, source in enumerate(self.config['eval_data']):
+            name = source.get('name')
+            self.paths_bib.pred_fig_dir = os.path.join(self.paths_bib.fig_dir, 'pred' + name + '/')
+            
+            os.makedirs(self.paths_bib.pred_fig_dir, exist_ok=True)
+            rec_path = self.paths_bib.pred_dir + name + '_pred_rec.h5'
+            gt_path = self.paths_bib.data_dir + source.get('path') + '.h5'
+            print(f"Evaluating for {name} between {rec_path} and {gt_path}...")
+            
+            # Compute metrics
+            self.compute_TKE(rec_path, gt_path, name)
+            self.compute_RMS(rec_path, gt_path, name)
+
+
+            
+                
+            
+
+            
+    def compute_TKE(self, rec_path, gt_path, name):
+        """
+        Compute TKE and save to h5s
+        """
+        import lib.weights as wg
+        time_lag = self.config['model_params']['time_lag']
+        val_id = self.indices['eval_data'][name]['val_indices']
+        nx = self.l_config.nx_t
+        ny = self.l_config.ny_t
+        nz = self.l_config.nz_t if self.dim == 3 else 1
+        # Check if weights are already computed and saved, if not compute and save them
+        with h5py.File(gt_path, 'r') as f:
+            if 'weights' in f:
+                print(f"Weights already computed and found in {gt_path}. Loading weights...")
+                weights = f['weights'][:]
+            else:
+                print(f"Weights not found in {gt_path}. Computing weights...")
+                if self.dim == 3:
+                    weights = wg.compute_weights_grid_3d(self.x_grid, self.y_grid, self.z_grid)
+                else:
+                    weights = wg.compute_weights_grid_2d(self.x_grid, self.y_grid)
+                f.create_dataset('weights', data=weights)
+                print(f"Weights computed and saved to {gt_path}.")
+    
+        if self.dim == 3:
+            weights = weights[:nx, :ny, :nz]
+        else:
+            weights = weights[:nx, :ny]
+            
+
+        with h5py.File(rec_path, 'r+') as f:
+            if 'TKE_rec' in f:
+                print(f"TKE for reconstructed already computed and found in {rec_path}. Skipping computation...")
+            else:
+                Q_rec = f['Q_rec'][time_lag:] # shape: (snaps, ..., dim)
+                Q_rec_weighted = Q_rec * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
+                Q_rec_weighted = Q_rec_weighted.reshape(Q_rec_weighted.shape[0], -1) 
+                
+                TKE_rec = 0.5 * np.sum(Q_rec_weighted**2, axis=-1) # shape: (snaps, ...)
+                f.create_dataset('TKE_rec', data=TKE_rec)
+
+            
+        
+
+        with h5py.File(gt_path, 'r+') as f:
+            if 'TKE_gt_'+self.latent_id in f:
+                print(f"TKE for GT already computed and found in {gt_path}. Skipping computation...")
+            else:
+                if self.dim == 3:
+                    mean_gt = f['mean'][:nx, :ny, :nz, :] # shape: (nx, ny, nz, dim)
+                    Q_gt = f['Q_gt'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
+                    Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
+                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1) 
+                    
+                else:
+                    mean_gt = f['mean'][:nx, :ny, :] # shape: (nx, ny, dim)
+                    Q_gt = f['Q_gt'][:, :nx, :ny, :] - mean_gt[np.newaxis]
+                    Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
+                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1)
+
+                TKE_gt = 0.5 * np.sum(Q_gt_weighted**2, axis=-1) # shape: (snaps, ...)
+                f.create_dataset('TKE_gt_'+self.latent_id, data=TKE_gt)
+                
+            
+    def compute_RMS(self, rec_path, gt_path, name):
+        """
+        Compute RMS error and save to h5s
+        """
+        time_lag = self.config['model_params']['time_lag']
+        val_id = self.indices['eval_data'][name]['val_indices']
+        nx = self.l_config.nx_t
+        ny = self.l_config.ny_t
+        nz = self.l_config.nz_t if self.dim == 3 else 1
+        with h5py.File(rec_path, 'r') as f:
+            if 'RMS_rec' in f:
+                print(f"RMS for reconstructed already computed and found in {rec_path}. Skipping computation...")
+            else:
+                Q_rec = f['Q_rec'][time_lag:] # shape: (snaps, ..., dim)
+                Q_rec = Q_rec.reshape(Q_rec.shape[0], -1)
+                RMS_rec = np.sqrt(np.mean(Q_rec**2, axis=-1)) # shape: (snaps, ...)
+                RMS_rec = RMS_rec.reshape(nx, ny, nz, 3) if self.dim == 3 else RMS_rec.reshape(nx, ny, 2)
+                f.create_dataset('RMS_rec', data=RMS_rec)
+
+        with h5py.File(gt_path, 'r') as f:
+            if 'RMS_gt_'+self.latent_id in f:
+                print(f"RMS for GT already computed and found in {gt_path}. Skipping computation...")
+            else:
+                if self.dim == 3:
+                    mean_gt = f['mean'][:nx, :ny, :nz, :]
+                    Q_gt = f['Q_gt'][val_id[time_lag:], :nx, :ny, :nz, :] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
+                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=-1)) # shape: (snaps, ...)
+                    RMS_gt = RMS_gt.reshape(nx, ny, nz, 3) 
+                else:
+                    mean_gt = f['mean'][:nx, :ny, :]
+                    Q_gt = f['Q_gt'][val_id[time_lag:], :nx, :ny, :] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
+                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=-1)) # shape: (snaps, ...)
+                    RMS_gt = RMS_gt.reshape(nx, ny, 2)
+
+
+                f.create_dataset('RMS_gt_'+self.latent_id, data=RMS_gt)
+                print(f"RMS computed and saved to {gt_path}.")
+
+
+                

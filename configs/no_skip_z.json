@@ -28,7 +28,7 @@
         "batch_size" : 64,
         "skipx" : 2,
         "skipy" : 2,
-        "skipz" : 2
+        "skipz" : 1
     },
 
     "train_data" : [
