@@ -13,4 +13,4 @@ module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-torchrun main.py -c 'distributed' -m 'train' -d "True"
+torchrun main.py -c 'multi_train' -m 'train' -d "True"
