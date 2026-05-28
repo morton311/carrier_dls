@@ -76,7 +76,7 @@ class pathsBib:
         self.model_path = self.model_dir + 'model.pth'
         self.checkpoint_dir = self.model_dir + 'checkpoints/'
         self.checkpoint_path = self.checkpoint_dir + 'checkpoint.tar'
-        self.predictions_dir = self.model_dir + 'pred/'
+        self.pred_dir = self.model_dir + 'pred/'
         self.fig_dir = self.model_dir + 'figs/'
         self.anim_dir = self.model_dir + 'anim/'
         self.metrics_dir = self.model_dir + 'saved_metrics/'

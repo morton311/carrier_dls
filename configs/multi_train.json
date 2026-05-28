@@ -1,0 +1,61 @@
+{
+    "model_params" : {
+        "model_name" :  "vanilla_carrier",
+        "model_type" :  "tr_enc",
+        "time_lag" :    20,
+        "train_ahead" : 5,
+        "num_layers" :  4,
+        "nhead" :       4,
+        "d_model":      512,
+        "ff_dim":       1536,
+        "lr" :          0.001,
+        "lr_factor":    0.5,
+        "lr_patience":  5,
+        "batch_size" :  2048,
+        "num_epochs" :  10000,
+        "patience" :    10,
+        "activation":   "swiglu",
+        "prenorm":      true
+    },
+    
+    "latent_params" : {
+        "type" : "dls",
+        "patch_size" : 21,
+        "num_modes" : 25,
+        "localized": true,
+        "source_name" : "0aoa",
+        "source_path" : "gencarr_transpose",
+        "batch_size" : 64,
+        "skipx" : 2,
+        "skipy" : 2,
+        "skipz" : 1
+    },
+
+    "train_data" : [
+        {
+            "name" : "0aoa",
+            "path" : "gencarr_transpose",
+            "train_split" : 0.9,
+            "test_split" : 0.1
+        },
+        {
+            "name" : "351aoa",
+            "path" : "gencarr_v1_25kt351degabl",
+            "train_split" : 0.9,
+            "test_split" : 0.1
+        }
+    ],
+
+    "eval_data" : [
+        {
+            "name" : "0aoa",
+            "path" : "gencarr_transpose",
+            "pred_split" : 0.1
+        },
+        {
+            "name" : "351aoa",
+            "path" : "gencarr_v1_25kt351degabl",
+            "pred_split" : 0.1
+        }
+    ]
+}

@@ -506,14 +506,6 @@ def gfem_recon_flexible(
         dof_u_arr = dof_u
         dof_v_arr = dof_v
 
-    if dof_u_arr.shape[0] != config.num_snaps:
-        # Accept transposed input format [n_dof, n_snap] as in legacy callers.
-        if dof_u_arr.shape[1] == config.num_snaps:
-            dof_u_arr = dof_u_arr.T
-            dof_v_arr = dof_v_arr.T
-        else:
-            raise ValueError("DOF array shape does not match config.num_snaps.")
-
     num_snaps = dof_u_arr.shape[0]
     num_batches = num_snaps // batch_size + (1 if num_snaps % batch_size else 0)
 

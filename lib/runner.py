@@ -19,13 +19,27 @@ import lib.init as init
 import lib.pod as pod
 import lib.models as models
 import lib.datas as datas
+import lib.plotting as pl
 
 
 class runner(nn.Module):
     def __init__(self, config):
         super(runner, self).__init__()
         self.config = config
-            
+        # check if overwrite, mode, name, and log are in config, if not set to default values
+        if 'overwrite' not in self.config:
+            self.config['overwrite'] = 'x'
+        if 'mode' not in self.config:
+            self.config['mode'] = 'test'
+        if 'name' not in self.config:
+            self.config['name'] = 'test'
+        if 'log' not in self.config:
+            self.config['log'] = 'terminal'
+        if 'device' not in self.config:
+            self.config['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if 'distributed' not in self.config:
+            self.config['distributed'] = False
+
         self.device = config['device']
         self.paths_bib = self._init_paths_and_logging(config)
 
@@ -89,6 +103,8 @@ class runner(nn.Module):
                     print(f"  {sub_key}: {sub_val}")
             else:
                 print(f"{key}: {val}")
+
+        print(f"{'#'*48}")
 
 
     def _get_data(self):
@@ -297,7 +313,10 @@ class runner(nn.Module):
         
         # Load the model weights if they exist and overwrite is not set to 'l' or 'm'
         if os.path.exists(self.paths_bib.model_path) and not self.config['overwrite'] in ['l', 'm']:
-            self.model.load_state_dict(torch.load(self.paths_bib.model_path, weights_only=True, map_location=self.device))
+            weights = torch.load(self.paths_bib.model_path, weights_only=True, map_location=self.device)
+            if not self.config['distributed']:
+                weights = {k.replace('module.', '', 1) if k.startswith('module.') else k: v for k, v in weights.items()}
+            self.model.load_state_dict(weights)
         if self.model is not None:
             self.num_params = sum(p.numel() for p in self.model.parameters())
             print(f"Model initialized with {self.num_params} parameters")
@@ -354,7 +373,8 @@ class runner(nn.Module):
                 checkpoint = torch.load(self.paths_bib.checkpoint_path, weights_only=True, map_location=self.device)
                 checkpoint['model_state_dict'] = remap_embed_keys(checkpoint['model_state_dict'])
                 # strip 'module.' from state dict keys if present (from DDP)
-                checkpoint['model_state_dict'] = {k.replace('module.', '', 1) if k.startswith('module.') else k: v for k, v in checkpoint['model_state_dict'].items()}
+                if not self.config['distributed']:
+                    checkpoint['model_state_dict'] = {k.replace('module.', '', 1) if k.startswith('module.') else k: v for k, v in checkpoint['model_state_dict'].items()}
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -373,6 +393,8 @@ class runner(nn.Module):
                 print(f"Loading model weights from {self.paths_bib.model_path}")
                 state_dict = torch.load(self.paths_bib.model_path, weights_only=True, map_location=self.device)
                 state_dict = remap_embed_keys(state_dict)
+                if not self.config['distributed']:
+                    state_dict = {k.replace('module.', '', 1) if k.startswith('module.') else k: v for k, v in state_dict.items()}
                 self.model.load_state_dict(state_dict)
                 self.checkpointed = False
             else:
@@ -713,8 +735,71 @@ class runner(nn.Module):
                 for ky in range(0,ny-1, skipy):
                     lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, ny, dof_node, self.dls.node_map())
                     elem_idx += 1
-        print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
+        # print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
         return lltogl_mat
+
+    def _predict_dofs_forward(self, name, dof_u, dof_v, dof_w=None, total_steps=None):
+        """
+        Predict dof_u/dof_v(/dof_w) forward in time from initial conditions.
+        Inputs dof_u/dof_v(/dof_w) are expected to contain at least `time_lag` snapshots.
+        Returns full predicted trajectories with shape (total_steps, num_dofs).
+        """
+        time_lag = self.config['model_params']['time_lag']
+        if total_steps is None:
+            total_steps = dof_u.shape[0]
+        if total_steps < time_lag:
+            raise ValueError(f"total_steps ({total_steps}) must be >= time_lag ({time_lag})")
+        if dof_u.shape[0] < time_lag or dof_v.shape[0] < time_lag:
+            raise ValueError("dof_u and dof_v must contain at least time_lag snapshots")
+        if self.dim == 3 and (dof_w is None or dof_w.shape[0] < time_lag):
+            raise ValueError("dof_w must contain at least time_lag snapshots for 3D predictions")
+
+        init_u = dof_u[:time_lag, :]
+        init_v = dof_v[:time_lag, :]
+        init_w = dof_w[:time_lag, :] if self.dim == 3 else None
+
+        lltogl_mat = self._compute_lltogl_mat()
+        num_elems = lltogl_mat.shape[0]
+
+        if self.dim == 3:
+            u_sel = init_u[:, lltogl_mat]
+            v_sel = init_v[:, lltogl_mat]
+            w_sel = init_w[:, lltogl_mat]
+            dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2))
+        else:
+            u_sel = init_u[:, lltogl_mat]
+            v_sel = init_v[:, lltogl_mat]
+            dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2))
+
+        dof_input = (dof_input - self.dof_mean[name].numpy()) / self.dof_std[name].numpy()
+        dof_input = torch.from_numpy(dof_input).float().to(self.device)
+
+        self.model.eval()
+        predictions = np.zeros((num_elems, total_steps, self.dim * self.l_config.dof_elem))
+        predictions[:, :time_lag, :] = dof_input.cpu().numpy()
+
+        with torch.no_grad():
+            for t in range(total_steps - time_lag):
+                output = self.model(dof_input)
+                predictions[:, t + time_lag, :] = output.cpu().numpy()
+                dof_input = torch.cat((dof_input[:, 1:, :], output.unsqueeze(1)), dim=1)
+
+        predictions = predictions * self.dof_std[name].numpy() + self.dof_mean[name].numpy()
+
+        num_dofs = self.l_config.num_gfem_nodes * self.l_config.dof_node
+        ndof = self.l_config.dof_elem
+
+        dof_u_pred = np.zeros((total_steps, num_dofs))
+        dof_v_pred = np.zeros((total_steps, num_dofs))
+        dof_w_pred = np.zeros((total_steps, num_dofs)) if self.dim == 3 else None
+
+        for i in range(num_elems):
+            dof_u_pred[:, lltogl_mat[i]] = predictions[i, :, :ndof]
+            dof_v_pred[:, lltogl_mat[i]] = predictions[i, :, ndof:2*ndof]
+            if self.dim == 3:
+                dof_w_pred[:, lltogl_mat[i]] = predictions[i, :, 2*ndof:]
+
+        return dof_u_pred, dof_v_pred, dof_w_pred
 
 
     def pred(self):
@@ -722,15 +807,22 @@ class runner(nn.Module):
         Make predictions over the validation data with the model for all sets in config['eval_data']
         """
         print(f"{'#'*20}\t{'Predicting...':<20}\t{'#'*20}")
+        pred_sources = []
+        if self.config.get('train_data') is not None:
+            pred_sources.extend((source, 'train_indices') for source in self.config['train_data'])
+        if self.config.get('eval_data') is not None:
+            pred_sources.extend((source, 'val_indices') for source in self.config['eval_data'])
+            
 
-        for id, source in enumerate(self.config['eval_data']):
+        for id, (source, split_key) in enumerate(pred_sources):
             name = source.get('name')
-            val_id = self.indices['eval_data'][name]['val_indices']
+            source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
+            val_id = self.indices[source_group][name][split_key]
             time_lag = self.config['model_params']['time_lag']
             init_id = val_id[:time_lag]
             path = source.get('path')
             path = self.paths_bib.data_dir + path + '.h5'
-            pred_path = self.paths_bib.pred_dir + name + '_pred.h5'
+            pred_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred.h5'
 
 
             print(f"Predicting for {name} from {path}...")
@@ -738,54 +830,16 @@ class runner(nn.Module):
                 dof_u = f[name]['dof_u'][init_id, :]
                 dof_v = f[name]['dof_v'][init_id, :]
                 dof_w = f[name]['dof_w'][init_id, :] if self.dim == 3 else None
-            # Precompute lltogl_mat shape: (num_elems, dof_elem)
-            lltogl_mat = self._compute_lltogl_mat()
-            num_elems = lltogl_mat.shape[0]
+            print(f"Predicting for {name} {source_group}")
 
-            
-            dof_input = np.zeros((num_elems, len(init_id), self.dim * self.l_config.dof_elem))
-            # Extract per-element for initial condition
-            if self.dim == 3:
-                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_elems, dof_elem)
-                v_sel = dof_v[:, lltogl_mat]
-                w_sel = dof_w[:, lltogl_mat]
-                # reshape to (num_elems, time_lag, dim*dof_elem)
-                dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2))
-            else:
-                u_sel = dof_u[:, lltogl_mat]  # shape: (time_lag, num_elems, dof_elem)
-                v_sel = dof_v[:, lltogl_mat]
-                dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2))
-            dof_input = (dof_input - self.dof_mean[name].numpy()) / self.dof_std[name].numpy()
-
-            dof_input = torch.from_numpy(dof_input).float().to(self.device)
-            self.model.eval()
-            predictions = np.zeros((len(val_id), num_elems, self.dim * self.l_config.dof_elem))
-            with torch.no_grad():
-                for t in range(len(val_id) - time_lag):
-                    output = self.model(dof_input)
-                    predictions[:, t + time_lag, :] = output.cpu().numpy()
-                    dof_input = torch.cat((dof_input[:, 1:, :], output.unsqueeze(1)), dim=1)
-            # Rescale predictions back to original scale
-            predictions = predictions * self.dof_std[name].numpy() + self.dof_mean[name].numpy() 
-
-            num_dofs = self.l_config.num_gfem_nodes * self.l_config.dof_node
-            # Reshape predictions to original dof_u, dof_v, dof_w format
-            if self.dim == 3:
-                dof_u_pred = np.zeros((len(val_id), num_dofs))
-                dof_v_pred = np.zeros((len(val_id), num_dofs))
-                dof_w_pred = np.zeros((len(val_id), num_dofs))
-                ndof = self.l_config.dof_elem
-                for i in range(num_elems):
-                    dof_u_pred[:, lltogl_mat[i]] = predictions[:, i, :ndof]
-                    dof_v_pred[:, lltogl_mat[i]] = predictions[:, i, ndof:2*ndof]
-                    dof_w_pred[:, lltogl_mat[i]] = predictions[:, i, 2*ndof:]
-            else:
-                dof_u_pred = np.zeros((len(val_id), num_dofs))
-                dof_v_pred = np.zeros((len(val_id), num_dofs))
-                ndof = self.l_config.dof_elem
-                for i in range(num_elems):
-                    dof_u_pred[:, lltogl_mat[i]] = predictions[:, i, :ndof]
-                    dof_v_pred[:, lltogl_mat[i]] = predictions[:, i, ndof:2*ndof]
+            # long forward prediction of dofs
+            dof_u_pred, dof_v_pred, dof_w_pred = self._predict_dofs_forward(
+                name=name,
+                dof_u=dof_u,
+                dof_v=dof_v,
+                dof_w=dof_w,
+                total_steps=len(val_id)
+            )
 
             # Save predictions to HDF5
             with h5py.File(pred_path, 'w') as f:
@@ -794,6 +848,51 @@ class runner(nn.Module):
                 if self.dim == 3:
                     f.create_dataset('dof_w', data=dof_w_pred)
             print(f"Predictions saved to {pred_path}")
+            
+            # Many short horizon predictions for error growth analysis
+            horizon = self.config['model_params'].get('horizon', 10)
+            max_horizons = 30
+            num_horizons = len(val_id) - time_lag - horizon + 1
+            num_horizons = min(num_horizons, max_horizons)
+
+            dof_true_horizons = np.zeros((num_horizons, horizon, dof_u.shape[1]*self.dim))  # for error growth metrics
+            dof_pred_horizon = np.zeros((num_horizons, horizon, dof_u.shape[1]*self.dim))  # for error growth metrics
+
+            with h5py.File(pred_path, 'r') as f,  h5py.File(self.paths_bib.latent_path, 'r') as f_latent:
+                for i in range(num_horizons):
+                    start_id = val_id[i:i+time_lag]
+                    dof_u_init = f_latent[name]['dof_u'][start_id, :]
+                    dof_v_init = f_latent[name]['dof_v'][start_id, :]
+                    dof_w_init = f_latent[name]['dof_w'][start_id, :] if self.dim == 3 else None
+
+                    dof_u_pred_horizon, dof_v_pred_horizon, dof_w_pred_horizon = self._predict_dofs_forward(
+                        name=name,
+                        dof_u=dof_u_init,
+                        dof_v=dof_v_init,
+                        dof_w=dof_w_init,
+                        total_steps=time_lag+horizon
+                    )
+                    
+                    # compute error growth metrics and save to pred_path
+                    true_id = val_id[i + time_lag:i+time_lag+horizon]
+                    dof_true_u = f_latent[name]['dof_u'][true_id, :]
+                    dof_true_v = f_latent[name]['dof_v'][true_id, :]
+                    dof_true_w = f_latent[name]['dof_w'][true_id, :] if self.dim == 3 else None
+
+                    dof_true = np.concatenate([dof_true_u, dof_true_v, dof_true_w], axis=1) if self.dim == 3 else np.concatenate([dof_true_u, dof_true_v], axis=1)
+                    dof_true_horizons[i] = dof_true
+
+                    temp_dof_pred_horizon = np.concatenate([dof_u_pred_horizon, dof_v_pred_horizon, dof_w_pred_horizon], axis=1) if self.dim == 3 else np.concatenate([dof_u_pred_horizon, dof_v_pred_horizon], axis=1)
+                    dof_pred_horizon[i] = temp_dof_pred_horizon[time_lag:time_lag+horizon]
+            
+
+            # shape: (num_horizons, horizon)
+            horizon_errors = self._l2_err_norm(dof_true_horizons, dof_pred_horizon, axis=2)
+            with h5py.File(pred_path, 'a') as f:
+                f.create_dataset(f'horizon_errors_{name}_{source_group}', data=horizon_errors)
+
+
+
 
         print("Prediction complete")
         print(f"\nReconstructing all predictions")
@@ -806,43 +905,103 @@ class runner(nn.Module):
         """
         print(f"{'#'*20}\t{'Reconstructing predictions...':<20}\t{'#'*20}")
         # get all files in pred directory and loop through them
-        for id, source in enumerate(self.config['eval_data']):
+        pred_sources = []
+        if self.config.get('train_data') is not None:
+            pred_sources.extend((source, 'train_indices') for source in self.config['train_data'])
+        if self.config.get('eval_data') is not None:
+            pred_sources.extend((source, 'val_indices') for source in self.config['eval_data'])
+        for id, (source, split_key) in enumerate(pred_sources):
             name = source.get('name')
-            pred_path = self.paths_bib.pred_dir + name + '_pred.h5'
+            source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
+            pred_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred.h5'
             print(f"Reconstructing for {name} from {pred_path}...")
             with h5py.File(pred_path, 'r') as f:
                 dof_u_pred = f['dof_u'][:]
                 dof_v_pred = f['dof_v'][:]
                 dof_w_pred = f['dof_w'][:] if self.dim == 3 else None
 
-            self.dls.gfem_recon_flexible(
-                    rec_target=pred_path.replace('.h5', '_rec.h5'),
-                    config=self.l_config,
-                    dof_u=dof_u_pred,
-                    dof_v=dof_v_pred,
-                    dof_w=dof_w_pred,
-                    batch_size=self.config['latent_params'].get('batch_size', 100)
-                )
-            
+            if self.dim == 3:
+                self.dls.gfem_recon_flexible(
+                        rec_target=pred_path.replace('.h5', '_rec.h5'),
+                        config=self.l_config,
+                        dof_u=dof_u_pred,
+                        dof_v=dof_v_pred,
+                        dof_w=dof_w_pred,
+                        batch_size=self.config['latent_params'].get('batch_size', 100)
+                    )
+            else:
+                self.dls.gfem_recon_flexible(
+                        rec_target=pred_path.replace('.h5', '_rec.h5'),
+                        config=self.l_config,
+                        dof_u=dof_u_pred,
+                        dof_v=dof_v_pred,
+                        batch_size=self.config['latent_params'].get('batch_size', 100)
+                    )
+    def _l2_err_norm(self, true, pred, axis=None):
+        """
+        Compute the L2 norm between two arrays.
+        """
+        return np.linalg.norm(true - pred, axis=axis) / np.linalg.norm(true, axis=axis)
 
     def eval(self):
         """
         Evaluate the model predictions against the ground truth for all sets in config['eval_data'], save metrics, then generate plots
         """
+        
         print(f"{'#'*20}\t{'Evaluating...':<20}\t{'#'*20}")
         # get all files in pred directory and loop through them
-        for id, source in enumerate(self.config['eval_data']):
+        self.latent_id = self.paths_bib.latent_id
+        pl.plot_loss(self)
+
+        pred_sources = []
+        if self.config.get('train_data') is not None:
+            pred_sources.extend((source, 'train_indices') for source in self.config['train_data'])
+        if self.config.get('eval_data') is not None:
+            pred_sources.extend((source, 'val_indices') for source in self.config['eval_data'])
+
+        for id, (source, split_key) in enumerate(pred_sources):
             name = source.get('name')
-            self.paths_bib.pred_fig_dir = os.path.join(self.paths_bib.fig_dir, 'pred' + name + '/')
+            source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
+            ids = self.indices[source_group][name][split_key]
+            self.frequency = source.get('frequency', 100)
+            z_slice = source.get('z_slice', self.l_config.nz_t//2) if self.dim == 3 else None
+            y_slice = source.get('y_slice', self.l_config.ny_t//2) if self.dim == 3 else None
+            x_slice = source.get('x_slice', 50) if self.dim == 3 else None
+            
+            self.paths_bib.pred_fig_dir = os.path.join(self.paths_bib.fig_dir, 'pred' + name + source_group + '/')
             
             os.makedirs(self.paths_bib.pred_fig_dir, exist_ok=True)
-            rec_path = self.paths_bib.pred_dir + name + '_pred_rec.h5'
+            rec_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred_rec.h5'
             gt_path = self.paths_bib.data_dir + source.get('path') + '.h5'
             print(f"Evaluating for {name} between {rec_path} and {gt_path}...")
             
             # Compute metrics
-            self.compute_TKE(rec_path, gt_path, name)
-            self.compute_RMS(rec_path, gt_path, name)
+            self.compute_TKE(rec_path, gt_path, name, source_group, ids)
+            self.compute_RMS(rec_path, gt_path, name, source_group, ids)
+
+            pl.plot_TKE(self, rec_path, gt_path, name, source_group,  ids)
+            pl.plot_RMS(self, rec_path, gt_path, name, source_group, z_slice=z_slice)
+            pl.plot_RMS(self, rec_path, gt_path, name, source_group, y_slice=y_slice)
+            pl.plot_RMS(self, rec_path, gt_path, name, source_group, x_slice=x_slice)
+
+            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  z_slice=z_slice)
+            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  z_slice=z_slice)
+
+            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  y_slice=y_slice)
+            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  y_slice=y_slice)
+            
+            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  x_slice=x_slice)
+            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  x_slice=x_slice)
+            
+            # pl.q_criterion(self, rec_path, gt_path, name, ids, 1)
+            # pl.q_criterion(self, rec_path, gt_path, name, ids, 30)
+            # pl.anim_q_criterion(self, rec_path, gt_path, name, ids)
+
+            pl.plot_horizon_errors(self, rec_path, gt_path, name, source_group)
+
+
+
+
 
 
             
@@ -850,27 +1009,27 @@ class runner(nn.Module):
             
 
             
-    def compute_TKE(self, rec_path, gt_path, name):
+    def compute_TKE(self, rec_path, gt_path, name, source, ids):
         """
         Compute TKE and save to h5s
         """
         import lib.weights as wg
         time_lag = self.config['model_params']['time_lag']
-        val_id = self.indices['eval_data'][name]['val_indices']
+        val_id = ids
         nx = self.l_config.nx_t
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
         # Check if weights are already computed and saved, if not compute and save them
-        with h5py.File(gt_path, 'r') as f:
+        with h5py.File(gt_path, 'r+') as f:
             if 'weights' in f:
                 print(f"Weights already computed and found in {gt_path}. Loading weights...")
                 weights = f['weights'][:]
             else:
                 print(f"Weights not found in {gt_path}. Computing weights...")
                 if self.dim == 3:
-                    weights = wg.compute_weights_grid_3d(self.x_grid, self.y_grid, self.z_grid)
+                    weights = wg.generate_weights_grid_3d(self.x_grid, self.y_grid, self.z_grid)
                 else:
-                    weights = wg.compute_weights_grid_2d(self.x_grid, self.y_grid)
+                    weights = wg.generate_weights_grid_2d(self.x_grid, self.y_grid)
                 f.create_dataset('weights', data=weights)
                 print(f"Weights computed and saved to {gt_path}.")
     
@@ -883,8 +1042,10 @@ class runner(nn.Module):
         with h5py.File(rec_path, 'r+') as f:
             if 'TKE_rec' in f:
                 print(f"TKE for reconstructed already computed and found in {rec_path}. Skipping computation...")
+                TKE_rec = f['TKE_rec'][:]
             else:
-                Q_rec = f['Q_rec'][time_lag:] # shape: (snaps, ..., dim)
+                print(f"TKE for reconstructed not found in {rec_path}. Computing TKE...")
+                Q_rec = f['Q_rec'][:] # shape: (snaps, ..., dim)
                 Q_rec_weighted = Q_rec * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
                 Q_rec_weighted = Q_rec_weighted.reshape(Q_rec_weighted.shape[0], -1) 
                 
@@ -895,41 +1056,49 @@ class runner(nn.Module):
         
 
         with h5py.File(gt_path, 'r+') as f:
-            if 'TKE_gt_'+self.latent_id in f:
+
+            if 'TKE_gt_'+self.latent_id + '_' + name + source in f:
                 print(f"TKE for GT already computed and found in {gt_path}. Skipping computation...")
+                TKE_gt = f['TKE_gt_'+self.latent_id + '_' + name + source][:]
             else:
+                print(f"TKE for GT not found in {gt_path}. Computing TKE...")
                 if self.dim == 3:
                     mean_gt = f['mean'][:nx, :ny, :nz, :] # shape: (nx, ny, nz, dim)
-                    Q_gt = f['Q_gt'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
+                    Q_gt = f['UV'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
                     Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
                     Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1) 
                     
                 else:
                     mean_gt = f['mean'][:nx, :ny, :] # shape: (nx, ny, dim)
-                    Q_gt = f['Q_gt'][:, :nx, :ny, :] - mean_gt[np.newaxis]
+                    Q_gt = f['UV'][:, :nx, :ny, :] - mean_gt[np.newaxis]
                     Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
                     Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1)
 
                 TKE_gt = 0.5 * np.sum(Q_gt_weighted**2, axis=-1) # shape: (snaps, ...)
-                f.create_dataset('TKE_gt_'+self.latent_id, data=TKE_gt)
+                f.create_dataset('TKE_gt_'+self.latent_id + '_' + name + source, data=TKE_gt)
+
+        TKE_error = pl.l2_err_norm(TKE_gt[val_id[time_lag:]], TKE_rec[time_lag:])
+        print(f"TKE error for {name} {source}: {100 * TKE_error:.4f}%")
                 
             
-    def compute_RMS(self, rec_path, gt_path, name):
+    def compute_RMS(self, rec_path, gt_path, name, source, ids):
         """
         Compute RMS error and save to h5s
         """
         time_lag = self.config['model_params']['time_lag']
-        val_id = self.indices['eval_data'][name]['val_indices']
+        val_id = ids
         nx = self.l_config.nx_t
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
-        with h5py.File(rec_path, 'r') as f:
+        with h5py.File(rec_path, 'r+') as f:
             if 'RMS_rec' in f:
                 print(f"RMS for reconstructed already computed and found in {rec_path}. Skipping computation...")
+                RMS_rec = f['RMS_rec'][:]
             else:
+                print(f"RMS for reconstructed not found in {rec_path}. Computing RMS...")
                 Q_rec = f['Q_rec'][time_lag:] # shape: (snaps, ..., dim)
                 Q_rec = Q_rec.reshape(Q_rec.shape[0], -1)
-                RMS_rec = np.sqrt(np.mean(Q_rec**2, axis=-1)) # shape: (snaps, ...)
+                RMS_rec = np.sqrt(np.mean(Q_rec**2, axis=0)) # shape: (snaps, ...)
                 RMS_rec = RMS_rec.reshape(nx, ny, nz, 3) if self.dim == 3 else RMS_rec.reshape(nx, ny, 2)
                 f.create_dataset('RMS_rec', data=RMS_rec)
 
@@ -938,26 +1107,40 @@ class runner(nn.Module):
         ny = self.l_config.ny
         nz = self.l_config.nz if self.dim == 3 else 1
 
-        with h5py.File(gt_path, 'r') as f:
-            if 'RMS_gt_'+self.latent_id in f:
+        with h5py.File(gt_path, 'r+') as f:
+            if 'RMS_gt_'+self.latent_id + '_' + name+ source in f:
                 print(f"RMS for GT already computed and found in {gt_path}. Skipping computation...")
+                RMS_gt = f['RMS_gt_'+self.latent_id + '_' + name+ source][:]
             else:
+                print(f"RMS for GT not found in {gt_path}. Computing RMS...")
                 if self.dim == 3:
                     mean_gt = f['mean'][:]
-                    Q_gt = f['Q_gt'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+                    Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
                     Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
-                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=-1)) # shape: (snaps, ...)
+                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0)) 
                     RMS_gt = RMS_gt.reshape(nx, ny, nz, 3) 
                 else:
                     mean_gt = f['mean'][:]
-                    Q_gt = f['Q_gt'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+                    Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
                     Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
-                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=-1)) # shape: (snaps, ...)
+                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0)) # shape: (snaps, ...)
                     RMS_gt = RMS_gt.reshape(nx, ny, 2)
 
 
-                f.create_dataset('RMS_gt_'+self.latent_id, data=RMS_gt)
+                f.create_dataset('RMS_gt_'+self.latent_id + '_' + name+ source, data=RMS_gt)
                 print(f"RMS computed and saved to {gt_path}.")
 
-
+        nx = self.l_config.nx_t
+        ny = self.l_config.ny_t
+        nz = self.l_config.nz_t if self.dim == 3 else 1
+        RMS_gt = RMS_gt[:nx, :ny, :nz, :] if self.dim == 3 else RMS_gt[:nx, :ny, :]
+        RMS_error = pl.l2_err_norm(RMS_gt, RMS_rec)
+        print(f"RMS error for {name} {source}: {100 * RMS_error:.4f}%")
+        RMS_u_error = pl.l2_err_norm(RMS_gt[..., 0], RMS_rec[..., 0])
+        RMS_v_error = pl.l2_err_norm(RMS_gt[..., 1], RMS_rec[..., 1])
+        print(f"RMS_u error for {name} {source}: {100 * RMS_u_error:.4f}%")
+        print(f"RMS_v error for {name} {source}: {100 * RMS_v_error:.4f}%")
+        if self.dim == 3:
+            RMS_w_error = pl.l2_err_norm(RMS_gt[..., 2], RMS_rec[..., 2])
+            print(f"RMS_w error for {name} {source}: {100 * RMS_w_error:.4f}%")
                 

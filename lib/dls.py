@@ -53,6 +53,44 @@ class dls_long_Config_Flexible:
         )
 
 
+class dls_long_Config_3D_Flexible:
+    num_snaps: int
+    nx: int
+    ny: int
+    nz: int
+    num_vars: int
+    patch_size: int
+    num_modes: int
+    modemat_local_u: np.ndarray
+    modemat_local_v: np.ndarray
+    modemat_local_w: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.nskip = (self.patch_size - 1) // 2
+        self.nskip_sample = self.patch_size - 1
+        self.mid_pt = 1 + self.nskip_sample // 2
+        self.sample_x = range(0, self.nx, self.nskip)
+        self.sample_y = range(0, self.ny, self.nskip)
+        self.sample_z = range(0, self.nz, self.nskip)
+        self.nx_t = max(self.sample_x) + 1
+        self.ny_t = max(self.sample_y) + 1
+        self.nz_t = max(self.sample_z) + 1
+        self.nx_g = len(self.sample_x)
+        self.ny_g = len(self.sample_y)
+        self.nz_g = len(self.sample_z)
+        self.num_gfem_nodes = self.nx_g * self.ny_g * self.nz_g
+        self.num_gfem_elems = (self.nx_g - 1) * (self.ny_g - 1) * (self.nz_g - 1)
+        self.dof_node = self.num_modes + 1
+        self.dof_elem = 8 * self.dof_node
+        self.compression_ratio = (
+            self.num_vars * self.num_snaps * self.nx * self.ny * self.nz
+            / (
+                self.num_vars * self.num_snaps * self.dof_node
+                + self.num_vars * self.num_modes * self.patch_size**3
+            )
+        )
+
+
 def node_map(opp=False) -> np.ndarray:
     # shape: (3, 8)
     IJK = np.array([
@@ -641,15 +679,6 @@ def gfem_recon_flexible(
         dof_u_arr = dof_u
         dof_v_arr = dof_v
         dof_w_arr = dof_w
-
-    if dof_u_arr.shape[0] != config.num_snaps:
-        # Accept transposed input format [n_dof, n_snap] as in legacy callers.
-        if dof_u_arr.shape[1] == config.num_snaps:
-            dof_u_arr = dof_u_arr.T
-            dof_v_arr = dof_v_arr.T
-            dof_w_arr = dof_w_arr.T
-        else:
-            raise ValueError("DOF array shape does not match config.num_snaps.")
 
     num_snaps = dof_u_arr.shape[0]
     num_batches = num_snaps // batch_size + (1 if num_snaps % batch_size else 0)
