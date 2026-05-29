@@ -183,44 +183,57 @@ class runner(nn.Module):
 
     def _latent_split(self):
 
-        if not os.path.exists(self.paths_bib.model_dir + 'split_ids.pkl'):
-
-            with h5py.File(self.paths_bib.latent_path, 'r') as f:
-                snaps = {}
-                for data_source in self.data_sources:
-                    snaps[data_source] = {}
-                    if self.config[data_source] is not None:
-                        for id, source in enumerate(self.config[data_source]):
-                            path = source.get('path')
-                            path = self.paths_bib.data_dir + path + '.h5'
-                            data_name = source.get('name')
-                            snaps[data_source][data_name] = {}
-                            snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
-                            print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]}")
-                            print(f"Splitting data")
-
-                            if data_source == 'train_data':
-                                
-                                indices = self._split_indices(snaps[data_source][data_name]['total'], 
-                                                            train_split=source['train_split'], 
-                                                            test_split=source['test_split'])
-                            elif data_source == 'eval_data':
-
-                                indices = self._split_indices(snaps[data_source][data_name]['total'], 
-                                                            train_split=1-source['pred_split'])
-
-                            snaps[data_source][data_name]['train_indices'] = indices['train_indices']
-                            snaps[data_source][data_name]['test_indices'] = indices['test_indices']
-                            snaps[data_source][data_name]['val_indices'] = indices['val_indices']
-                
-                with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
-                    pickle.dump(snaps, f)
-                print(f"Train, test, and validation indices saved to {self.paths_bib.model_dir + 'split_ids.pkl'}")
-
-        else:
+        # Load existing splits if available
+        if os.path.exists(self.paths_bib.model_dir + 'split_ids.pkl'):
             with open(self.paths_bib.model_dir + 'split_ids.pkl', 'rb') as f:
                 snaps = pickle.load(f)
                 print(f"Train, test, and validation indices loaded from {self.paths_bib.model_dir + 'split_ids.pkl'}")
+        else:
+            snaps = {}
+
+        # Initialize data source dicts if needed
+        for data_source in self.data_sources:
+            if data_source not in snaps:
+                snaps[data_source] = {}
+
+        # Compute splits for missing [data_source][data_name] combinations
+        with h5py.File(self.paths_bib.latent_path, 'r') as f:
+            for data_source in self.data_sources:
+                if self.config[data_source] is not None:
+                    for id, source in enumerate(self.config[data_source]):
+                        path = source.get('path')
+                        path = self.paths_bib.data_dir + path + '.h5'
+                        data_name = source.get('name')
+                        
+                        # Check if splits already exist for this combination
+                        if data_name in snaps[data_source] and 'train_indices' in snaps[data_source][data_name]:
+                            print(f"Splits already exist for {data_source} '{data_name}', skipping")
+                            continue
+                        
+                        # Compute splits for this combination
+                        print(f"Computing splits for {data_source} '{data_name}...")
+                        if data_name not in snaps[data_source]:
+                            snaps[data_source][data_name] = {}
+                        
+                        snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
+                        print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]['total']}")
+
+                        if data_source == 'train_data':
+                            indices = self._split_indices(snaps[data_source][data_name]['total'], 
+                                                        train_split=source['train_split'], 
+                                                        test_split=source['test_split'])
+                        elif data_source == 'eval_data':
+                            indices = self._split_indices(snaps[data_source][data_name]['total'], 
+                                                        train_split=1-source['pred_split'])
+
+                        snaps[data_source][data_name]['train_indices'] = indices['train_indices']
+                        snaps[data_source][data_name]['test_indices'] = indices['test_indices']
+                        snaps[data_source][data_name]['val_indices'] = indices['val_indices']
+        
+        # Save updated splits
+        with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
+            pickle.dump(snaps, f)
+        print(f"Train, test, and validation indices saved to {self.paths_bib.model_dir + 'split_ids.pkl'}")
             
         with h5py.File(self.paths_bib.latent_path, 'r') as f:
             latent_keys = list(f.keys())
