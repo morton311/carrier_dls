@@ -112,9 +112,8 @@ class runner(nn.Module):
         Load the latent coefficients
         """
         print(f"{'#'*20}\t{'Loading data...':<20}\t{'#'*20}")
-        
-        if not os.path.exists(self.paths_bib.latent_path) or self.config['overwrite'] == 'l':
-            self._compute_latent_coefficients()
+    
+        self._compute_latent_coefficients()
 
         # load latent_config 
         with open(self.paths_bib.latent_config_path, 'rb') as f:
@@ -135,12 +134,34 @@ class runner(nn.Module):
         
 
     def _compute_latent_coefficients(self):
+        
         print("Computing latent coefficients...")
         # compute the latent coefficients from source data
         print(f"Source path: {self.paths_bib.source_path}")
         
         if self.config['latent_params']['type'] == 'dls':
-            latent_config = self.dls.gfem_compress_flexible(
+            # Check if latent_path exists and contains the source_name group
+            if os.path.exists(self.paths_bib.latent_path):
+                with h5py.File(self.paths_bib.latent_path, 'r') as f:
+                    if self.config['latent_params']['source_name'] in f:
+                        print(f"Latent coefficients for source {self.config['latent_params']['source_name']} already exist in {self.paths_bib.latent_path}, skipping computation.")
+                    else:
+                        print(f"Latent coefficients for source {self.config['latent_params']['source_name']} not found in {self.paths_bib.latent_path}, computing...")
+                        latent_config = self.dls.gfem_compress_flexible(
+                            data_source = self.paths_bib.source_path,
+                            field_name = 'UV',
+                            group_name = self.config['latent_params']['source_name'],
+                            patch_size = self.config['latent_params']['patch_size'],
+                            num_modes = self.config['latent_params']['num_modes'],
+                            latent_target = self.paths_bib.latent_path,
+                            batch_size = self.config['latent_params']['batch_size'],
+                        )
+                        with open(self.paths_bib.latent_config_path, 'wb') as f:
+                            pickle.dump(latent_config, f)
+                        print("Latent coefficient config saved")
+            else:
+                print(f"Latent file {self.paths_bib.latent_path} not found, computing latent coefficients for source {self.config['latent_params']['source_name']}...")
+                latent_config = self.dls.gfem_compress_flexible(
                     data_source = self.paths_bib.source_path,
                     field_name = 'UV',
                     group_name = self.config['latent_params']['source_name'],
@@ -149,10 +170,15 @@ class runner(nn.Module):
                     latent_target = self.paths_bib.latent_path,
                     batch_size = self.config['latent_params']['batch_size'],
                 )
+            
         
-        with open(self.paths_bib.latent_config_path, 'wb') as f:
-            pickle.dump(latent_config, f)
-        print("Latent coefficient config saved")
+                with open(self.paths_bib.latent_config_path, 'wb') as f:
+                    pickle.dump(latent_config, f)
+                print("Latent coefficient config saved")
+
+        # load latent_config for use in computing latent coefficients for train and eval data
+        with open(self.paths_bib.latent_config_path, 'rb') as f:
+            latent_config = pickle.load(f)
 
         for data_source in self.data_sources:
             print(f"Processing data source {data_source} for latent coefficient computation...")
@@ -167,6 +193,12 @@ class runner(nn.Module):
                         print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
                         continue
                     else:
+                        # Check if data_name group already exists in latent file
+                        with h5py.File(self.paths_bib.latent_path, 'r') as f:
+                            if data_name in f:
+                                print(f"Group {data_name} already exists in latent file, skipping computation.")
+                                continue
+                        
                         print(f"Computing latent coefficients for {data_source} {data_name}...")
                         if self.config['latent_params']['type'] == 'dls':
                             self.dls.gfem_compress_flexible(
