@@ -467,31 +467,28 @@ class runner(nn.Module):
             tl = self.config['model_params']['time_lag']
             ta = self.config['model_params']['train_ahead']
             dof_dim = self.config['model_params']['input_dim']
-            num_gfem_elems = self.l_config.num_gfem_elems
-            dof_node = self.l_config.dof_node
-            dof_elem = self.l_config.dof_elem
-            nx = self.l_config.nx_g
-            ny = self.l_config.ny_g
-            nz = self.l_config.nz_g if self.dim == 3 else 1
+            localized = self.config['latent_params'].get('localized', False)
 
-            skipx = self.config['latent_params'].get('skipx', 1)
-            skipy = self.config['latent_params'].get('skipy', 1)
-            skipz = self.config['latent_params'].get('skipz', 1) if self.dim == 3 else 1
+            if localized:
+                dof_elem = self.l_config.dof_elem
+                skipx = self.config['latent_params'].get('skipx', 1)
+                skipy = self.config['latent_params'].get('skipy', 1)
+                skipz = self.config['latent_params'].get('skipz', 1) if self.dim == 3 else 1
 
-            # print l_config attributes
-            print(f"l_config attributes:")
-            for attr in dir(self.l_config):
-                if not attr.startswith('modemat') and not attr.startswith('_'):
-                    print(f"  {attr}: {getattr(self.l_config, attr)}")
+                # print l_config attributes
+                print(f"l_config attributes:")
+                for attr in dir(self.l_config):
+                    if not attr.startswith('modemat') and not attr.startswith('_'):
+                        print(f"  {attr}: {getattr(self.l_config, attr)}")
 
-            IJK = self.dls.node_map()
+                IJK = self.dls.node_map()
 
             self.dof_mean = {}
             self.dof_std = {}
             self.train_loader = {}
             self.test_loader = {}
             self.sampler = {}
-            
+
             with h5py.File(self.paths_bib.latent_path, 'r') as f:
                 for id, source in enumerate(self.config['train_data']):
                     name = source.get('name')
@@ -499,52 +496,58 @@ class runner(nn.Module):
                     train_indices = self.indices['train_data'][name]['train_indices']
                     test_indices = self.indices['train_data'][name]['test_indices']
 
-
                     if self.config['latent_params']['type'] == 'dls':
                         dof_u = f[name]['dof_u']
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w'] if self.dim == 3 else None
 
+                        if localized:
+                            lltogl_mat = self._compute_lltogl_mat(skipx=skipx, 
+                                                                  skipy=skipy, 
+                                                                  skipz=skipz)
+                            num_unique_elems = lltogl_mat.shape[0]
 
+                            # Compute mean and std: loop over time snapshots (not elements)
+                            dofs = torch.zeros(len(train_indices), num_unique_elems, self.dim * dof_elem)
+                            if self.dim == 3:
+                                for t, idx in enumerate(train_indices):
+                                    u_row = np.array(dof_u[idx, :])
+                                    v_row = np.array(dof_v[idx, :])
+                                    w_row = np.array(dof_w[idx, :])
 
-                        lltogl_mat = self._compute_lltogl_mat(skipx=skipx, 
-                                                              skipy=skipy, 
-                                                              skipz=skipz
-                                                              ) 
+                                    u_sel = u_row[lltogl_mat]
+                                    v_sel = v_row[lltogl_mat]
+                                    w_sel = w_row[lltogl_mat]
 
-                        num_unique_elems = lltogl_mat.shape[0]
+                                    dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=1)
+                                    dofs[t] = torch.from_numpy(dofs_cat).float()
+                            else:
+                                for t, idx in enumerate(train_indices):
+                                    u_row = np.array(dof_u[idx, :])
+                                    v_row = np.array(dof_v[idx, :])
 
-                        # Compute mean and std: loop over time snapshots (not elements)
-                        dofs = torch.zeros(len(train_indices), num_unique_elems, self.dim * dof_elem)
-                        if self.dim == 3:
-                            for t, idx in enumerate(train_indices):
-                                # Read one snapshot row per h5py call (vectorized)
-                                u_row = np.array(dof_u[idx, :])
-                                v_row = np.array(dof_v[idx, :])
-                                w_row = np.array(dof_w[idx, :])
-                                
-                                # Extract per-element in NumPy (all elements at once)
-                                u_sel = u_row[lltogl_mat]  # shape: (num_unique_elems, dof_elem)
-                                v_sel = v_row[lltogl_mat]
-                                w_sel = w_row[lltogl_mat]
-                                
-                                # Concatenate and convert to torch
-                                dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=1)
-                                dofs[t] = torch.from_numpy(dofs_cat).float()
+                                    u_sel = u_row[lltogl_mat]
+                                    v_sel = v_row[lltogl_mat]
+
+                                    dofs_cat = np.concatenate([u_sel, v_sel], axis=1)
+                                    dofs[t] = torch.from_numpy(dofs_cat).float()
                         else:
-                            for t, idx in enumerate(train_indices):
-                                # Read one snapshot row per h5py call (vectorized)
-                                u_row = np.array(dof_u[idx, :])
-                                v_row = np.array(dof_v[idx, :])
-                                
-                                # Extract per-element in NumPy (all elements at once)
-                                u_sel = u_row[lltogl_mat]  # shape: (num_unique_elems, dof_elem)
-                                v_sel = v_row[lltogl_mat]
-                                
-                                # Concatenate and convert to torch
-                                dofs_cat = np.concatenate([u_sel, v_sel], axis=1)
-                                dofs[t] = torch.from_numpy(dofs_cat).float()
-                            
+                            num_dofs = dof_u.shape[1]
+                            dofs = torch.zeros(len(train_indices), self.dim * num_dofs)
+                            if self.dim == 3:
+                                for t, idx in enumerate(train_indices):
+                                    u_row = np.array(dof_u[idx, :])
+                                    v_row = np.array(dof_v[idx, :])
+                                    w_row = np.array(dof_w[idx, :])
+                                    dofs_cat = np.concatenate([u_row, v_row, w_row], axis=0)
+                                    dofs[t] = torch.from_numpy(dofs_cat).float()
+                            else:
+                                for t, idx in enumerate(train_indices):
+                                    u_row = np.array(dof_u[idx, :])
+                                    v_row = np.array(dof_v[idx, :])
+                                    dofs_cat = np.concatenate([u_row, v_row], axis=0)
+                                    dofs[t] = torch.from_numpy(dofs_cat).float()
+
                     self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))  # scalar normalization
                     self.dof_std[name] = torch.std(dofs, dim=(0, 1))
                     print(f"Mean/std shapes: {self.dof_mean[name].shape}, {self.dof_std[name].shape}")
@@ -552,54 +555,68 @@ class runner(nn.Module):
                     # Helper to get normalized dof sequence as torch tensor (vectorized batch read)
                     def get_dof_seq(idx, length, latent_type='dls'):
                         if latent_type == 'dls':
-                            # Read batch of rows once from HDF5
                             u_rows = np.array(dof_u[idx:idx+length, :])
                             v_rows = np.array(dof_v[idx:idx+length, :])
                             w_rows = np.array(dof_w[idx:idx+length, :]) if self.dim == 3 else None
-                            
-                            # Extract per-element, all at once in NumPy
-                            u_sel = u_rows[:, lltogl_mat]  # shape: (length, num_unique_elems, dof_elem)
-                            v_sel = v_rows[:, lltogl_mat]
-                            w_sel = w_rows[:, lltogl_mat] if self.dim == 3 else None
-                            
-                            # Concatenate along last axis
-                            if self.dim == 3:
-                                dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=2)  # (length, num_unique_elems, 3*dof_elem)  
+
+                            if localized:
+                                u_sel = u_rows[:, lltogl_mat]
+                                v_sel = v_rows[:, lltogl_mat]
+                                w_sel = w_rows[:, lltogl_mat] if self.dim == 3 else None
+
+                                if self.dim == 3:
+                                    dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=2)
+                                else:
+                                    dofs_cat = np.concatenate([u_sel, v_sel], axis=2)
                             else:
-                                dofs_cat = np.concatenate([u_sel, v_sel], axis=2)  # (length, num_unique_elems, 2*dof_elem)
+                                if self.dim == 3:
+                                    dofs_cat = np.concatenate([u_rows, v_rows, w_rows], axis=1)
+                                else:
+                                    dofs_cat = np.concatenate([u_rows, v_rows], axis=1)
+
                             dof = torch.from_numpy(dofs_cat).float()
-                        
+
                         dof = (dof - self.dof_mean[name]) / self.dof_std[name]
                         return dof
 
-                    # Prepare lists for X/Y, then stack at the end
-                    X_train = torch.zeros(len(train_indices) * num_unique_elems, tl, dof_dim)
-                    Y_train = torch.zeros(len(train_indices) * num_unique_elems, ta, dof_dim)
+                    if localized:
+                        num_samples = num_unique_elems
+                        X_train = torch.zeros(len(train_indices) * num_samples, tl, dof_dim)
+                        Y_train = torch.zeros(len(train_indices) * num_samples, ta, dof_dim)
+                        X_test = torch.zeros(len(test_indices) * num_samples, tl, dof_dim)
+                        Y_test = torch.zeros(len(test_indices) * num_samples, ta, dof_dim)
 
-                    X_test = torch.zeros(len(test_indices) * num_unique_elems, tl, dof_dim)
-                    Y_test = torch.zeros(len(test_indices) * num_unique_elems, ta, dof_dim)
+                        for t, idx in enumerate(train_indices):
+                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            for iind in range(num_samples):
+                                X_train[t*num_samples + iind] = dof_seq[:tl, iind, :]
+                                Y_train[t*num_samples + iind] = dof_seq[tl:tl+ta, iind, :]
 
-                    # Vectorized data loading: loop over time indices (not elements)
-                    for t, idx in enumerate(train_indices):
-                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                        # dof_seq shape: (tl+ta, num_unique_elems, dim*dof_elem)
-                        for iind in range(num_unique_elems):
-                            X_train[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
-                            Y_train[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
-                    
-                    for t, idx in enumerate(test_indices):
-                        dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
-                        # dof_seq shape: (tl+ta, num_unique_elems, dim*dof_elem)
-                        for iind in range(num_unique_elems):
-                            X_test[t*num_unique_elems + iind] = dof_seq[:tl, iind, :]
-                            Y_test[t*num_unique_elems + iind] = dof_seq[tl:tl+ta, iind, :]
+                        for t, idx in enumerate(test_indices):
+                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            for iind in range(num_samples):
+                                X_test[t*num_samples + iind] = dof_seq[:tl, iind, :]
+                                Y_test[t*num_samples + iind] = dof_seq[tl:tl+ta, iind, :]
+                    else:
+                        X_train = torch.zeros(len(train_indices), tl, dof_dim)
+                        Y_train = torch.zeros(len(train_indices), ta, dof_dim)
+                        X_test = torch.zeros(len(test_indices), tl, dof_dim)
+                        Y_test = torch.zeros(len(test_indices), ta, dof_dim)
 
+                        for t, idx in enumerate(train_indices):
+                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            X_train[t] = dof_seq[:tl, :]
+                            Y_train[t] = dof_seq[tl:tl+ta, :]
+
+                        for t, idx in enumerate(test_indices):
+                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            X_test[t] = dof_seq[:tl, :]
+                            Y_test[t] = dof_seq[tl:tl+ta, :]
 
                     print(f"Data loaded for {name}. Shapes before stacking: X_train {X_train.shape}, Y_train {Y_train.shape}, X_test {X_test.shape}, Y_test {Y_test.shape}")
                     print(f"X_train shape: {X_train.shape}, Y_train shape: {Y_train.shape}, dtype: {X_train.dtype}")
                     print(f"X_test shape: {X_test.shape}, Y_test shape: {Y_test.shape}, dtype: {X_test.dtype}")
 
-                    # convert to data loader (keep on CPU, move batch-by-batch during training)
                     if self.config['distributed']:
                         self.train_loader[name], self.sampler[name] = datas.make_dataloader(X_train, Y_train, batch_size=self.config['model_params']['batch_size'], shuffle=True, distributed=True)
                     else:
