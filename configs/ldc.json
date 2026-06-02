@@ -2,7 +2,7 @@
     "model_params" : {
         "model_name" :  "ldc",
         "model_type" :  "tr_enc",
-        "time_lag" :    64,
+        "time_lag" :    20,
         "train_ahead" : 5,
         "num_layers" :  4,
         "nhead" :       4,
@@ -11,7 +11,7 @@
         "lr" :          0.001,
         "lr_factor":    0.5,
         "lr_patience":  5,
-        "batch_size" :  2048,
+        "batch_size" :  4096,
         "num_epochs" :  10000,
         "patience" :    10,
         "activation":   "swiglu",
@@ -20,8 +20,8 @@
     
     "latent_params" : {
         "type" : "dls",
-        "patch_size" : 19,
-        "num_modes" : 10,
+        "patch_size" : 49,
+        "num_modes" : 20,
         "localized": true,
         "source_name" : "ldc_15k",
         "source_path" : "ldc_15k",
@@ -35,7 +35,7 @@
         {
             "name" : "ldc_15k",
             "path" : "ldc_15k",
-            "train_split" : 0.9,
+            "train_split" : 0.8,
             "test_split" : 0.1
         }
     ],
@@ -44,7 +44,7 @@
         {
             "name" : "ldc_15k",
             "path" : "ldc_15k",
-            "pred_split" : 0.1
+            "pred_split" : 0.2
         }
     ]
 }

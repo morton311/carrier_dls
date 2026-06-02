@@ -7,7 +7,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH -t 24:00:00
-#SBATCH --output=out_carrier.out
+#SBATCH --output=out/carrier.out
 
 module use $HOME/my_modules
 module load torch_module

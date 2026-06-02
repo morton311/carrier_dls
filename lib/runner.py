@@ -394,10 +394,12 @@ class runner(nn.Module):
                 patience=self.config['model_params'].get('lr_patience', 5),
                 min_lr=1e-7
             )
+            self.scaler = torch.amp.GradScaler()
 
             print(f"Loss function: {self.criterion}")
             print(f"Optimizer: {self.optimizer}")
             print(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)})")
+            print(f"Using mixed precision training with GradScaler: {self.scaler}")
 
             # Helper function to remap 'embed' keys to 'input_projection'
             def remap_embed_keys(state_dict):
@@ -425,6 +427,8 @@ class runner(nn.Module):
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if 'lr_scheduler_state_dict' in checkpoint:
                     self.scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+                if 'scaler_state_dict' in checkpoint:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 self.epoch = checkpoint['epoch']
                 self.losses = checkpoint['losses']
                 self.test_losses = checkpoint['test_losses']
@@ -666,31 +670,33 @@ class runner(nn.Module):
                 for key in self.train_loader: 
                     if self.config['distributed']:
                         self.sampler[key].set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
-                    loader = self.train_loader[key]
-                    for inputs, targets in loader: 
+                    for inputs, targets in self.train_loader[key]: 
                         inputs, targets = inputs.to(self.device), targets.to(self.device)
                         self.optimizer.zero_grad()
                         total_loss = 0.0
+                        
 
                         for n in range(targets.shape[1]):
-                            # print(f"Step {n+1}/{targets.shape[1]}, VRAM usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                            print(f"Step {n+1}/{targets.shape[1]}, VRAM usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
                             target = targets[:, n, :]  # shape: [B, input_dim]
 
                             # Forward pass
-                            outputs = self.model(inputs)  # shape: [B, input_dim]
-                            loss = self.criterion(outputs, target)
+                            with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=use_amp)
+                                outputs = self.model(inputs)  # shape: [B, input_dim]
+                                loss = self.criterion(outputs, target)
 
                             # Backward and optimization for current step only
                             total_loss += loss
-                            loss.backward()
+                            self.scaler.scale(loss).backward()
 
                             # Prepare input for next step
                             inputs = torch.cat((inputs[:, 1:, :], outputs.detach().unsqueeze(1)), dim=1)
 
-                        epoch_loss += total_loss.item() / (targets.shape[1] * len(loader))
-
+                        epoch_loss += total_loss.item() / (targets.shape[1] * len(self.train_loader[key]))
+                        self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-                        self.optimizer.step()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
 
                 losses.append(epoch_loss)
 
@@ -700,14 +706,14 @@ class runner(nn.Module):
                 test_loss = 0
                 with torch.no_grad():
                     for key in self.test_loader:
-                        loader = self.test_loader[key]
-                        for inputs, targets in loader:
+                        for inputs, targets in self.test_loader[key]:
                             inputs, targets = inputs.to(self.device), targets.to(self.device)
                             for n in range(targets.shape[1]):
                                 target = targets[:, n, :]
-                                outputs = self.model(inputs)
-                                loss = self.criterion(outputs, target)
-                                test_loss += loss.item() / (targets.shape[1] * len(loader))
+                                with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=use_amp)
+                                    outputs = self.model(inputs)
+                                    loss = self.criterion(outputs, target)
+                                test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
                                 inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
 
                 test_losses.append(test_loss)
