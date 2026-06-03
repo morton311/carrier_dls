@@ -7,7 +7,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH -t 24:00:00
-#SBATCH --output=output/out_ldc.out
+#SBATCH --output=output/ldc.out
 
 module use $HOME/my_modules
 module load torch_module

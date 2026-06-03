@@ -643,7 +643,7 @@ def gfem_compress_flexible(
     if latent_target is None:
         return config, dof_u_all, dof_v_all, dof_w_all
     elif isinstance(latent_target, str):
-        with h5py.File(latent_target, "w") as dof_file:
+        with h5py.File(latent_target, "a") as dof_file:
             grp = dof_file.create_group(group_name if group_name else "dofs")
             grp.create_dataset("dof_u", data=dof_u_all, dtype="float32")
             grp.create_dataset("dof_v", data=dof_v_all, dtype="float32")
@@ -756,7 +756,7 @@ def gfem_recon_flexible(
         return q_rec
 
     if isinstance(rec_target, str):
-        with h5py.File(rec_target, "w") as rec_file:
+        with h5py.File(rec_target, "a") as rec_file:
             rec_file.create_dataset("Q_rec", data=q_rec, dtype="float32")
     else:
         rec_target["Q_rec"] = q_rec

@@ -142,7 +142,7 @@ class runner(nn.Module):
         if self.config['latent_params']['type'] == 'dls':
             # Check if latent_path exists and contains the source_name group
             if os.path.exists(self.paths_bib.latent_path):
-                with h5py.File(self.paths_bib.latent_path, 'r') as f:
+                with h5py.File(self.paths_bib.latent_path, 'r+') as f:
                     if self.config['latent_params']['source_name'] in f:
                         print(f"Latent coefficients for source {self.config['latent_params']['source_name']} already exist in {self.paths_bib.latent_path}, skipping computation.")
                     else:
@@ -681,7 +681,7 @@ class runner(nn.Module):
                             target = targets[:, n, :]  # shape: [B, input_dim]
 
                             # Forward pass
-                            with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=use_amp)
+                            with torch.autocast(device_type="cuda", dtype=torch.float16):
                                 outputs = self.model(inputs)  # shape: [B, input_dim]
                                 loss = self.criterion(outputs, target)
 
@@ -710,7 +710,7 @@ class runner(nn.Module):
                             inputs, targets = inputs.to(self.device), targets.to(self.device)
                             for n in range(targets.shape[1]):
                                 target = targets[:, n, :]
-                                with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=use_amp)
+                                with torch.autocast(device_type="cuda", dtype=torch.float16):
                                     outputs = self.model(inputs)
                                     loss = self.criterion(outputs, target)
                                 test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
