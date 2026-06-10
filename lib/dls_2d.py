@@ -9,6 +9,9 @@ from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import factorized
 from tqdm import tqdm
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 ArrayDict = Dict[str, np.ndarray]
 DataInput = Union[str, ArrayDict]
@@ -339,21 +342,21 @@ def gfem_compress_flexible(
     dof_node = num_modes + 1
     dof_elem = 4 * dof_node
 
-    print("shape of mode data:", mode_data.shape)
-    print("number of snapshots:", num_snaps)
-    print("number of batches:", num_snaps // batch_size)
-    print("nx:", nx)
-    print("ny:", ny)
-    print("num_vars:", ndim)
+    logger.info(f"shape of mode data: {mode_data.shape}")
+    logger.info(f"number of snapshots: {num_snaps}")
+    logger.info(f"number of batches: {num_snaps // batch_size}")
+    logger.info(f"nx: {nx}")
+    logger.info(f"ny: {ny}")
+    logger.info(f"num_vars: {ndim}")
 
     if dls_config is None:
-        print("Performing modal decomposition to get local modes")
+        logger.info("Performing modal decomposition to get local modes")
         local_modes_u, _ = Modal_decomp(mode_data[..., 0], patch_size)
         local_modes_v, _ = Modal_decomp(mode_data[..., 1], patch_size)
         
-        print("Modal decomposition done")
+        logger.info("Modal decomposition done")
 
-        print("Constructing local modal matrices")
+        logger.info("Constructing local modal matrices")
         modemat_local_u, modemat_local_wt_u = local_modemat_over_elem(
             grid_x, grid_y, nskip, local_modes_u, num_modes, patch_size
         )
@@ -361,12 +364,12 @@ def gfem_compress_flexible(
             grid_x, grid_y, nskip, local_modes_v, num_modes, patch_size
         )
 
-        print("Local modal matrices constructed")
+        logger.info("Local modal matrices constructed")
     else:
         modemat_local_u = dls_config.modemat_local_u
         modemat_local_v = dls_config.modemat_local_v
 
-        print("Using provided local modal matrices from dls_config")
+        logger.info("Using provided local modal matrices from dls_config")
 
         Wt_vec = _build_wt_vec(nskip)
         modemat_local_wt_u = modemat_local_u.copy()
@@ -376,7 +379,7 @@ def gfem_compress_flexible(
             modemat_local_wt_u[:, kk] *= Wt_vec
             modemat_local_wt_v[:, kk] *= Wt_vec
 
-        print("Constructed weighted local modal matrices from provided local modal matrices")
+        logger.info("Constructed weighted local modal matrices from provided local modal matrices")
 
 
     # With a uniform/structured mesh in this formulation, one local mass matrix is reused.
@@ -389,23 +392,23 @@ def gfem_compress_flexible(
 
     IJK = node_map()
 
-    print("Constructing global M GFEM matrices")
+    logger.info("Constructing global M GFEM matrices")
     for i in range(nx_g - 1):
         for j in range(ny_g - 1):
             lltogl = build_lltogl(i, j, ny_g, dof_node, IJK)
             M_u[np.ix_(lltogl, lltogl)] += M_local_u
             M_v[np.ix_(lltogl, lltogl)] += M_local_v
 
-    print("Prefactorizing M")
+    logger.info("Prefactorizing M")
     solve_M_u = factorized(M_u.tocsc())
     solve_M_v = factorized(M_v.tocsc())
 
-    print("M prefactorized")
+    logger.info("M prefactorized")
 
     dof_u_all = np.zeros((num_snaps, num_gfem_nodes * dof_node), dtype=np.float32)
     dof_v_all = np.zeros((num_snaps, num_gfem_nodes * dof_node), dtype=np.float32)
 
-    print("Looping through snapshots, solving for dofs")
+    logger.info("Looping through snapshots, solving for dofs")
     loops = num_snaps // batch_size + (1 if num_snaps % batch_size else 0)
     total_time = 0.0
 
@@ -456,7 +459,7 @@ def gfem_compress_flexible(
 
         total_time += time.time() - t0
 
-    print(f"Solved for dofs in {total_time:.2f} seconds")
+    logger.info(f"Solved for dofs in {total_time:.2f} seconds")
 
     config = dls_long_Config_Flexible(
         num_snaps=num_snaps,
@@ -526,8 +529,7 @@ def gfem_recon_flexible(
         snap_end = min((bid + 1) * batch_size, num_snaps)
 
         start_time = time.time()
-        sys.stdout.write(f"Processing batch {bid+1}/{num_batches}, batch size: {batch_size}")
-        sys.stdout.flush()
+        logger.info(f"Processing batch {bid+1}/{num_batches}, batch size: {batch_size}")
 
         Q_rec_u = np.zeros((config.nx_t, config.ny_t, snap_end - snap_start))
         Q_rec_v = np.zeros((config.nx_t, config.ny_t, snap_end - snap_start))
@@ -558,17 +560,16 @@ def gfem_recon_flexible(
 
         end_time = time.time()
         batch_time = end_time - start_time
-        sys.stdout.write(f", processed in {batch_time:.2f}s")
+        msg = f"Batch {bid+1}/{num_batches} processed in {batch_time:.2f}s"
         if bid + 1 != num_batches:
             proj_time = (num_batches - (bid + 1)) * batch_time / 60
             proj_time_str = f"{int(proj_time)}m {int((proj_time - int(proj_time)) * 60)}s"
-            sys.stdout.write(f" -> Proj. time: {proj_time_str}")
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+            msg += f" -> Proj. time: {proj_time_str}"
+        logger.info(msg)
 
     if batch_time < 1:
         t_time = t_time/1000  # convert from ms if under 1s
-    sys.stdout.write(f"Total reconstruction time not with saving to disk: {t_time:.2f}s\n\n")
+    logger.info(f"Total reconstruction time not with saving to disk: {t_time:.2f}s")
 
     if rec_target is None:
         return q_rec

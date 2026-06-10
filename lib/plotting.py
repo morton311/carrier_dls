@@ -17,6 +17,9 @@ from matplotlib.ticker import FuncFormatter
 
 from lib.metrics import l2_err_norm
 
+import logging
+logger = logging.getLogger(__name__)
+
 _PAPER_WIDTH_PT = 470
 _PAPER_WIDTH_IN = _PAPER_WIDTH_PT / 72.27
 _PAPER_HEIGHT_IN = _PAPER_WIDTH_IN / 1.618

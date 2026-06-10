@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Tuple
-
+import logging
+logger = logging.getLogger(__name__)
 
 class pathsBib:
     """Stores all filesystem paths used by the runner."""
@@ -26,10 +27,10 @@ class pathsBib:
 
         source_name = config['latent_params'].get('source_name', None)
         if source_name is None:
-            print("Error: No source name specified in latent_params")
+            logger.info("Error: No source name specified in latent_params")
         source_path = config['latent_params'].get('source_path', None)
         if source_path is None:
-            print("Error: No source path specified in latent_params")
+            logger.info("Error: No source path specified in latent_params")
 
         if config['latent_params']['type'] == 'dls':
             self.latent_id = source_name + '_dls_p'  + str(config['latent_params']['patch_size']) + 'm' + str(config['latent_params']['num_modes'])
@@ -87,6 +88,6 @@ def init_path(config: dict) -> Tuple[bool, pathsBib]:
             Path(pth).mkdir(exist_ok=True, parents=True)
         is_init_path = True
     except Exception as exc:
-        print(f"Error: Failed to create full path list: {exc}")
+        logger.info(f"Error: Failed to create full path list: {exc}")
 
     return is_init_path, paths_bib

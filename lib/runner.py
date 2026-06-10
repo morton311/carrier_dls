@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 GRAD_CLIP_MAX_NORM = 0.2
 CHECKPOINT_INTERVAL = 5
+MAX_ERROR_HORIZONS = 30
 
 
 class runner(nn.Module):
@@ -44,6 +45,7 @@ class runner(nn.Module):
 
         self.device = config['device']
         self.paths_bib = self._init_paths_and_logging(config)
+        
 
         self._log_config()
 
@@ -71,9 +73,24 @@ class runner(nn.Module):
         self.data_sources = ['train_data', 'eval_data']
         self.config['group_names'] = paths.data_dict
         if config['mode'] != 'compare' and config['log'] == 'file':
-            sys.stdout = open(paths.log_path, 'w')
-            sys.stderr = open(paths.log_path, 'a')
-            logger.info(f"Logging to {paths.log_path}")
+            log_path = paths.log_path
+            logging.info("To follow the log in real time, run 'tail -f {paths.log_path}'")
+            file_handler = logging.FileHandler(log_path, mode='w')
+            formatter = logging.Formatter('%(message)s')
+            file_handler.setFormatter(formatter)
+
+            root_logger = logging.getLogger()
+            for handler in list(root_logger.handlers):
+                root_logger.removeHandler(handler)
+            root_logger.addHandler(file_handler)
+            root_logger.setLevel(logging.INFO)
+
+            logger.handlers = []
+            logger.addHandler(file_handler)
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+
+            logger.info(f"Logging to {log_path}")
         logger.info(f'Using device: {self.device}')
         return paths
     
@@ -853,7 +870,7 @@ class runner(nn.Module):
             
             # Many short horizon predictions for error growth analysis
             horizon = self.config['model_params'].get('horizon', 10)
-            max_horizons = 30
+            max_horizons = MAX_ERROR_HORIZONS
             num_horizons = len(val_id) - time_lag - horizon + 1
             num_horizons = min(num_horizons, max_horizons)
 
