@@ -3,13 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from functools import partial
-from datetime import datetime
-import os
-import numpy as np
-import time
-from tqdm import tqdm
-import copy
-import pickle
 
 
 ## ==================================== Positional Encoding ======================================
@@ -176,19 +169,6 @@ class RotaryPositionalEmbeddings(nn.Module):
 
     return x_rope
 
-###################################
-# RoPE Multihead Attention module #
-###################################
-class RoPEMultiheadAttention(nn.Module):
-    pass
-    
-    
-########################################
-# RoPE-based Transformer Encoder Layer #
-########################################
-class RoPETransformerEncoderLayer(nn.Module):
-    pass
-    
 ## ====================================== Transformer ============================================
 # Define the Transformer Encoder model
 class TransformerEncoderModel(nn.Module):
@@ -223,7 +203,7 @@ class TransformerEncoderModel(nn.Module):
         for _ in range(num_layers):
             
             if self.use_rope:
-                layer = RoPETransformerEncoderLayer(d_model=d_model, nhead=nhead, ff_dim=ff_dim)
+                raise NotImplementedError("RoPE transformer encoder is not yet implemented")
             else:
                 base_activation = 'relu' if activation == 'swiglu' else activation
                 layer = nn.TransformerEncoderLayer(

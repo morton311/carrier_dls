@@ -1,6 +1,6 @@
+import logging
 import os
 import sys
-# from directory_tree import DisplayTree
 import h5py
 import pickle
 import copy
@@ -10,16 +10,18 @@ import torch
 from torch import nn
 from tqdm import tqdm
 import time
-import builtins
-from functools import partial
-print = partial(print, flush=True)
-builtins.print = print
 
 import lib.init as init
 import lib.pod as pod
 import lib.models as models
 import lib.datas as datas
 import lib.plotting as pl
+from lib.metrics import l2_err_norm
+
+logger = logging.getLogger(__name__)
+
+GRAD_CLIP_MAX_NORM = 0.2
+CHECKPOINT_INTERVAL = 5
 
 
 class runner(nn.Module):
@@ -47,12 +49,12 @@ class runner(nn.Module):
 
         self._get_grid()
 
-        print(self.dim)
+        logger.info(self.dim)
         if self.dim == 3:
-            print("Using 3D DLS for latent coefficient computation")
+            logger.info("Using 3D DLS for latent coefficient computation")
             import lib.dls as dls
         else:
-            print("Using 2D DLS for latent coefficient computation")
+            logger.info("Using 2D DLS for latent coefficient computation")
             import lib.dls_2d as dls
         self.dls = dls
 
@@ -68,14 +70,11 @@ class runner(nn.Module):
         is_init_path, paths = init.init_path(config)
         self.data_sources = ['train_data', 'eval_data']
         self.config['group_names'] = paths.data_dict
-        if config['mode'] != 'compare':
-            if config['log'] == 'file':
-                print(f"To follow the log in real time, run 'tail -f {paths.log_path}'")
-                sys.stdout = open(paths.log_path, 'w')
-                sys.stderr = open(paths.log_path, 'a')
-        
-
-        print(f'Using device: {self.device}')
+        if config['mode'] != 'compare' and config['log'] == 'file':
+            sys.stdout = open(paths.log_path, 'w')
+            sys.stderr = open(paths.log_path, 'a')
+            logger.info(f"Logging to {paths.log_path}")
+        logger.info(f'Using device: {self.device}')
         return paths
     
     def _get_grid(self):
@@ -95,23 +94,23 @@ class runner(nn.Module):
                 self.z = self.z_grid.shape[0] if self.dim == 3 else None
         
     def _log_config(self):
-        print(f"{'#'*20} Configuration {'#'*20}")
+        logger.info(f"{'#'*20} Configuration {'#'*20}")
         for key, val in self.config.items():
             if isinstance(val, dict):
-                print(f"{key}:")
+                logger.info(f"{key}:")
                 for sub_key, sub_val in val.items():
-                    print(f"  {sub_key}: {sub_val}")
+                    logger.info(f"  {sub_key}: {sub_val}")
             else:
-                print(f"{key}: {val}")
+                logger.info(f"{key}: {val}")
 
-        print(f"{'#'*48}")
+        logger.info(f"{'#'*48}")
 
 
     def _get_data(self):
         """
         Load the latent coefficients
         """
-        print(f"{'#'*20}\t{'Loading data...':<20}\t{'#'*20}")
+        logger.info(f"{'#'*20}\t{'Loading data...':<20}\t{'#'*20}")
     
         self._compute_latent_coefficients()
 
@@ -126,27 +125,27 @@ class runner(nn.Module):
         if os.path.exists(scaler_path):
             with open(scaler_path, 'rb') as f:
                 self.dof_mean, self.dof_std = pickle.load(f)
-            print(f"DOF scaler loaded from {scaler_path}")
+            logger.info(f"DOF scaler loaded from {scaler_path}")
         else:
-            print(f"No DOF scaler found at {scaler_path}. Will compute before training.")
+            logger.info(f"No DOF scaler found at {scaler_path}. Will compute before training.")
 
 
         
 
     def _compute_latent_coefficients(self):
         
-        print("Computing latent coefficients...")
+        logger.info("Computing latent coefficients...")
         # compute the latent coefficients from source data
-        print(f"Source path: {self.paths_bib.source_path}")
+        logger.info(f"Source path: {self.paths_bib.source_path}")
         
         if self.config['latent_params']['type'] == 'dls':
             # Check if latent_path exists and contains the source_name group
             if os.path.exists(self.paths_bib.latent_path):
                 with h5py.File(self.paths_bib.latent_path, 'r+') as f:
                     if self.config['latent_params']['source_name'] in f:
-                        print(f"Latent coefficients for source {self.config['latent_params']['source_name']} already exist in {self.paths_bib.latent_path}, skipping computation.")
+                        logger.info(f"Latent coefficients for source {self.config['latent_params']['source_name']} already exist in {self.paths_bib.latent_path}, skipping computation.")
                     else:
-                        print(f"Latent coefficients for source {self.config['latent_params']['source_name']} not found in {self.paths_bib.latent_path}, computing...")
+                        logger.info(f"Latent coefficients for source {self.config['latent_params']['source_name']} not found in {self.paths_bib.latent_path}, computing...")
                         latent_config = self.dls.gfem_compress_flexible(
                             data_source = self.paths_bib.source_path,
                             field_name = 'UV',
@@ -158,9 +157,9 @@ class runner(nn.Module):
                         )
                         with open(self.paths_bib.latent_config_path, 'wb') as f:
                             pickle.dump(latent_config, f)
-                        print("Latent coefficient config saved")
+                        logger.info("Latent coefficient config saved")
             else:
-                print(f"Latent file {self.paths_bib.latent_path} not found, computing latent coefficients for source {self.config['latent_params']['source_name']}...")
+                logger.info(f"Latent file {self.paths_bib.latent_path} not found, computing latent coefficients for source {self.config['latent_params']['source_name']}...")
                 latent_config = self.dls.gfem_compress_flexible(
                     data_source = self.paths_bib.source_path,
                     field_name = 'UV',
@@ -174,14 +173,14 @@ class runner(nn.Module):
         
                 with open(self.paths_bib.latent_config_path, 'wb') as f:
                     pickle.dump(latent_config, f)
-                print("Latent coefficient config saved")
+                logger.info("Latent coefficient config saved")
 
         # load latent_config for use in computing latent coefficients for train and eval data
         with open(self.paths_bib.latent_config_path, 'rb') as f:
             latent_config = pickle.load(f)
 
         for data_source in self.data_sources:
-            print(f"Processing data source {data_source} for latent coefficient computation...")
+            logger.info(f"Processing data source {data_source} for latent coefficient computation...")
             if self.config[data_source] is not None:
                 for id, source in enumerate(self.config[data_source]):
                     source_config = source
@@ -190,16 +189,16 @@ class runner(nn.Module):
                     data_name = source.get('name')
                     
                     if path == self.paths_bib.source_path:
-                        print(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
+                        logger.info(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
                         continue
                     else:
                         # Check if data_name group already exists in latent file
                         with h5py.File(self.paths_bib.latent_path, 'r') as f:
                             if data_name in f:
-                                print(f"Group {data_name} already exists in latent file, skipping computation.")
+                                logger.info(f"Group {data_name} already exists in latent file, skipping computation.")
                                 continue
                         
-                        print(f"Computing latent coefficients for {data_source} {data_name}...")
+                        logger.info(f"Computing latent coefficients for {data_source} {data_name}...")
                         if self.config['latent_params']['type'] == 'dls':
                             self.dls.gfem_compress_flexible(
                                 data_source = path,
@@ -219,7 +218,7 @@ class runner(nn.Module):
         if os.path.exists(self.paths_bib.model_dir + 'split_ids.pkl'):
             with open(self.paths_bib.model_dir + 'split_ids.pkl', 'rb') as f:
                 snaps = pickle.load(f)
-                print(f"Train, test, and validation indices loaded from {self.paths_bib.model_dir + 'split_ids.pkl'}")
+                logger.info(f"Train, test, and validation indices loaded from {self.paths_bib.model_dir + 'split_ids.pkl'}")
         else:
             snaps = {}
 
@@ -239,16 +238,16 @@ class runner(nn.Module):
                         
                         # Check if splits already exist for this combination
                         if data_name in snaps[data_source] and 'train_indices' in snaps[data_source][data_name]:
-                            print(f"Splits already exist for {data_source} '{data_name}', skipping")
+                            logger.info(f"Splits already exist for {data_source} '{data_name}', skipping")
                             continue
                         
                         # Compute splits for this combination
-                        print(f"Computing splits for {data_source} '{data_name}...")
+                        logger.info(f"Computing splits for {data_source} '{data_name}...")
                         if data_name not in snaps[data_source]:
                             snaps[data_source][data_name] = {}
                         
                         snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
-                        print(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]['total']}")
+                        logger.info(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]['total']}")
 
                         if data_source == 'train_data':
                             indices = self._split_indices(snaps[data_source][data_name]['total'], 
@@ -265,7 +264,7 @@ class runner(nn.Module):
         # Save updated splits
         with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
             pickle.dump(snaps, f)
-        print(f"Train, test, and validation indices saved to {self.paths_bib.model_dir + 'split_ids.pkl'}")
+        logger.info(f"Train, test, and validation indices saved to {self.paths_bib.model_dir + 'split_ids.pkl'}")
             
         with h5py.File(self.paths_bib.latent_path, 'r') as f:
             latent_keys = list(f.keys())
@@ -274,7 +273,7 @@ class runner(nn.Module):
                     input_dim = self.dim * self.l_config.dof_elem
                 else:
                     input_dim = self.dim * self.l_config.num_gfem_elems * self.l_config.dof_node
-        print(f"Input dimension for model: {input_dim}")
+        logger.info(f"Input dimension for model: {input_dim}")
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
             
@@ -288,11 +287,11 @@ class runner(nn.Module):
         test_indices = np.arange(train_len - test_len, train_len)
         val_indices = np.arange(train_len, total_snaps)
 
-        print(f"{'Set':<12}|{'Total':<10}|{'First Idx':<12}|{'Last Idx':<12}|{'Sampled':<10}")
-        print("-" * 56)
-        print(f"{'Train':<12}|{train_len:<10}|{train_indices[0]:<12}|{train_indices[-1]:<12}|{sample_train:<10}")
-        print(f"{'Test':<12}|{len(test_indices):<10}|{test_indices[0]:<12}|{test_indices[-1]:<12}|{sample_test:<10}")
-        print(f"{'Validation':<12}|{len(val_indices):<10}|{val_indices[0]:<12}|{val_indices[-1]:<12}|{'-':<10}")
+        logger.info(f"{'Set':<12}|{'Total':<10}|{'First Idx':<12}|{'Last Idx':<12}|{'Sampled':<10}")
+        logger.info("-" * 56)
+        logger.info(f"{'Train':<12}|{train_len:<10}|{train_indices[0]:<12}|{train_indices[-1]:<12}|{sample_train:<10}")
+        logger.info(f"{'Test':<12}|{len(test_indices):<10}|{test_indices[0]:<12}|{test_indices[-1]:<12}|{sample_test:<10}")
+        logger.info(f"{'Validation':<12}|{len(val_indices):<10}|{val_indices[0]:<12}|{val_indices[-1]:<12}|{'-':<10}")
 
         if not os.path.exists(self.paths_bib.model_dir + 'split_ids.pkl'):
             indices = {}
@@ -315,12 +314,12 @@ class runner(nn.Module):
             # save the train, test, and validation indices
             with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
                 pickle.dump(indices, f)
-            print(f"Train, test, and validation indices saved to {self.paths_bib.model_dir + 'split_ids.pkl'}")
+            logger.info(f"Train, test, and validation indices saved to {self.paths_bib.model_dir + 'split_ids.pkl'}")
 
         else:
             with open(self.paths_bib.model_dir + 'split_ids.pkl', 'rb') as f:
                 indices = pickle.load(f)
-            print(f"Train, test, and validation indices loaded from {self.paths_bib.model_dir + 'split_ids.pkl'}")
+            logger.info(f"Train, test, and validation indices loaded from {self.paths_bib.model_dir + 'split_ids.pkl'}")
         
         return indices
     
@@ -329,7 +328,7 @@ class runner(nn.Module):
         Load the model
         """
         # Load the model
-        print(f"{'#'*20}\t{'Loading model...':<20}\t{'#'*20}")
+        logger.info(f"{'#'*20}\t{'Loading model...':<20}\t{'#'*20}")
         if self.config['model_params']['model_type'] == 'tr_enc':
             self.model = models.TransformerEncoderModel(
                         time_lag=self.config['model_params']['time_lag'],
@@ -364,7 +363,7 @@ class runner(nn.Module):
             self.model.load_state_dict(weights)
         if self.model is not None:
             self.num_params = sum(p.numel() for p in self.model.parameters())
-            print(f"Model initialized with {self.num_params} parameters")
+            logger.info(f"Model initialized with {self.num_params} parameters")
 
         if self.config['distributed']:
             from torch.nn.parallel import DistributedDataParallel as DDP
@@ -372,7 +371,7 @@ class runner(nn.Module):
             device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else "cpu")
             self.model.to(device)
             self.model = DDP(self.model, device_ids=[local_rank], output_device=local_rank)
-            print("Model wrapped in DistributedDataParallel for distributed training")
+            logger.info("Model wrapped in DistributedDataParallel for distributed training")
         else:
             self.model = self.model.to(self.device)
 
@@ -381,7 +380,7 @@ class runner(nn.Module):
         Compile the model
         """
         # Define the loss function and optimizer
-        print(f"{'#'*20}\t{'Compiling model...':<20}\t{'#'*20}")
+        logger.info(f"{'#'*20}\t{'Compiling model...':<20}\t{'#'*20}")
 
         if self.model is not None: 
             
@@ -396,10 +395,10 @@ class runner(nn.Module):
             )
             self.scaler = torch.amp.GradScaler()
 
-            print(f"Loss function: {self.criterion}")
-            print(f"Optimizer: {self.optimizer}")
-            print(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)})")
-            print(f"Using mixed precision training with GradScaler: {self.scaler}")
+            logger.info(f"Loss function: {self.criterion}")
+            logger.info(f"Optimizer: {self.optimizer}")
+            logger.info(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)})")
+            logger.info(f"Using mixed precision training with GradScaler: {self.scaler}")
 
             # Helper function to remap 'embed' keys to 'input_projection'
             def remap_embed_keys(state_dict):
@@ -416,7 +415,7 @@ class runner(nn.Module):
             check_flag = os.path.exists(self.paths_bib.checkpoint_path)
             model_flag = os.path.exists(self.paths_bib.model_path)
             if check_flag and not model_flag and not self.config['overwrite'] in ['l', 'm']: 
-                print(f"Loading checkpoint from {self.paths_bib.checkpoint_path}")
+                logger.info(f"Loading checkpoint from {self.paths_bib.checkpoint_path}")
                 checkpoint = torch.load(self.paths_bib.checkpoint_path, weights_only=True, map_location=self.device)
                 checkpoint['model_state_dict'] = remap_embed_keys(checkpoint['model_state_dict'])
                 # strip 'module.' from state dict keys if present (from DDP)
@@ -433,13 +432,13 @@ class runner(nn.Module):
                 self.losses = checkpoint['losses']
                 self.test_losses = checkpoint['test_losses']
                 self.early_stop_counter = checkpoint['early_stop_counter']
-                print(f"Checkpoint loaded")
+                logger.info(f"Checkpoint loaded")
                 self.checkpointed = True
 
             # if model exists and overwrite is not set to 'l' or 'm', load the model and skip training
             elif model_flag and not self.config['overwrite'] in ['l', 'm']:
-                print(f"Model already exists at {self.paths_bib.model_path}. Skipping training.")
-                print(f"Loading model weights from {self.paths_bib.model_path}")
+                logger.info(f"Model already exists at {self.paths_bib.model_path}. Skipping training.")
+                logger.info(f"Loading model weights from {self.paths_bib.model_path}")
                 state_dict = torch.load(self.paths_bib.model_path, weights_only=True, map_location=self.device)
                 state_dict = remap_embed_keys(state_dict)
                 if not self.config['distributed']:
@@ -447,45 +446,72 @@ class runner(nn.Module):
                 self.model.load_state_dict(state_dict)
                 self.checkpointed = False
             else:
-                print(f"Model does not exist at {self.paths_bib.model_path}. Training from scratch.")
+                logger.info(f"Model does not exist at {self.paths_bib.model_path}. Training from scratch.")
                 self.checkpointed = False
 
 
 
-    def train(self):
-        """
-        Train the model
-        """
+    def train(self) -> None:
+        """Train the model."""
         # Load the latent coefficients
-        print(f"{'#'*20}\t{'Training model...':<20}\t{'#'*20}")
+        logger.info(f"{'#'*20}\t{'Training model...':<20}\t{'#'*20}")
         self._get_train_data()
         self._model_fit()
 
 
+    def _load_dof_rows(self, dof_u, dof_v, dof_w, indices, lltogl_mat=None) -> torch.Tensor:
+        """Load and concatenate DOF rows for the given time indices.
+
+        Returns shape (n, n_elems, dim*dof_elem) when lltogl_mat is provided,
+        or (n, dim*num_dofs) otherwise.
+        """
+        rows = []
+        for idx in indices:
+            comps = [np.array(dof_u[idx, :]), np.array(dof_v[idx, :])]
+            if dof_w is not None:
+                comps.append(np.array(dof_w[idx, :]))
+            if lltogl_mat is not None:
+                comps = [c[lltogl_mat] for c in comps]
+                rows.append(np.concatenate(comps, axis=1))
+            else:
+                rows.append(np.concatenate(comps, axis=0))
+        return torch.from_numpy(np.stack(rows)).float()
+
+    def _get_dof_sequence(self, dof_u, dof_v, dof_w, idx: int, length: int,
+                          name: str, lltogl_mat=None) -> torch.Tensor:
+        """Read a contiguous block of length DOF rows starting at idx, then normalize."""
+        u_rows = np.array(dof_u[idx:idx + length, :])
+        v_rows = np.array(dof_v[idx:idx + length, :])
+        comps = [u_rows, v_rows]
+        if dof_w is not None:
+            comps.append(np.array(dof_w[idx:idx + length, :]))
+
+        if lltogl_mat is not None:
+            comps = [c[:, lltogl_mat] for c in comps]
+            dofs_cat = np.concatenate(comps, axis=2)
+        else:
+            dofs_cat = np.concatenate(comps, axis=1)
+
+        dof = torch.from_numpy(dofs_cat).float()
+        dof = (dof - self.dof_mean[name]) / self.dof_std[name]
+        return dof
+
     def _get_train_data(self):
-        """
-        Get training and test data as torch tensors, minimizing memory usage.
-        """
+        """Get training and test data as torch tensors, minimizing memory usage."""
         if self.model is not None:
-            print('Getting training and test data')
+            logger.info('Getting training and test data')
             tl = self.config['model_params']['time_lag']
             ta = self.config['model_params']['train_ahead']
             dof_dim = self.config['model_params']['input_dim']
             localized = self.config['latent_params'].get('localized', False)
 
+            lltogl_mat = None
             if localized:
-                dof_elem = self.l_config.dof_elem
                 skipx = self.config['latent_params'].get('skipx', 1)
                 skipy = self.config['latent_params'].get('skipy', 1)
                 skipz = self.config['latent_params'].get('skipz', 1) if self.dim == 3 else 1
-
-                # print l_config attributes
-                print(f"l_config attributes:")
-                for attr in dir(self.l_config):
-                    if not attr.startswith('modemat') and not attr.startswith('_'):
-                        print(f"  {attr}: {getattr(self.l_config, attr)}")
-
-                IJK = self.dls.node_map()
+                lltogl_mat = self._compute_lltogl_mat(skipx=skipx, skipy=skipy, skipz=skipz)
+                num_unique_elems = lltogl_mat.shape[0]
 
             self.dof_mean = {}
             self.dof_std = {}
@@ -494,9 +520,8 @@ class runner(nn.Module):
             self.sampler = {}
 
             with h5py.File(self.paths_bib.latent_path, 'r') as f:
-                for id, source in enumerate(self.config['train_data']):
+                for source in self.config['train_data']:
                     name = source.get('name')
-                    print(f"indices keys {self.indices['train_data'].keys()}")
                     train_indices = self.indices['train_data'][name]['train_indices']
                     test_indices = self.indices['train_data'][name]['test_indices']
 
@@ -505,84 +530,13 @@ class runner(nn.Module):
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w'] if self.dim == 3 else None
 
-                        if localized:
-                            lltogl_mat = self._compute_lltogl_mat(skipx=skipx, 
-                                                                  skipy=skipy, 
-                                                                  skipz=skipz)
-                            num_unique_elems = lltogl_mat.shape[0]
+                        dofs = self._load_dof_rows(dof_u, dof_v, dof_w, train_indices, lltogl_mat)
 
-                            # Compute mean and std: loop over time snapshots (not elements)
-                            dofs = torch.zeros(len(train_indices), num_unique_elems, self.dim * dof_elem)
-                            if self.dim == 3:
-                                for t, idx in enumerate(train_indices):
-                                    u_row = np.array(dof_u[idx, :])
-                                    v_row = np.array(dof_v[idx, :])
-                                    w_row = np.array(dof_w[idx, :])
-
-                                    u_sel = u_row[lltogl_mat]
-                                    v_sel = v_row[lltogl_mat]
-                                    w_sel = w_row[lltogl_mat]
-
-                                    dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=1)
-                                    dofs[t] = torch.from_numpy(dofs_cat).float()
-                            else:
-                                for t, idx in enumerate(train_indices):
-                                    u_row = np.array(dof_u[idx, :])
-                                    v_row = np.array(dof_v[idx, :])
-
-                                    u_sel = u_row[lltogl_mat]
-                                    v_sel = v_row[lltogl_mat]
-
-                                    dofs_cat = np.concatenate([u_sel, v_sel], axis=1)
-                                    dofs[t] = torch.from_numpy(dofs_cat).float()
-                        else:
-                            num_dofs = dof_u.shape[1]
-                            dofs = torch.zeros(len(train_indices), self.dim * num_dofs)
-                            if self.dim == 3:
-                                for t, idx in enumerate(train_indices):
-                                    u_row = np.array(dof_u[idx, :])
-                                    v_row = np.array(dof_v[idx, :])
-                                    w_row = np.array(dof_w[idx, :])
-                                    dofs_cat = np.concatenate([u_row, v_row, w_row], axis=0)
-                                    dofs[t] = torch.from_numpy(dofs_cat).float()
-                            else:
-                                for t, idx in enumerate(train_indices):
-                                    u_row = np.array(dof_u[idx, :])
-                                    v_row = np.array(dof_v[idx, :])
-                                    dofs_cat = np.concatenate([u_row, v_row], axis=0)
-                                    dofs[t] = torch.from_numpy(dofs_cat).float()
-
-                    self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))  # scalar normalization
+                    self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))
                     self.dof_std[name] = torch.std(dofs, dim=(0, 1))
-                    print(f"Mean/std shapes: {self.dof_mean[name].shape}, {self.dof_std[name].shape}")
+                    logger.info(f"Mean/std shapes: {self.dof_mean[name].shape}, {self.dof_std[name].shape}")
 
-                    # Helper to get normalized dof sequence as torch tensor (vectorized batch read)
-                    def get_dof_seq(idx, length, latent_type='dls'):
-                        if latent_type == 'dls':
-                            u_rows = np.array(dof_u[idx:idx+length, :])
-                            v_rows = np.array(dof_v[idx:idx+length, :])
-                            w_rows = np.array(dof_w[idx:idx+length, :]) if self.dim == 3 else None
-
-                            if localized:
-                                u_sel = u_rows[:, lltogl_mat]
-                                v_sel = v_rows[:, lltogl_mat]
-                                w_sel = w_rows[:, lltogl_mat] if self.dim == 3 else None
-
-                                if self.dim == 3:
-                                    dofs_cat = np.concatenate([u_sel, v_sel, w_sel], axis=2)
-                                else:
-                                    dofs_cat = np.concatenate([u_sel, v_sel], axis=2)
-                            else:
-                                if self.dim == 3:
-                                    dofs_cat = np.concatenate([u_rows, v_rows, w_rows], axis=1)
-                                else:
-                                    dofs_cat = np.concatenate([u_rows, v_rows], axis=1)
-
-                            dof = torch.from_numpy(dofs_cat).float()
-
-                        dof = (dof - self.dof_mean[name]) / self.dof_std[name]
-                        return dof
-
+                    latent_type = self.config['latent_params']['type']
                     if localized:
                         num_samples = num_unique_elems
                         X_train = torch.zeros(len(train_indices) * num_samples, tl, dof_dim)
@@ -591,16 +545,15 @@ class runner(nn.Module):
                         Y_test = torch.zeros(len(test_indices) * num_samples, ta, dof_dim)
 
                         for t, idx in enumerate(train_indices):
-                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            dof_seq = self._get_dof_sequence(dof_u, dof_v, dof_w, idx, tl + ta, name, lltogl_mat)
                             for iind in range(num_samples):
-                                X_train[t*num_samples + iind] = dof_seq[:tl, iind, :]
-                                Y_train[t*num_samples + iind] = dof_seq[tl:tl+ta, iind, :]
-
+                                X_train[t * num_samples + iind] = dof_seq[:tl, iind, :]
+                                Y_train[t * num_samples + iind] = dof_seq[tl:tl + ta, iind, :]
                         for t, idx in enumerate(test_indices):
-                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            dof_seq = self._get_dof_sequence(dof_u, dof_v, dof_w, idx, tl + ta, name, lltogl_mat)
                             for iind in range(num_samples):
-                                X_test[t*num_samples + iind] = dof_seq[:tl, iind, :]
-                                Y_test[t*num_samples + iind] = dof_seq[tl:tl+ta, iind, :]
+                                X_test[t * num_samples + iind] = dof_seq[:tl, iind, :]
+                                Y_test[t * num_samples + iind] = dof_seq[tl:tl + ta, iind, :]
                     else:
                         X_train = torch.zeros(len(train_indices), tl, dof_dim)
                         Y_train = torch.zeros(len(train_indices), ta, dof_dim)
@@ -608,35 +561,84 @@ class runner(nn.Module):
                         Y_test = torch.zeros(len(test_indices), ta, dof_dim)
 
                         for t, idx in enumerate(train_indices):
-                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            dof_seq = self._get_dof_sequence(dof_u, dof_v, dof_w, idx, tl + ta, name)
                             X_train[t] = dof_seq[:tl, :]
-                            Y_train[t] = dof_seq[tl:tl+ta, :]
-
+                            Y_train[t] = dof_seq[tl:tl + ta, :]
                         for t, idx in enumerate(test_indices):
-                            dof_seq = get_dof_seq(idx, tl + ta, latent_type=self.config['latent_params']['type'])
+                            dof_seq = self._get_dof_sequence(dof_u, dof_v, dof_w, idx, tl + ta, name)
                             X_test[t] = dof_seq[:tl, :]
-                            Y_test[t] = dof_seq[tl:tl+ta, :]
+                            Y_test[t] = dof_seq[tl:tl + ta, :]
 
-                    print(f"Data loaded for {name}. Shapes before stacking: X_train {X_train.shape}, Y_train {Y_train.shape}, X_test {X_test.shape}, Y_test {Y_test.shape}")
-                    print(f"X_train shape: {X_train.shape}, Y_train shape: {Y_train.shape}, dtype: {X_train.dtype}")
-                    print(f"X_test shape: {X_test.shape}, Y_test shape: {Y_test.shape}, dtype: {X_test.dtype}")
+                    logger.info(f"Data loaded for {name}: X_train {X_train.shape}, X_test {X_test.shape}")
 
                     if self.config['distributed']:
-                        self.train_loader[name], self.sampler[name] = datas.make_dataloader(X_train, Y_train, batch_size=self.config['model_params']['batch_size'], shuffle=True, distributed=True)
+                        self.train_loader[name], self.sampler[name] = datas.make_dataloader(
+                            X_train, Y_train,
+                            batch_size=self.config['model_params']['batch_size'],
+                            shuffle=True, distributed=True,
+                        )
                     else:
-                        self.train_loader[name] = datas.make_dataloader(X_train, Y_train, batch_size=self.config['model_params']['batch_size'], shuffle=True)
+                        self.train_loader[name] = datas.make_dataloader(
+                            X_train, Y_train,
+                            batch_size=self.config['model_params']['batch_size'],
+                            shuffle=True,
+                        )
 
-                    print(f"Train loader created with {len(self.train_loader[name])} batches")
-
-                    self.test_loader[name] = datas.make_dataloader(X_test, Y_test, batch_size=self.config['model_params']['batch_size'], shuffle=False)
-                    print(f"Test loader created with {len(self.test_loader[name])} batches")
+                    self.test_loader[name] = datas.make_dataloader(
+                        X_test, Y_test,
+                        batch_size=self.config['model_params']['batch_size'],
+                        shuffle=False,
+                    )
+                    logger.info(f"Train loader: {len(self.train_loader[name])} batches | Test loader: {len(self.test_loader[name])} batches")
 
                     with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as f:
                         pickle.dump((self.dof_mean, self.dof_std), f)
 
 
+    def _train_epoch(self, epoch: int, max_norm: float) -> float:
+        """Single forward+backward pass over all training loaders. Returns mean epoch loss."""
+        self.model.train()
+        epoch_loss = 0.0
+        for key in self.train_loader:
+            if self.config['distributed']:
+                self.sampler[key].set_epoch(epoch)
+            for inputs, targets in self.train_loader[key]:
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                self.optimizer.zero_grad()
+                total_loss = 0.0
+                for n in range(targets.shape[1]):
+                    target = targets[:, n, :]
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        outputs = self.model(inputs)
+                        loss = self.criterion(outputs, target)
+                    total_loss += loss
+                    self.scaler.scale(loss).backward()
+                    inputs = torch.cat((inputs[:, 1:, :], outputs.detach().unsqueeze(1)), dim=1)
+                epoch_loss += total_loss.item() / (targets.shape[1] * len(self.train_loader[key]))
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+        return epoch_loss
+
+    def _validate_epoch(self) -> float:
+        """Single forward pass over all test loaders. Returns mean test loss."""
+        self.model.eval()
+        test_loss = 0.0
+        with torch.no_grad():
+            for key in self.test_loader:
+                for inputs, targets in self.test_loader[key]:
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    for n in range(targets.shape[1]):
+                        target = targets[:, n, :]
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            outputs = self.model(inputs)
+                            loss = self.criterion(outputs, target)
+                        test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
+                        inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
+        return test_loss
+
     def _model_fit(self):
-        
         if self.model is not None:
             if self.checkpointed:
                 best_epoch = self.epoch
@@ -654,100 +656,39 @@ class runner(nn.Module):
                 best_epoch = 0
 
             start_time = time.time()
-            
-            max_norm = 0.2
             new_lr = self.scheduler.get_last_lr() if self.scheduler is not None else self.config['model_params']['lr']
             if new_lr is list:
                 new_lr = new_lr[0]
 
-
             for epoch in range(len(losses), self.config['model_params']['num_epochs']):
-                self.model.train()
-                epoch_loss = 0
-                
-
-                ## --------------------------------------- Train ---------------------------------------
-                for key in self.train_loader: 
-                    if self.config['distributed']:
-                        self.sampler[key].set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
-                    for inputs, targets in self.train_loader[key]: 
-                        inputs, targets = inputs.to(self.device), targets.to(self.device)
-                        self.optimizer.zero_grad()
-                        total_loss = 0.0
-                        
-
-                        for n in range(targets.shape[1]):
-                            print(f"Step {n+1}/{targets.shape[1]}, VRAM usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-                            target = targets[:, n, :]  # shape: [B, input_dim]
-
-                            # Forward pass
-                            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                outputs = self.model(inputs)  # shape: [B, input_dim]
-                                loss = self.criterion(outputs, target)
-
-                            # Backward and optimization for current step only
-                            total_loss += loss
-                            self.scaler.scale(loss).backward()
-
-                            # Prepare input for next step
-                            inputs = torch.cat((inputs[:, 1:, :], outputs.detach().unsqueeze(1)), dim=1)
-
-                        epoch_loss += total_loss.item() / (targets.shape[1] * len(self.train_loader[key]))
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-
+                epoch_loss = self._train_epoch(epoch, GRAD_CLIP_MAX_NORM)
                 losses.append(epoch_loss)
 
-                ## --------------------------------------- Test ---------------------------------------
-                # Evaluate the model on the test set
-                self.model.eval()
-                test_loss = 0
-                with torch.no_grad():
-                    for key in self.test_loader:
-                        for inputs, targets in self.test_loader[key]:
-                            inputs, targets = inputs.to(self.device), targets.to(self.device)
-                            for n in range(targets.shape[1]):
-                                target = targets[:, n, :]
-                                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                    outputs = self.model(inputs)
-                                    loss = self.criterion(outputs, target)
-                                test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
-                                inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
-
+                test_loss = self._validate_epoch()
                 test_losses.append(test_loss)
-                
-                # Step scheduler based on test loss (plateau detection)
+
                 self.scheduler.step(test_loss)
                 new_lr = self.scheduler.get_last_lr()[0] if isinstance(new_lr, list) else new_lr
-                
-                
-                ## ------------------------------- Early stop and Checkpoint -------------------------------
-                # Early stopping and saving the best model
+
                 if epoch > 1:
                     if np.isnan(test_losses[-1]) or np.isnan(losses[-1]):
-                        print(f'NaN loss at epoch {epoch+1}. Stopping training.')
+                        logger.info(f'NaN loss at epoch {epoch+1}. Stopping training.')
                         self.model.load_state_dict(best_model)
                         break
                     elif test_loss < best_test_loss:
                         best_test_loss = test_loss
                         best_model = copy.deepcopy(self.model.state_dict())
                         best_epoch = epoch + 1
-                        # print(f'Best model saved at epoch {best_epoch} with test loss: {best_test_loss:.4f}')
                         early_stop_counter = 0
                     else:
                         early_stop_counter += 1
                         if early_stop_counter >= self.config['model_params']['patience']:
-                            print(f'Early stopping at epoch {epoch+1}')
+                            logger.info(f'Early stopping at epoch {epoch+1}')
                             self.model.load_state_dict(best_model)
-                            print(f'Best model loaded from epoch {best_epoch}, with test loss: {best_test_loss:.4f}')
+                            logger.info(f'Best model loaded from epoch {best_epoch}, with test loss: {best_test_loss:.4f}')
                             break
 
-                    if (epoch + 1) % 5 == 0:
-                        # Save model checkpoint every 5 epochs
-                        # Save model losses, current weights, best weights, and optimizer state 
-
+                    if (epoch + 1) % CHECKPOINT_INTERVAL == 0:
                         torch.save({
                             'epoch': epoch,
                             'model_state_dict': self.model.state_dict(),
@@ -758,29 +699,24 @@ class runner(nn.Module):
                             'early_stop_counter': early_stop_counter,
                             'best_model': best_model
                         }, self.paths_bib.checkpoint_path)
-                        # print(f"Checkpoint saved at epoch {epoch+1} to {self.paths_bib.checkpoint_path}")
-                    
+
                 best_flag = 'X' if (epoch + 1) == best_epoch else ' '
-                checkpoint_flag = 'X' if (epoch + 1) % 5 == 0 else ' '
-                print(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} | LR: {new_lr:.2e} | Time: {(time.time() - start_time)/60:10.2f} min |")
+                checkpoint_flag = 'X' if (epoch + 1) % CHECKPOINT_INTERVAL == 0 else ' '
+                logger.info(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} | LR: {new_lr:.2e} | Time: {(time.time() - start_time)/60:10.2f} min |")
 
             end_time = time.time()
-            print('\n\nTime taken for training: ', end_time - start_time)
-            print('Time taken per epoch: ', (end_time - start_time) / (epoch + 1))
+            logger.info('\n\nTime taken for training: ', end_time - start_time)
+            logger.info('Time taken per epoch: ', (end_time - start_time) / (epoch + 1))
 
-            # Save the final model after training
             torch.save(self.model.state_dict(), self.paths_bib.model_path)
-            print(f"Final model saved to {self.paths_bib.model_path}")
-            # Save the training and test losses
+            logger.info(f"Final model saved to {self.paths_bib.model_path}")
             with open(self.paths_bib.model_dir + 'losses.pkl', 'wb') as f:
                 pickle.dump({'train_losses': losses, 'test_losses': test_losses}, f)
-
-            print(f"Training and test losses saved to {self.paths_bib.model_dir + 'losses.pkl'}")
-
-            print('\nTraining complete')
+            logger.info(f"Training and test losses saved to {self.paths_bib.model_dir + 'losses.pkl'}")
+            logger.info('\nTraining complete')
 
         else:
-            print("No training required for f_extrap model")
+            logger.info("No training required for f_extrap model")
             self.pred()
 
     def _compute_lltogl_mat(self, skipx=1, skipy=1, skipz=1):
@@ -803,7 +739,7 @@ class runner(nn.Module):
                 for ky in range(0,ny-1, skipy):
                     lltogl_mat[elem_idx] = self.dls.build_lltogl(kx, ky, ny, dof_node, self.dls.node_map())
                     elem_idx += 1
-        # print(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
+        # logger.info(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
         return lltogl_mat
 
     def _predict_dofs_forward(self, name, dof_u, dof_v, dof_w=None, total_steps=None):
@@ -870,11 +806,9 @@ class runner(nn.Module):
         return dof_u_pred, dof_v_pred, dof_w_pred
 
 
-    def pred(self):
-        """
-        Make predictions over the validation data with the model for all sets in config['eval_data']
-        """
-        print(f"{'#'*20}\t{'Predicting...':<20}\t{'#'*20}")
+    def pred(self) -> None:
+        """Make predictions over the validation data for all sets in config['eval_data']."""
+        logger.info(f"{'#'*20}\t{'Predicting...':<20}\t{'#'*20}")
         pred_sources = []
         if self.config.get('train_data') is not None:
             pred_sources.extend((source, 'train_indices') for source in self.config['train_data'])
@@ -893,12 +827,12 @@ class runner(nn.Module):
             pred_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred.h5'
 
 
-            print(f"Predicting for {name} from {path}...")
+            logger.info(f"Predicting for {name} from {path}...")
             with h5py.File(self.paths_bib.latent_path, 'r') as f:
                 dof_u = f[name]['dof_u'][init_id, :]
                 dof_v = f[name]['dof_v'][init_id, :]
                 dof_w = f[name]['dof_w'][init_id, :] if self.dim == 3 else None
-            print(f"Predicting for {name} {source_group}")
+            logger.info(f"Predicting for {name} {source_group}")
 
             # long forward prediction of dofs
             dof_u_pred, dof_v_pred, dof_w_pred = self._predict_dofs_forward(
@@ -915,7 +849,7 @@ class runner(nn.Module):
                 f.create_dataset('dof_v', data=dof_v_pred)
                 if self.dim == 3:
                     f.create_dataset('dof_w', data=dof_w_pred)
-            print(f"Predictions saved to {pred_path}")
+            logger.info(f"Predictions saved to {pred_path}")
             
             # Many short horizon predictions for error growth analysis
             horizon = self.config['model_params'].get('horizon', 10)
@@ -955,15 +889,15 @@ class runner(nn.Module):
             
 
             # shape: (num_horizons, horizon)
-            horizon_errors = self._l2_err_norm(dof_true_horizons, dof_pred_horizon, axis=2)
+            horizon_errors = l2_err_norm(dof_true_horizons, dof_pred_horizon, axis=2)
             with h5py.File(pred_path, 'a') as f:
                 f.create_dataset(f'horizon_errors_{name}_{source_group}', data=horizon_errors)
 
 
 
 
-        print("Prediction complete")
-        print(f"\nReconstructing all predictions")
+        logger.info("Prediction complete")
+        logger.info(f"\nReconstructing all predictions")
         self._pred_rec()
 
 
@@ -971,7 +905,7 @@ class runner(nn.Module):
         """
         Reconstruct the full field predictions from the predicted dofs and save to HDF5.
         """
-        print(f"{'#'*20}\t{'Reconstructing predictions...':<20}\t{'#'*20}")
+        logger.info(f"{'#'*20}\t{'Reconstructing predictions...':<20}\t{'#'*20}")
         # get all files in pred directory and loop through them
         pred_sources = []
         if self.config.get('train_data') is not None:
@@ -982,7 +916,7 @@ class runner(nn.Module):
             name = source.get('name')
             source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
             pred_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred.h5'
-            print(f"Reconstructing for {name} from {pred_path}...")
+            logger.info(f"Reconstructing for {name} from {pred_path}...")
             with h5py.File(pred_path, 'r') as f:
                 dof_u_pred = f['dof_u'][:]
                 dof_v_pred = f['dof_v'][:]
@@ -1005,18 +939,11 @@ class runner(nn.Module):
                         dof_v=dof_v_pred,
                         batch_size=self.config['latent_params'].get('batch_size', 100)
                     )
-    def _l2_err_norm(self, true, pred, axis=None):
-        """
-        Compute the L2 norm between two arrays.
-        """
-        return np.linalg.norm(true - pred, axis=axis) / np.linalg.norm(true, axis=axis)
 
-    def eval(self):
-        """
-        Evaluate the model predictions against the ground truth for all sets in config['eval_data'], save metrics, then generate plots
-        """
+    def eval(self) -> None:
+        """Evaluate predictions against ground truth for all sets in config['eval_data'], save metrics and plots."""
         
-        print(f"{'#'*20}\t{'Evaluating...':<20}\t{'#'*20}")
+        logger.info(f"{'#'*20}\t{'Evaluating...':<20}\t{'#'*20}")
         # get all files in pred directory and loop through them
         self.latent_id = self.paths_bib.latent_id
         pl.plot_loss(self)
@@ -1041,7 +968,7 @@ class runner(nn.Module):
             os.makedirs(self.paths_bib.pred_fig_dir, exist_ok=True)
             rec_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred_rec.h5'
             gt_path = self.paths_bib.data_dir + source.get('path') + '.h5'
-            print(f"Evaluating for {name} between {rec_path} and {gt_path}...")
+            logger.info(f"Evaluating for {name} between {rec_path} and {gt_path}...")
             
             # Compute metrics
             self.compute_TKE(rec_path, gt_path, name, source_group, ids)
@@ -1090,16 +1017,16 @@ class runner(nn.Module):
         # Check if weights are already computed and saved, if not compute and save them
         with h5py.File(gt_path, 'r+') as f:
             if 'weights' in f:
-                print(f"Weights already computed and found in {gt_path}. Loading weights...")
+                logger.info(f"Weights already computed and found in {gt_path}. Loading weights...")
                 weights = f['weights'][:]
             else:
-                print(f"Weights not found in {gt_path}. Computing weights...")
+                logger.info(f"Weights not found in {gt_path}. Computing weights...")
                 if self.dim == 3:
                     weights = wg.generate_weights_grid_3d(self.x_grid, self.y_grid, self.z_grid)
                 else:
                     weights = wg.generate_weights_grid_2d(self.x_grid, self.y_grid)
                 f.create_dataset('weights', data=weights)
-                print(f"Weights computed and saved to {gt_path}.")
+                logger.info(f"Weights computed and saved to {gt_path}.")
     
         if self.dim == 3:
             weights = weights[:nx, :ny, :nz]
@@ -1109,10 +1036,10 @@ class runner(nn.Module):
 
         with h5py.File(rec_path, 'r+') as f:
             if 'TKE_rec' in f:
-                print(f"TKE for reconstructed already computed and found in {rec_path}. Skipping computation...")
+                logger.info(f"TKE for reconstructed already computed and found in {rec_path}. Skipping computation...")
                 TKE_rec = f['TKE_rec'][:]
             else:
-                print(f"TKE for reconstructed not found in {rec_path}. Computing TKE...")
+                logger.info(f"TKE for reconstructed not found in {rec_path}. Computing TKE...")
                 Q_rec = f['Q_rec'][:] # shape: (snaps, ..., dim)
                 Q_rec_weighted = Q_rec * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
                 Q_rec_weighted = Q_rec_weighted.reshape(Q_rec_weighted.shape[0], -1) 
@@ -1126,10 +1053,10 @@ class runner(nn.Module):
         with h5py.File(gt_path, 'r+') as f:
 
             if 'TKE_gt_'+self.latent_id + '_' + name + source in f:
-                print(f"TKE for GT already computed and found in {gt_path}. Skipping computation...")
+                logger.info(f"TKE for GT already computed and found in {gt_path}. Skipping computation...")
                 TKE_gt = f['TKE_gt_'+self.latent_id + '_' + name + source][:]
             else:
-                print(f"TKE for GT not found in {gt_path}. Computing TKE...")
+                logger.info(f"TKE for GT not found in {gt_path}. Computing TKE...")
                 if self.dim == 3:
                     mean_gt = f['mean'][:nx, :ny, :nz, :] # shape: (nx, ny, nz, dim)
                     Q_gt = f['UV'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
@@ -1146,7 +1073,7 @@ class runner(nn.Module):
                 f.create_dataset('TKE_gt_'+self.latent_id + '_' + name + source, data=TKE_gt)
 
         TKE_error = pl.l2_err_norm(TKE_gt[val_id[time_lag:]], TKE_rec[time_lag:])
-        print(f"TKE error for {name} {source}: {100 * TKE_error:.4f}%")
+        logger.info(f"TKE error for {name} {source}: {100 * TKE_error:.4f}%")
                 
             
     def compute_RMS(self, rec_path, gt_path, name, source, ids):
@@ -1160,10 +1087,10 @@ class runner(nn.Module):
         nz = self.l_config.nz_t if self.dim == 3 else 1
         with h5py.File(rec_path, 'r+') as f:
             if 'RMS_rec' in f:
-                print(f"RMS for reconstructed already computed and found in {rec_path}. Skipping computation...")
+                logger.info(f"RMS for reconstructed already computed and found in {rec_path}. Skipping computation...")
                 RMS_rec = f['RMS_rec'][:]
             else:
-                print(f"RMS for reconstructed not found in {rec_path}. Computing RMS...")
+                logger.info(f"RMS for reconstructed not found in {rec_path}. Computing RMS...")
                 Q_rec = f['Q_rec'][time_lag:] # shape: (snaps, ..., dim)
                 Q_rec = Q_rec.reshape(Q_rec.shape[0], -1)
                 RMS_rec = np.sqrt(np.mean(Q_rec**2, axis=0)) # shape: (snaps, ...)
@@ -1177,10 +1104,10 @@ class runner(nn.Module):
 
         with h5py.File(gt_path, 'r+') as f:
             if 'RMS_gt_'+self.latent_id + '_' + name+ source in f:
-                print(f"RMS for GT already computed and found in {gt_path}. Skipping computation...")
+                logger.info(f"RMS for GT already computed and found in {gt_path}. Skipping computation...")
                 RMS_gt = f['RMS_gt_'+self.latent_id + '_' + name+ source][:]
             else:
-                print(f"RMS for GT not found in {gt_path}. Computing RMS...")
+                logger.info(f"RMS for GT not found in {gt_path}. Computing RMS...")
                 if self.dim == 3:
                     mean_gt = f['mean'][:]
                     Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
@@ -1196,19 +1123,19 @@ class runner(nn.Module):
 
 
                 f.create_dataset('RMS_gt_'+self.latent_id + '_' + name+ source, data=RMS_gt)
-                print(f"RMS computed and saved to {gt_path}.")
+                logger.info(f"RMS computed and saved to {gt_path}.")
 
         nx = self.l_config.nx_t
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
         RMS_gt = RMS_gt[:nx, :ny, :nz, :] if self.dim == 3 else RMS_gt[:nx, :ny, :]
         RMS_error = pl.l2_err_norm(RMS_gt, RMS_rec)
-        print(f"RMS error for {name} {source}: {100 * RMS_error:.4f}%")
+        logger.info(f"RMS error for {name} {source}: {100 * RMS_error:.4f}%")
         RMS_u_error = pl.l2_err_norm(RMS_gt[..., 0], RMS_rec[..., 0])
         RMS_v_error = pl.l2_err_norm(RMS_gt[..., 1], RMS_rec[..., 1])
-        print(f"RMS_u error for {name} {source}: {100 * RMS_u_error:.4f}%")
-        print(f"RMS_v error for {name} {source}: {100 * RMS_v_error:.4f}%")
+        logger.info(f"RMS_u error for {name} {source}: {100 * RMS_u_error:.4f}%")
+        logger.info(f"RMS_v error for {name} {source}: {100 * RMS_v_error:.4f}%")
         if self.dim == 3:
             RMS_w_error = pl.l2_err_norm(RMS_gt[..., 2], RMS_rec[..., 2])
-            print(f"RMS_w error for {name} {source}: {100 * RMS_w_error:.4f}%")
+            logger.info(f"RMS_w error for {name} {source}: {100 * RMS_w_error:.4f}%")
                 

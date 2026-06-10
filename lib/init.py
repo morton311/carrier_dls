@@ -1,8 +1,11 @@
-class pathsBib: 
-    """
-    Class to store paths.
-    """ 
-    def __init__(self, config):
+from __future__ import annotations
+from typing import Tuple
+
+
+class pathsBib:
+    """Stores all filesystem paths used by the runner."""
+
+    def __init__(self, config: dict) -> None:
         """
         Initialize paths.
         """
@@ -16,22 +19,6 @@ class pathsBib:
         data_dict = {}
         for data_source in data_sources:
             data_dict[data_source] = {}
-            for info in data_dict[data_source]:
-                print(f"Processing {data_source} entry: {info}")
-                data_path = info.get('path', False)
-                data_name = info.get('name', False)
-                
-                if data_name:
-                    data_path_obj = Path(data_path).expanduser()
-                    data_dict[data_source][data_name] = info
-                    data_dict[data_source][data_name]['path'] = self.data_dir  + str(data_path_obj) + '.h5'
-                elif data_path:
-                    data_path_obj = Path(data_path).expanduser()
-                    data_name = data_path_obj.stem
-                    data_dict[data_source][data_name] = info
-                    data_dict[data_source][data_name]['path'] = self.data_dir  + str(data_path_obj) + '.h5'
-                else:
-                    print(f"Error: No data path or name specified for {data_source} entry: {info}")
         self.data_dict = data_dict
         ##############################
         # Latent info initialization #
@@ -82,29 +69,24 @@ class pathsBib:
         self.metrics_dir = self.model_dir + 'saved_metrics/'
 
 
-def init_path(config):
-    """
-    Initialisation of all the paths 
+def init_path(config: dict) -> Tuple[bool, pathsBib]:
+    """Create all required directories and return a populated pathsBib.
 
     Returns:
-        pathsBib        :   (class) class containing all the paths
-        is_init_path    :   (bool) if initialise success
+        (is_init_path, paths_bib): True if all directories were created successfully.
     """
-    import os 
+    import os
     from pathlib import Path
-    
+
     paths_bib = pathsBib(config)
     is_init_path = False
     try:
-        # print(f"{'#'*20}\t{'Init paths...':<20}\t{'#'*20}")
-        path_list =[i for key,i in paths_bib.__dict__.items() if type(i)==str and "/" in i and '_dir' in key]
+        path_list = [v for k, v in paths_bib.__dict__.items()
+                     if isinstance(v, str) and '/' in v and '_dir' in k]
         for pth in path_list:
             Path(pth).mkdir(exist_ok=True, parents=True)
-            # print(f"INIT:\t{pth}\tDONE")
-            
         is_init_path = True
-    except:
-        print(f"Error: Failed to create full path list")
-
+    except Exception as exc:
+        print(f"Error: Failed to create full path list: {exc}")
 
     return is_init_path, paths_bib

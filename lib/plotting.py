@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional
+
 import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -11,29 +15,30 @@ from scipy.signal import welch, correlate, coherence, correlation_lags, csd
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.ticker import FuncFormatter
 
+from lib.metrics import l2_err_norm
 
-paper_width = 470 # pt
-width = paper_width / 72.27 # inches
-height = width / 1.618 # inches
+_PAPER_WIDTH_PT = 470
+_PAPER_WIDTH_IN = _PAPER_WIDTH_PT / 72.27
+_PAPER_HEIGHT_IN = _PAPER_WIDTH_IN / 1.618
+
+Q_ISO_VALUE = 0.01
+Q_ISO_VALUE_ANIM = 0.001
+DOMAIN_X_MAX = 500
+
+width = _PAPER_WIDTH_IN
+height = _PAPER_HEIGHT_IN
+
 plt.rcParams['text.usetex'] = True
-# set default font size
-plt.rcParams['font.size'] = 10 # Change default font size to 12
-plt.rcParams['axes.titlesize'] = 12 # Change axes title font size
-plt.rcParams['axes.labelsize'] = 10 # Change axes labels font size
-plt.rcParams['xtick.labelsize'] = 10 # Change x-axis tick labels font size
-plt.rcParams['ytick.labelsize'] = 10 # Change y-axis tick labels font size
-plt.rcParams['legend.fontsize'] = 10 # Change legend font size
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.titlesize'] = 12
+plt.rcParams['axes.labelsize'] = 10
+plt.rcParams['xtick.labelsize'] = 10
+plt.rcParams['ytick.labelsize'] = 10
+plt.rcParams['legend.fontsize'] = 10
 plt.rcParams['figure.constrained_layout.use'] = True
 
 
-def l2_err_norm(true, pred, axis=None):
-    """
-    Compute the L2 norm between two arrays.
-    """
-    return np.linalg.norm(true - pred, axis=axis) / np.linalg.norm(true, axis=axis)
-
-
-def plot_loss(runner):
+def plot_loss(runner) -> None:
     with open(runner.paths_bib.model_dir + 'losses.pkl', 'rb') as f:
         results = pickle.load(f)
     size = 0.6
@@ -52,12 +57,11 @@ def plot_loss(runner):
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.grid(visible=True, linestyle='--', linewidth=0.5)
-    # plt.tight_layout()
     plt.savefig(runner.paths_bib.fig_dir + 'losses.png', dpi=300)
     plt.close()
 
 
-def plot_TKE(runner, rec_path, gt_path, name, source, ids):
+def plot_TKE(runner, rec_path: str, gt_path: str, name: str, source: str, ids) -> None:
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         time_lag = runner.config['model_params']['time_lag']
         val_id = ids
@@ -93,7 +97,6 @@ def plot_TKE(runner, rec_path, gt_path, name, source, ids):
     )
     plt.ticklabel_format(axis='y', style='sci', scilimits=(0,0))
     plt.grid(visible=True, linestyle='--', linewidth=0.5)
-    # plt.tight_layout()
     plt.savefig(os.path.join(runner.paths_bib.pred_fig_dir, 'past_tke_comparison.png'), dpi=300)
     plt.close()
 
@@ -124,7 +127,6 @@ def plot_TKE(runner, rec_path, gt_path, name, source, ids):
     )
     plt.ticklabel_format(axis='y', style='sci', scilimits=(0,0))
     plt.grid(visible=True, linestyle='--', linewidth=0.5)
-    # plt.tight_layout()
     plt.savefig(os.path.join(runner.paths_bib.pred_fig_dir, 'future_tke_comparison.png'), dpi=300)
     plt.close()
 
@@ -148,189 +150,133 @@ def plot_TKE(runner, rec_path, gt_path, name, source, ids):
         fontsize=8  # Adjust font size
     )
     plt.grid(visible=True, linestyle='--', linewidth=0.5)
-    # plt.tight_layout() #rect=[0, 0, 1, 0.95]
     plt.savefig(os.path.join(runner.paths_bib.pred_fig_dir, 'tke_psd_comparison.png'), dpi=300)
     plt.close()
 
 
-def plot_RMS(runner, rec_path, gt_path, name, source, x_slice=None, y_slice=None, z_slice=None):
-    rms_dir = os.path.join(runner.paths_bib.pred_fig_dir, 'rms_compare/')
-    os.makedirs(rms_dir, exist_ok=True)
-    nx, ny = runner.l_config.nx, runner.l_config.ny
-    nx_t, ny_t = runner.l_config.nx_t, runner.l_config.ny_t
-    x_grid, y_grid = runner.x_grid, runner.y_grid
-    x_grid_t, y_grid_t = x_grid[:nx_t, :ny_t], y_grid[:nx_t, :ny_t]
-    if runner.dim == 3:
-        nz = runner.l_config.nz
-        nz_t = runner.l_config.nz_t
-        x_grid, y_grid, z_grid = runner.x_grid, runner.y_grid, runner.z_grid
-        x_grid_t, y_grid_t, z_grid_t = x_grid[:nx_t, :ny_t, :nz_t], y_grid[:nx_t, :ny_t, :nz_t], z_grid[:nx_t, :ny_t, :nz_t]
-    if z_slice is not None:
-        print(f"Plotting RMS for z-slice {z_slice}...")
-    if y_slice is not None:
-        print(f"Plotting RMS for y-slice {y_slice}...")
-    if x_slice is not None:
-        print(f"Plotting RMS for x-slice {x_slice}...")
-    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
-        RMS_rec = f_rec['RMS_rec'][:]
-        RMS_gt = f_gt['RMS_gt_'+runner.latent_id + '_' + name + source][:]
-    
-    if z_slice is not None:
-        RMS_rec = RMS_rec[:, :, z_slice]
-        RMS_gt = RMS_gt[:, :, z_slice]
-        x_grid = x_grid[:, :, z_slice]
-        y_grid = y_grid[:, :, z_slice]
-        x_grid_t = x_grid_t[:, :, z_slice]
-        y_grid_t = y_grid_t[:, :, z_slice]
-        print(f"RMS for z-slice {z_slice} extracted.")
-    if y_slice is not None:
-        RMS_rec = RMS_rec[:, y_slice, :]
-        RMS_gt = RMS_gt[:, y_slice, :]
-        x_grid = x_grid[:, y_slice, :]
-        z_grid = z_grid[:, y_slice, :]
-        x_grid_t = x_grid_t[:, y_slice, :]
-        z_grid_t = z_grid_t[:, y_slice, :]
-        print(f"RMS for y-slice {y_slice} extracted.")
-    if x_slice is not None:
-        RMS_rec = RMS_rec[x_slice, :, :]
-        RMS_gt = RMS_gt[x_slice, :, :]
-        y_grid = y_grid[x_slice, :, :]
-        z_grid = z_grid[x_slice, :, :]
-        y_grid_t = y_grid_t[x_slice, :, :]
-        z_grid_t = z_grid_t[x_slice, :, :]
-        print(f"RMS for x-slice {x_slice} extracted.")
-
-    RMS_max = np.max(RMS_gt, axis=(0, 1), keepdims=True)
-    rms_true = RMS_gt / RMS_max
-    rms_pred = RMS_rec / RMS_max
-    slice_val = None
-    if z_slice is not None:
-        slice = 'z'
-        slice_val = z_slice
-        dim_mult = 2
-        x_label = 'x'
-        y_label = 'y'
-
-    if y_slice is not None:
-        y_grid = z_grid
-        y_grid_t = z_grid_t
-        slice = 'y'
-        slice_val = y_slice
-        dim_mult = 3.5
-        x_label = 'x'
-        y_label = 'z'
-    
-    if x_slice is not None:
-        x_grid = y_grid
-        x_grid_t = y_grid_t
-        y_grid = z_grid
-        y_grid_t = z_grid_t
-        slice = 'x'
-        slice_val = x_slice
-        dim_mult = 2
-        x_label = 'y'
-        y_label = 'z'
-
-    if slice_val is None:
-        dim_mult = 2
-        x_label = 'x'
-        y_label = 'y'
-        slice = 'full'
-
-
-
-    size = 1
-    
-    domain_x_limits = (x_grid_t.min(), x_grid_t.max())
-    domain_y_limits = (y_grid_t.min(), y_grid_t.max())
-    domain_aspect_ratio = (domain_y_limits[1] - domain_y_limits[0]) / (domain_x_limits[1] - domain_x_limits[0])
-
-    fig_width = size * width
-    fig_height = size * width * domain_aspect_ratio*dim_mult
-    ticks = np.linspace(0, 1, 6)
-
-    # u RMS plot
-    fig, axs = plt.subplots(2,1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
-    c1 = axs[0].contourf(x_grid, y_grid, rms_true[..., 0], levels=200, cmap='RdBu_r', vmin=0, vmax=1)
-    axs[0].set_title('True U RMS')
-    # axs[0].set_xticks([])
-    # axs[0].set_yticks([])
-    # axs[0].set_xlabel(x_label)
+def _plot_rms_component(
+    x_grid, y_grid, x_grid_t, y_grid_t,
+    rms_true, rms_pred, component_idx: int, component_name: str,
+    fig_width, fig_height, ticks, domain_x_limits, domain_y_limits,
+    x_label: str, y_label: str, slice_label: str, slice_val, rms_dir: str,
+) -> None:
+    fig, axs = plt.subplots(2, 1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
+    c1 = axs[0].contourf(x_grid, y_grid, rms_true[..., component_idx],
+                         levels=200, cmap='RdBu_r', vmin=0, vmax=1)
+    axs[0].set_title(f'True {component_name.upper()} RMS')
     axs[0].set_ylabel(y_label)
     axs[0].set_aspect('equal')
     axs[0].set_xlim(domain_x_limits)
     axs[0].set_ylim(domain_y_limits)
-
-    c2 = axs[1].contourf(x_grid_t, y_grid_t, rms_pred[..., 0], levels=200, cmap='RdBu_r', vmin=0, vmax=1)
-    axs[1].set_title('Predicted U RMS')
-    # axs[1].set_xticks([])
-    # axs[1].set_yticks([])
-    axs[1].set_xlabel(x_label)
-    axs[1].set_ylabel(y_label)
-    axs[1].set_aspect('equal')
-    axs[1].set_xlim(domain_x_limits)
-    axs[1].set_ylim(domain_y_limits)
-
-    fig.colorbar(c1, ax=axs, shrink=0.8, ticks=ticks, format='%.2f', pad=0.03)
-    plt.savefig(os.path.join(rms_dir, 'u_' +slice+str(slice_val)+ '.png'), dpi=300)
-    plt.close() 
-
-
-    # v RMS plot
-    fig, axs = plt.subplots(2,1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
-    c1 = axs[0].contourf(x_grid, y_grid, rms_true[..., 1], levels=200, cmap='RdBu_r', vmin=0, vmax=1)
-    axs[0].set_title('True V RMS')
-    # axs[0].set_xticks([])
-    # axs[0].set_yticks([])
-    # axs[0].set_xlabel(x_label)
-    axs[0].set_ylabel(y_label)
-    axs[0].set_aspect('equal')
-    axs[0].set_xlim(domain_x_limits)
-    axs[0].set_ylim(domain_y_limits)    
-
-    c2 = axs[1].contourf(x_grid_t, y_grid_t, rms_pred[..., 1], levels=200, cmap='RdBu_r', vmin=0, vmax=1)
-    axs[1].set_title('Predicted V RMS')
-    # axs[1].set_xticks([])
-    # axs[1].set_yticks([])
+    axs[1].contourf(x_grid_t, y_grid_t, rms_pred[..., component_idx],
+                    levels=200, cmap='RdBu_r', vmin=0, vmax=1)
+    axs[1].set_title(f'Predicted {component_name.upper()} RMS')
     axs[1].set_xlabel(x_label)
     axs[1].set_ylabel(y_label)
     axs[1].set_aspect('equal')
     axs[1].set_xlim(domain_x_limits)
     axs[1].set_ylim(domain_y_limits)
     fig.colorbar(c1, ax=axs, shrink=0.8, ticks=ticks, format='%.2f', pad=0.03)
-    plt.savefig(os.path.join(rms_dir, 'v_' +slice+str(slice_val)+ '.png'), dpi=300)
+    plt.savefig(os.path.join(rms_dir, f'{component_name}_{slice_label}{slice_val}.png'), dpi=300)
     plt.close()
 
+
+def plot_RMS(runner, rec_path: str, gt_path: str, name: str, source: str,
+             x_slice: Optional[int] = None, y_slice: Optional[int] = None,
+             z_slice: Optional[int] = None) -> None:
+    rms_dir = os.path.join(runner.paths_bib.pred_fig_dir, 'rms_compare/')
+    os.makedirs(rms_dir, exist_ok=True)
+    nx_t, ny_t = runner.l_config.nx_t, runner.l_config.ny_t
+    x_grid, y_grid = runner.x_grid, runner.y_grid
+    x_grid_t, y_grid_t = x_grid[:nx_t, :ny_t], y_grid[:nx_t, :ny_t]
+    z_grid = None
+    z_grid_t = None
     if runner.dim == 3:
-        # w RMS plot
-        fig, axs = plt.subplots(2,1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
-        c1 = axs[0].contourf(x_grid, y_grid, rms_true[..., 2], levels=200, cmap='RdBu_r', vmin=0, vmax=1)
-        axs[0].set_title('True W RMS')
-        # axs[0].set_xticks([])
-        # axs[0].set_yticks([])
-        # axs[0].set_xlabel(x_label)
-        axs[0].set_ylabel(y_label)
-        axs[0].set_aspect('equal')
-        axs[0].set_xlim(domain_x_limits)
-        axs[0].set_ylim(domain_y_limits)    
+        nz_t = runner.l_config.nz_t
+        x_grid, y_grid, z_grid = runner.x_grid, runner.y_grid, runner.z_grid
+        x_grid_t, y_grid_t, z_grid_t = (
+            x_grid[:nx_t, :ny_t, :nz_t],
+            y_grid[:nx_t, :ny_t, :nz_t],
+            z_grid[:nx_t, :ny_t, :nz_t],
+        )
 
-        c2 = axs[1].contourf(x_grid_t, y_grid_t, rms_pred[..., 2], levels=200, cmap='RdBu_r', vmin=0, vmax=1)
-        axs[1].set_title('Predicted W RMS')
-        # axs[1].set_xticks([])
-        # axs[1].set_yticks([])
-        axs[1].set_xlabel(x_label)
-        axs[1].set_ylabel(y_label)
-        axs[1].set_aspect('equal')
-        axs[1].set_xlim(domain_x_limits)
-        axs[1].set_ylim(domain_y_limits)
-        fig.colorbar(c1, ax=axs, shrink=0.8, ticks=ticks, format='%.2f', pad=0.03)
-        plt.savefig(os.path.join(rms_dir, 'w_' +slice+str(slice_val)+ '.png'), dpi=300)
-        plt.close()
+    slice_axis = None
+    slice_val = None
+    if z_slice is not None:
+        slice_axis, slice_val = 'z', z_slice
+    elif y_slice is not None:
+        slice_axis, slice_val = 'y', y_slice
+    elif x_slice is not None:
+        slice_axis, slice_val = 'x', x_slice
+
+    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+        RMS_rec = f_rec['RMS_rec'][:]
+        RMS_gt = f_gt['RMS_gt_' + runner.latent_id + '_' + name + source][:]
+
+    if slice_axis is not None:
+        data_slice_map = {
+            'z': (slice(None), slice(None), slice_val),
+            'y': (slice(None), slice_val, slice(None)),
+            'x': (slice_val, slice(None), slice(None)),
+        }
+        RMS_rec = RMS_rec[data_slice_map[slice_axis]]
+        RMS_gt = RMS_gt[data_slice_map[slice_axis]]
+
+        if slice_axis == 'z':
+            x_grid = x_grid[:, :, slice_val]
+            y_grid = y_grid[:, :, slice_val]
+            x_grid_t = x_grid_t[:, :, slice_val]
+            y_grid_t = y_grid_t[:, :, slice_val]
+        elif slice_axis == 'y':
+            x_grid = x_grid[:, slice_val, :]
+            y_grid = z_grid[:, slice_val, :]
+            x_grid_t = x_grid_t[:, slice_val, :]
+            y_grid_t = z_grid_t[:, slice_val, :]
+        else:
+            x_grid = y_grid[slice_val, :, :]
+            y_grid = z_grid[slice_val, :, :]
+            x_grid_t = y_grid_t[slice_val, :, :]
+            y_grid_t = z_grid_t[slice_val, :, :]
+
+    RMS_max = np.max(RMS_gt, axis=(0, 1), keepdims=True)
+    rms_true = RMS_gt / RMS_max
+    rms_pred = RMS_rec / RMS_max
+
+    slice_props = {
+        'z':    ('z', 2,   'x', 'y'),
+        'y':    ('y', 3.5, 'x', 'z'),
+        'x':    ('x', 2,   'y', 'z'),
+        None:   ('full', 2, 'x', 'y'),
+    }
+    slice_label, dim_mult, x_label, y_label = slice_props[slice_axis]
+
+    domain_x_limits = (x_grid.min(), x_grid.max())
+    domain_y_limits = (y_grid.min(), y_grid.max())
+    aspect = (domain_y_limits[1] - domain_y_limits[0]) / (domain_x_limits[1] - domain_x_limits[0])
+    fig_width = width
+    fig_height = width * aspect * dim_mult
+    ticks = np.linspace(0, 1, 6)
+
+    components = ['u', 'v', 'w'] if runner.dim == 3 else ['u', 'v']
+    for i, comp in enumerate(components):
+        _plot_rms_component(
+            x_grid, y_grid, x_grid_t, y_grid_t,
+            rms_true, rms_pred,
+            component_idx=i, component_name=comp,
+            fig_width=fig_width, fig_height=fig_height,
+            ticks=ticks,
+            domain_x_limits=domain_x_limits,
+            domain_y_limits=domain_y_limits,
+            x_label=x_label, y_label=y_label,
+            slice_label=slice_label, slice_val=slice_val,
+            rms_dir=rms_dir,
+        )
 
 
-    
 
-def plot_slice_compare(runner, rec_path, gt_path, name, ids, indx, x_slice=None, y_slice=None, z_slice=None):
+def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx: int,
+                       x_slice: Optional[int] = None, y_slice: Optional[int] = None,
+                       z_slice: Optional[int] = None) -> None:
     slice_dir = os.path.join(runner.paths_bib.pred_fig_dir, 'slice_compare/')
     os.makedirs(slice_dir, exist_ok=True)
     nx, ny = runner.l_config.nx, runner.l_config.ny
@@ -345,11 +291,6 @@ def plot_slice_compare(runner, rec_path, gt_path, name, ids, indx, x_slice=None,
     time_lag = runner.config['model_params']['time_lag']
     val_id = ids
 
-    if runner.dim == 3:
-        nz = runner.l_config.nz
-        nz_t = runner.l_config.nz_t
-        x_grid, y_grid, z_grid = runner.x_grid, runner.y_grid, runner.z_grid
-        x_grid_t, y_grid_t, z_grid_t = x_grid[:nx_t, :ny_t, :nz_t], y_grid[:nx_t, :ny_t, :nz_t], z_grid[:nx_t, :ny_t, :nz_t]
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
         Q_gt = f_gt['UV'][val_id[time_lag + indx]] - mean
@@ -405,81 +346,65 @@ def plot_slice_compare(runner, rec_path, gt_path, name, ids, indx, x_slice=None,
     fig_width = size * width
     fig_height = size * width * domain_aspect_ratio*dim_mult
     ticks = np.linspace(-1, 1, 6)
-    fig, axs = plt.subplots(2,1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
+    fig, axs = plt.subplots(2, 1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
     c1 = axs[0].contourf(x_grid, y_grid, Q_gt[..., 0], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
     axs[0].set_title('True U')
-    # axs[0].set_xticks([])
-    # axs[0].set_yticks([])
-    # axs[0].set_xlabel(x_label)
     axs[0].set_ylabel(y_label)
     axs[0].set_aspect('equal')
     axs[0].set_xlim(domain_x_limits)
-    axs[0].set_ylim(domain_y_limits)    
-    c2 = axs[1].contourf(x_grid_t, y_grid_t, Q_rec[..., 0], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
+    axs[0].set_ylim(domain_y_limits)
+    axs[1].contourf(x_grid_t, y_grid_t, Q_rec[..., 0], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
     axs[1].set_title('Predicted U')
-    # axs[1].set_xticks([])
-    # axs[1].set_yticks([])
     axs[1].set_xlabel(x_label)
     axs[1].set_ylabel(y_label)
     axs[1].set_aspect('equal')
     axs[1].set_xlim(domain_x_limits)
     axs[1].set_ylim(domain_y_limits)
     fig.colorbar(c1, ax=axs, shrink=0.8, ticks=ticks, format='%.2f', pad=0.03)
-    plt.savefig(os.path.join(slice_dir, 'u_' +slice_dim+str(slice_val)+ '_t' + str(indx) + '.png'), dpi=300)
-    plt.close() 
+    plt.savefig(os.path.join(slice_dir, f'u_{slice_dim}{slice_val}_t{indx}.png'), dpi=300)
+    plt.close()
 
-    fig, axs = plt.subplots(2,1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
+    fig, axs = plt.subplots(2, 1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
     c1 = axs[0].contourf(x_grid, y_grid, Q_gt[..., 1], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
     axs[0].set_title('True V')
-    # axs[0].set_xticks([])
-    # axs[0].set_yticks([])   
-    # axs[0].set_xlabel(x_label)
     axs[0].set_ylabel(y_label)
     axs[0].set_aspect('equal')
     axs[0].set_xlim(domain_x_limits)
-    axs[0].set_ylim(domain_y_limits)    
-    c2 = axs[1].contourf(x_grid_t, y_grid_t, Q_rec[..., 1], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
+    axs[0].set_ylim(domain_y_limits)
+    axs[1].contourf(x_grid_t, y_grid_t, Q_rec[..., 1], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
     axs[1].set_title('Predicted V')
-    # axs[1].set_xticks([])
-    # axs[1].set_yticks([])
     axs[1].set_xlabel(x_label)
     axs[1].set_ylabel(y_label)
     axs[1].set_aspect('equal')
     axs[1].set_xlim(domain_x_limits)
     axs[1].set_ylim(domain_y_limits)
     fig.colorbar(c1, ax=axs, shrink=0.8, ticks=ticks, format='%.2f', pad=0.03)
-    plt.savefig(os.path.join(slice_dir, 'v_' +slice_dim+str(slice_val)+ '_t' + str(indx) + '.png'), dpi=300)
-    plt.close() 
+    plt.savefig(os.path.join(slice_dir, f'v_{slice_dim}{slice_val}_t{indx}.png'), dpi=300)
+    plt.close()
 
     if runner.dim == 3:
-        fig, axs = plt.subplots(2,1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
+        fig, axs = plt.subplots(2, 1, figsize=(fig_width, fig_height), sharex=True, sharey=True)
         c1 = axs[0].contourf(x_grid, y_grid, Q_gt[..., 2], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
         axs[0].set_title('True W')
-        # axs[0].set_xticks([])
-        # axs[0].set_yticks([])   
-        # axs[0].set_xlabel(x_label)
         axs[0].set_ylabel(y_label)
         axs[0].set_aspect('equal')
         axs[0].set_xlim(domain_x_limits)
-        axs[0].set_ylim(domain_y_limits)    
-        c2 = axs[1].contourf(x_grid_t, y_grid_t, Q_rec[..., 2], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
+        axs[0].set_ylim(domain_y_limits)
+        axs[1].contourf(x_grid_t, y_grid_t, Q_rec[..., 2], levels=200, cmap='RdBu_r', vmin=-1, vmax=1)
         axs[1].set_title('Predicted W')
-        # axs[1].set_xticks([])
-        # axs[1].set_yticks([])
         axs[1].set_xlabel(x_label)
         axs[1].set_ylabel(y_label)
         axs[1].set_aspect('equal')
         axs[1].set_xlim(domain_x_limits)
         axs[1].set_ylim(domain_y_limits)
         fig.colorbar(c1, ax=axs, shrink=0.8, ticks=ticks, format='%.2f', pad=0.03)
-        plt.savefig(os.path.join(slice_dir, 'w_' +slice_dim+str(slice_val)+ '_t' + str(indx) + '.png'), dpi=300)
+        plt.savefig(os.path.join(slice_dir, f'w_{slice_dim}{slice_val}_t{indx}.png'), dpi=300)
         plt.close()
 
     
 
-def q_criterion(runner, rec_path, gt_path, name, ids, indx):
+def q_criterion(runner, rec_path: str, gt_path: str, name: str, ids, indx: int) -> None:
     import pyvista as pv
-    # pv.set_plot_theme('paraview')
     q_dir = os.path.join(runner.paths_bib.pred_fig_dir, 'q_criterion/')
     os.makedirs(q_dir, exist_ok=True)
     val_id = ids
@@ -493,12 +418,11 @@ def q_criterion(runner, rec_path, gt_path, name, ids, indx):
     nx_t, ny_t, nz_t = runner.l_config.nx_t, runner.l_config.ny_t, runner.l_config.nz_t
     x_grid_t, y_grid_t, z_grid_t = x_grid[:nx_t, :ny_t, :nz_t], y_grid[:nx_t, :ny_t, :nz_t], z_grid[:nx_t, :ny_t, :nz_t]
 
-    iso_value = 0.01
-    xmax = 500
-    x_grid, y_grid, z_grid = x_grid[:xmax], y_grid[:xmax], z_grid[:xmax]
-    x_grid_t, y_grid_t, z_grid_t = x_grid_t[:xmax], y_grid_t[:xmax], z_grid_t[:xmax]
-    Q_gt = Q_gt[:xmax]
-    Q_rec = Q_rec[:xmax]
+    iso_value = Q_ISO_VALUE
+    x_grid, y_grid, z_grid = x_grid[:DOMAIN_X_MAX], y_grid[:DOMAIN_X_MAX], z_grid[:DOMAIN_X_MAX]
+    x_grid_t, y_grid_t, z_grid_t = x_grid_t[:DOMAIN_X_MAX], y_grid_t[:DOMAIN_X_MAX], z_grid_t[:DOMAIN_X_MAX]
+    Q_gt = Q_gt[:DOMAIN_X_MAX]
+    Q_rec = Q_rec[:DOMAIN_X_MAX]
 
     x_grid = -x_grid
     x_grid_t = -x_grid_t
@@ -542,9 +466,8 @@ def compute_q_criterion(vel_grid, x, y, z):
     return grid
     
 
-def anim_q_criterion(runner, rec_path, gt_path, name, ids):
+def anim_q_criterion(runner, rec_path: str, gt_path: str, name: str, ids) -> None:
     import pyvista as pv
-    # pv.set_plot_theme('paraview')
     q_dir = os.path.join(runner.paths_bib.pred_fig_dir, 'q_criterion/')
     os.makedirs(q_dir, exist_ok=True)
     val_id = ids
@@ -559,12 +482,11 @@ def anim_q_criterion(runner, rec_path, gt_path, name, ids):
     nx_t, ny_t, nz_t = runner.l_config.nx_t, runner.l_config.ny_t, runner.l_config.nz_t
     x_grid_t, y_grid_t, z_grid_t = x_grid[:nx_t, :ny_t, :nz_t], y_grid[:nx_t, :ny_t, :nz_t], z_grid[:nx_t, :ny_t, :nz_t]
 
-    iso_value = 0.001
-    xmax = 500
-    x_grid, y_grid, z_grid = x_grid[:xmax], y_grid[:xmax], z_grid[:xmax]
-    x_grid_t, y_grid_t, z_grid_t = x_grid_t[:xmax], y_grid_t[:xmax], z_grid_t[:xmax]
-    Q_gt = Q_gt[:, :xmax]
-    Q_rec = Q_rec[:, :xmax]
+    iso_value = Q_ISO_VALUE_ANIM
+    x_grid, y_grid, z_grid = x_grid[:DOMAIN_X_MAX], y_grid[:DOMAIN_X_MAX], z_grid[:DOMAIN_X_MAX]
+    x_grid_t, y_grid_t, z_grid_t = x_grid_t[:DOMAIN_X_MAX], y_grid_t[:DOMAIN_X_MAX], z_grid_t[:DOMAIN_X_MAX]
+    Q_gt = Q_gt[:, :DOMAIN_X_MAX]
+    Q_rec = Q_rec[:, :DOMAIN_X_MAX]
 
     x_grid = -x_grid
     x_grid_t = -x_grid_t
@@ -605,7 +527,7 @@ def anim_q_criterion(runner, rec_path, gt_path, name, ids):
     imageio.mimwrite(os.path.join(q_dir, 'mov_q_crit.mp4'), images, fps=5)
     
 
-def plot_horizon_errors(runner, rec_path, gt_path, name, source):
+def plot_horizon_errors(runner, rec_path: str, gt_path: str, name: str, source: str) -> None:
     pred_path = rec_path.replace('_rec.h5', '.h5')
     with h5py.File(pred_path, 'r') as f_pred, h5py.File(gt_path, 'r') as f_gt:
         horizon_errors = f_pred[f'horizon_errors_{name}_{source}'][:] # shape (num_horizons, length)
@@ -633,6 +555,5 @@ def plot_horizon_errors(runner, rec_path, gt_path, name, source):
     plt.title('Prediction Horizon Errors', pad=16)
     plt.legend(handles=[h_band, h_mean], loc="best")
     plt.grid(visible=True, linestyle='--', linewidth=0.5)
-    # plt.tight_layout()
     plt.savefig(os.path.join(runner.paths_bib.pred_fig_dir, 'horizon_errors.png'), dpi=300)
     plt.close()

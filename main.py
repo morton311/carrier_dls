@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import shutil
 import sys
@@ -7,6 +8,8 @@ import json
 from pathlib import Path
 import lib.init as init
 from lib.runner import runner
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-c', type=str, default='config.json', help='Name or whole path of config file, must be in json format')
@@ -49,7 +52,6 @@ if __name__ == "__main__":
     else:
 
         device = ('cuda' if torch.cuda.is_available() else "cpu")
-    # device = 'cpu'
     config['device'] = device
     
     run = runner(config)
@@ -62,15 +64,11 @@ if __name__ == "__main__":
     elif run.config['mode'] == 'latent':
         from lib.dls import latent_eval
         latent_eval(run)
-    # elif run.config['mode'] == 'anim':
-    #     from lib.plotting import animate
-    #     animate(run)
-    
     # copy the config file to the model directory
     shutil.copy(args.c, run.paths_bib.model_dir + os.path.basename(args.c))
     
     
-    print(f"{'#'*20}\t{'End of script':<20}\t{'#'*20}")
-    # close the log file
-    sys.stdout.close()
-    sys.stderr.close()
+    logging.info(f"{'#'*20}\t{'End of script':<20}\t{'#'*20}")
+    if run.config.get('log') == 'file':
+        sys.stdout.close()
+        sys.stderr.close()
