@@ -192,8 +192,7 @@ def plot_RMS(runner, rec_path: str, gt_path: str, name: str, source: str,
     nx_t, ny_t = runner.l_config.nx_t, runner.l_config.ny_t
     x_grid, y_grid = runner.x_grid, runner.y_grid
     x_grid_t, y_grid_t = x_grid[:nx_t, :ny_t], y_grid[:nx_t, :ny_t]
-    z_grid = None
-    z_grid_t = None
+
     if runner.dim == 3:
         nz_t = runner.l_config.nz_t
         x_grid, y_grid, z_grid = runner.x_grid, runner.y_grid, runner.z_grid
@@ -214,6 +213,34 @@ def plot_RMS(runner, rec_path: str, gt_path: str, name: str, source: str,
 
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         RMS_rec = f_rec['RMS_rec'][:]
+        RMS_gt = f_gt['RMS_gt_'+runner.latent_id + '_' + name + source][:]
+
+    
+    
+    if z_slice is not None:
+        RMS_rec = RMS_rec[:, :, z_slice]
+        RMS_gt = RMS_gt[:, :, z_slice]
+        x_grid = x_grid[:, :, z_slice]
+        y_grid = y_grid[:, :, z_slice]
+        x_grid_t = x_grid_t[:, :, z_slice]
+        y_grid_t = y_grid_t[:, :, z_slice]
+        print(f"RMS for z-slice {z_slice} extracted.")
+    if y_slice is not None:
+        RMS_rec = RMS_rec[:, y_slice, :]
+        RMS_gt = RMS_gt[:, y_slice, :]
+        x_grid = x_grid[:, y_slice, :]
+        z_grid = z_grid[:, y_slice, :]
+        x_grid_t = x_grid_t[:, y_slice, :]
+        z_grid_t = z_grid_t[:, y_slice, :]
+        print(f"RMS for y-slice {y_slice} extracted.")
+    if x_slice is not None:
+        RMS_rec = RMS_rec[x_slice, :, :]
+        RMS_gt = RMS_gt[x_slice, :, :]
+        y_grid = y_grid[x_slice, :, :]
+        z_grid = z_grid[x_slice, :, :]
+        y_grid_t = y_grid_t[x_slice, :, :]
+        z_grid_t = z_grid_t[x_slice, :, :]
+        print(f"RMS for x-slice {x_slice} extracted.")
         RMS_gt = f_gt['RMS_gt_' + runner.latent_id + '_' + name + source][:]
 
     if slice_axis is not None:
@@ -297,8 +324,8 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
         Q_gt = f_gt['UV'][val_id[time_lag + indx]] - mean
-        Q_rec = f_rec['Q_rec'][indx]
-
+        Q_rec = f_rec['Q_rec'][time_lag + indx]
+    slice_val = None
 
     if z_slice is not None:
         slice_dim = 'z'
@@ -336,6 +363,13 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
         x_grid_t = y_grid_t[slice_val, :, :]
         y_grid_t = z_grid_t[slice_val, :, :]
         dim_mult = 2
+
+    if slice_val is None:
+        dim_mult = 2
+        x_label = 'x'
+        y_label = 'y'
+        slice_dim = ''
+        slice_val = 'full'
 
     # normalize Q_gt between -1 and 1 and apply same normalization to Q_rec
     Q_gt_max = np.max(np.abs(Q_gt), axis=(0, 1), keepdims=True)

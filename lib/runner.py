@@ -7,6 +7,7 @@ import copy
 
 import numpy as np
 import torch
+from torchinfo import summary
 from torch import nn
 from tqdm import tqdm
 import time
@@ -51,6 +52,7 @@ class runner(nn.Module):
 
         self._get_grid()
 
+        
         logger.info(self.dim)
         if self.dim == 3:
             logger.info("Using 3D DLS for latent coefficient computation")
@@ -402,6 +404,9 @@ class runner(nn.Module):
             self.num_params = sum(p.numel() for p in self.model.parameters())
             logger.info(f"Model initialized with {self.num_params} parameters")
 
+            # print model summary 
+            summary(self.model, input_size=(self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim']))
+
         if self.config['distributed']:
             from torch.nn.parallel import DistributedDataParallel as DDP
             local_rank = int(os.environ["LOCAL_RANK"]) # automatically set by torchrun
@@ -637,6 +642,87 @@ class runner(nn.Module):
                     with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as f:
                         pickle.dump((self.dof_mean, self.dof_std), f)
 
+
+    def _model_fit(self):
+        
+        if self.model is not None:
+            if self.checkpointed:
+                best_epoch = self.epoch
+                losses = self.losses
+                test_losses = self.test_losses
+                best_model = copy.deepcopy(self.model.state_dict())
+                early_stop_counter = self.early_stop_counter
+                best_test_loss = min(test_losses)
+            else:
+                losses = []
+                test_losses = []
+                best_model = None
+                early_stop_counter = 0
+                best_test_loss = float('inf')
+                best_epoch = 0
+
+            start_time = time.time()
+            
+            max_norm = 0.2
+            new_lr = self.scheduler.get_last_lr() if self.scheduler is not None else self.config['model_params']['lr']
+            if new_lr is list:
+                new_lr = new_lr[0]
+
+
+            for epoch in range(len(losses), self.config['model_params']['num_epochs']):
+                self.model.train()
+                epoch_loss = 0
+                
+
+                ## --------------------------------------- Train ---------------------------------------
+                for key in self.train_loader: 
+                    if self.config['distributed']:
+                        self.sampler[key].set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
+                    for inputs, targets in self.train_loader[key]: 
+                        inputs, targets = inputs.to(self.device), targets.to(self.device)
+                        self.optimizer.zero_grad()
+                        total_loss = 0.0
+                        
+
+                        for n in range(targets.shape[1]):
+                            # print(f"Step {n+1}/{targets.shape[1]}, VRAM usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                            target = targets[:, n, :]  # shape: [B, input_dim]
+
+                            # Forward pass
+                            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                outputs = self.model(inputs)  # shape: [B, input_dim]
+                                loss = self.criterion(outputs, target)
+
+                            # Backward and optimization for current step only
+                            total_loss += loss
+                            self.scaler.scale(loss).backward()
+
+                            # Prepare input for next step
+                            inputs = torch.cat((inputs[:, 1:, :], outputs.detach().unsqueeze(1)), dim=1)
+
+                        epoch_loss += total_loss.item() / (targets.shape[1] * len(self.train_loader[key]))
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+
+                losses.append(epoch_loss)
+
+                ## --------------------------------------- Test ---------------------------------------
+                # Evaluate the model on the test set
+                self.model.eval()
+                test_loss = 0
+                with torch.no_grad():
+                    for key in self.test_loader:
+                        for inputs, targets in self.test_loader[key]:
+                            inputs, targets = inputs.to(self.device), targets.to(self.device)
+                            for n in range(targets.shape[1]):
+                                target = targets[:, n, :]
+                                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                    outputs = self.model(inputs)
+                                    loss = self.criterion(outputs, target)
+                                test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
+                                inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
 
     def _train_epoch(self, epoch: int, max_norm: float) -> float:
         """Single forward+backward pass over all training loaders. Returns mean epoch loss."""
@@ -1051,10 +1137,10 @@ class runner(nn.Module):
         num_elems = lltogl_mat.shape[0]
 
         if self.dim == 3:
-            u_sel = init_u[:, lltogl_mat]
+            u_sel = init_u[:, lltogl_mat] # shape: (time_lag, num_elems, dof_elem)
             v_sel = init_v[:, lltogl_mat]
             w_sel = init_w[:, lltogl_mat]
-            dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2))
+            dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2)) # shape: (num_elems, time_lag, dim * dof_elem)
         else:
             u_sel = init_u[:, lltogl_mat]
             v_sel = init_v[:, lltogl_mat]
@@ -1334,22 +1420,34 @@ class runner(nn.Module):
             self.compute_RMS(rec_path, gt_path, name, source_group, ids)
 
             pl.plot_TKE(self, rec_path, gt_path, name, source_group,  ids)
-            pl.plot_RMS(self, rec_path, gt_path, name, source_group, z_slice=z_slice)
-            pl.plot_RMS(self, rec_path, gt_path, name, source_group, y_slice=y_slice)
-            pl.plot_RMS(self, rec_path, gt_path, name, source_group, x_slice=x_slice)
 
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  z_slice=z_slice)
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  z_slice=z_slice)
+            if self.dim == 3:
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group, z_slice=z_slice)
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group, y_slice=y_slice)
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group, x_slice=x_slice)
 
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  y_slice=y_slice)
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  y_slice=y_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  z_slice=z_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  z_slice=z_slice)
+
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  y_slice=y_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  y_slice=y_slice)
+                
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  x_slice=x_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  x_slice=x_slice)
+                
+                pl.q_criterion(self, rec_path, gt_path, name, ids, 1)
+                pl.q_criterion(self, rec_path, gt_path, name, ids, 30)
+                pl.anim_q_criterion(self, rec_path, gt_path, name, ids)
+            else:
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 10)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 20)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 40)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 50)
+
             
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  x_slice=x_slice)
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  x_slice=x_slice)
-            
-            # pl.q_criterion(self, rec_path, gt_path, name, ids, 1)
-            # pl.q_criterion(self, rec_path, gt_path, name, ids, 30)
-            # pl.anim_q_criterion(self, rec_path, gt_path, name, ids)
 
             pl.plot_horizon_errors(self, rec_path, gt_path, name, source_group)
 
