@@ -104,6 +104,82 @@ def make_dataloader(
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
+class LocalGlobalDataset(torch.utils.data.Dataset):
+    """Snapshot-grouped dataset for the global-local encoder-decoder model.
+
+    One item = all GFEM elements of one time window starting at t0:
+        X   (E, time_lag, F)            local input windows
+        Y   (E, train_ahead, F)         local targets
+        tok (E, context_window * F)     encoder tokens at the context time
+        t0  scalar window start index
+    where F = num_components * dof_elem. Nodal DOF arrays are stored once and
+    gathered through lltogl_mat per item, so no dense per-sample copies are made.
+    """
+
+    def __init__(
+        self,
+        dof_comps: list,
+        lltogl_mat: torch.Tensor,
+        t0_list: np.ndarray,
+        time_lag: int,
+        train_ahead: int,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        context_window: int = 1,
+        context_time: str = 'window_start',
+    ):
+        if context_window > time_lag:
+            raise ValueError("context_window must be <= time_lag")
+        if context_time not in ('window_start', 'window_end'):
+            raise ValueError(f"context_time should be 'window_start' or 'window_end', not {context_time}")
+        self.dof_comps = [torch.as_tensor(c, dtype=torch.float32) for c in dof_comps]
+        self.lltogl_mat = torch.as_tensor(lltogl_mat, dtype=torch.long)
+        self.t0_list = np.asarray(t0_list)
+        self.time_lag = time_lag
+        self.train_ahead = train_ahead
+        self.mean = mean
+        self.std = std
+        self.context_window = context_window
+        self.context_time = context_time
+
+    def __len__(self) -> int:
+        return len(self.t0_list)
+
+    def __getitem__(self, i: int):
+        t0 = int(self.t0_list[i])
+        tl, ta, cw = self.time_lag, self.train_ahead, self.context_window
+        # (tl+ta, E, F): gather element-local slots from each component and concatenate
+        block = torch.cat(
+            [c[t0:t0 + tl + ta][:, self.lltogl_mat] for c in self.dof_comps], dim=2
+        )
+        block = (block - self.mean) / self.std
+        X = block[:tl].permute(1, 0, 2)
+        Y = block[tl:tl + ta].permute(1, 0, 2)
+        c0 = 0 if self.context_time == 'window_start' else tl - cw
+        tok = block[c0:c0 + cw].permute(1, 0, 2).reshape(block.shape[1], -1)
+        return X, Y, tok, t0
+
+
+def make_group_dataloader(
+    dataset: torch.utils.data.Dataset,
+    batch_size: int = 8,
+    shuffle: bool = True,
+    distributed: bool = False,
+) -> Union[DataLoader, Tuple[DataLoader, object]]:
+    """Create a DataLoader over a snapshot-grouped Dataset.
+
+    When distributed=True, returns (dataloader, sampler).
+    """
+    if distributed:
+        import os
+        from torch.utils.data.distributed import DistributedSampler
+        world_rank = int(os.environ["RANK"])
+        sampler = DistributedSampler(dataset, seed=world_rank)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, sampler=sampler)
+        return dataloader, sampler
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
 def normalize_data(
     data: np.ndarray,
     mean: Union[float, np.ndarray],

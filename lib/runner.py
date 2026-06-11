@@ -367,10 +367,30 @@ class runner(nn.Module):
                         batch_size= self.config['model_params']['batch_size'],
                         )
             
+        elif self.config['model_params']['model_type'] == 'tr_encdec':
+            mp = self.config['model_params']
+            self.model = models.GlobalLocalTransformer(
+                        time_lag=mp['time_lag'],
+                        input_dim=mp['input_dim'],
+                        d_model=mp['d_model'],
+                        ff_dim=mp.get('ff_dim', 4 * mp['d_model']),
+                        nhead=mp['nhead'],
+                        num_layers=mp['num_layers'],
+                        enc_num_layers=mp.get('enc_num_layers', 2),
+                        enc_nhead=mp.get('enc_nhead', mp['nhead']),
+                        enc_ff_dim=mp.get('enc_ff_dim', mp.get('ff_dim', 4 * mp['d_model'])),
+                        activation=mp.get('activation', 'relu'),
+                        pre_norm=mp.get('prenorm', False),
+                        spatial_dim=self.dim,
+                        num_freqs=mp.get('coord_freqs', 6),
+                        context_window=mp.get('context_window', 1),
+                        num_context_tokens=mp.get('num_context_tokens', 0),
+                        causal=mp.get('causal', True),
+                        )
         elif self.config['model_params']['model_type'] == 'f_extrap':
             self.model = None
         else:
-            raise ValueError(f"Model {self.config['model_params']['model_type']} not recognized. Please use 'tr_enc' or 'lstm'.")
+            raise ValueError(f"Model {self.config['model_params']['model_type']} not recognized. Please use 'tr_enc', 'tr_encdec', or 'lstm'.")
         
         # Load the model weights if they exist and overwrite is not set to 'l' or 'm'
         if os.path.exists(self.paths_bib.model_path) and not self.config['overwrite'] in ['l', 'm']:
@@ -410,7 +430,11 @@ class runner(nn.Module):
                 patience=self.config['model_params'].get('lr_patience', 5),
                 min_lr=1e-7
             )
-            self.scaler = torch.amp.GradScaler()
+            # torch.amp.GradScaler exists from torch 2.3; fall back for older versions
+            if hasattr(torch.amp, 'GradScaler'):
+                self.scaler = torch.amp.GradScaler()
+            else:
+                self.scaler = torch.cuda.amp.GradScaler()
 
             logger.info(f"Loss function: {self.criterion}")
             logger.info(f"Optimizer: {self.optimizer}")
@@ -515,6 +539,8 @@ class runner(nn.Module):
 
     def _get_train_data(self):
         """Get training and test data as torch tensors, minimizing memory usage."""
+        if self.config['model_params']['model_type'] == 'tr_encdec':
+            return self._get_train_data_encdec()
         if self.model is not None:
             logger.info('Getting training and test data')
             tl = self.config['model_params']['time_lag']
@@ -614,6 +640,8 @@ class runner(nn.Module):
 
     def _train_epoch(self, epoch: int, max_norm: float) -> float:
         """Single forward+backward pass over all training loaders. Returns mean epoch loss."""
+        if self.config['model_params']['model_type'] == 'tr_encdec':
+            return self._train_epoch_encdec(epoch, max_norm)
         self.model.train()
         epoch_loss = 0.0
         for key in self.train_loader:
@@ -640,6 +668,8 @@ class runner(nn.Module):
 
     def _validate_epoch(self) -> float:
         """Single forward pass over all test loaders. Returns mean test loss."""
+        if self.config['model_params']['model_type'] == 'tr_encdec':
+            return self._validate_epoch_encdec()
         self.model.eval()
         test_loss = 0.0
         with torch.no_grad():
@@ -653,6 +683,239 @@ class runner(nn.Module):
                             loss = self.criterion(outputs, target)
                         test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
                         inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
+        return test_loss
+
+    ## ======================= Global-local encoder-decoder (tr_encdec) ==========================
+
+    def _encdec_geometry(self, use_skip=True):
+        """Precompute and cache element geometry for the encdec model.
+
+        use_skip=True follows the training element subsampling (skipx/y/z);
+        use_skip=False uses all elements (prediction/rollout, matching baseline behavior).
+        """
+        if use_skip:
+            skipx = self.config['latent_params'].get('skipx', 1)
+            skipy = self.config['latent_params'].get('skipy', 1)
+            skipz = self.config['latent_params'].get('skipz', 1) if self.dim == 3 else 1
+        else:
+            skipx = skipy = skipz = 1
+        key = (skipx, skipy, skipz)
+        if not hasattr(self, '_encdec_geom_cache'):
+            self._encdec_geom_cache = {}
+        if key in self._encdec_geom_cache:
+            return self._encdec_geom_cache[key]
+
+        lltogl_mat = self._compute_lltogl_mat(skipx=skipx, skipy=skipy, skipz=skipz)
+        coords = self._compute_elem_centroids(skipx=skipx, skipy=skipy, skipz=skipz)
+        num_dofs = self.l_config.num_gfem_nodes * self.l_config.dof_node
+        flat_index = lltogl_mat.reshape(-1)
+        # nodes not covered by any (skipped) element keep count 1 to avoid divide-by-zero
+        counts = np.bincount(flat_index, minlength=num_dofs).clip(min=1)
+        geom = {
+            'lltogl_np': lltogl_mat,
+            'lltogl': torch.from_numpy(lltogl_mat).long().to(self.device),
+            'coords': torch.from_numpy(coords).float().to(self.device),
+            'scatter_index': torch.from_numpy(flat_index).long().to(self.device),
+            'scatter_index_cpu': torch.from_numpy(flat_index).long(),
+            'counts': torch.from_numpy(counts).float().to(self.device),
+            'counts_cpu': torch.from_numpy(counts).float(),
+            'num_dofs': num_dofs,
+        }
+        self._encdec_geom_cache[key] = geom
+        logger.info(f"encdec geometry (skip={key}): {lltogl_mat.shape[0]} elements, {num_dofs} nodal DOFs")
+        return geom
+
+    def _compute_elem_centroids(self, skipx=1, skipy=1, skipz=1):
+        """Element centroid coordinates, min-max normalized to [0,1].
+
+        Loop order must mirror _compute_lltogl_mat so coords align with lltogl rows.
+        GFEM node (i, j[, k]) sits at grid index (i*nskip, j*nskip[, k*nskip]).
+        """
+        nx = self.l_config.nx_g
+        ny = self.l_config.ny_g
+        nskip = self.l_config.nskip
+        coords = []
+        if self.dim == 3:
+            nz = self.l_config.nz_g
+            for kx in range(0, nx - 1, skipx):
+                for ky in range(0, ny - 1, skipy):
+                    for kz in range(0, nz - 1, skipz):
+                        lo = (kx * nskip, ky * nskip, kz * nskip)
+                        hi = ((kx + 1) * nskip, (ky + 1) * nskip, (kz + 1) * nskip)
+                        coords.append([
+                            0.5 * (self.x_grid[lo] + self.x_grid[hi]),
+                            0.5 * (self.y_grid[lo] + self.y_grid[hi]),
+                            0.5 * (self.z_grid[lo] + self.z_grid[hi]),
+                        ])
+        else:
+            for kx in range(0, nx - 1, skipx):
+                for ky in range(0, ny - 1, skipy):
+                    lo = (kx * nskip, ky * nskip)
+                    hi = ((kx + 1) * nskip, (ky + 1) * nskip)
+                    coords.append([
+                        0.5 * (self.x_grid[lo] + self.x_grid[hi]),
+                        0.5 * (self.y_grid[lo] + self.y_grid[hi]),
+                    ])
+        coords = np.asarray(coords, dtype=np.float64)
+        cmin, cmax = coords.min(axis=0), coords.max(axis=0)
+        return (coords - cmin) / np.where(cmax > cmin, cmax - cmin, 1.0)
+
+    def _reassemble_tokens(self, pred_norm, name, geom):
+        """Project normalized element predictions to a consistent global field and back.
+
+        (G, E, F) -> scatter-mean shared nodal DOFs -> regather -> (G, E, F).
+        Runs in fp32; keep outside autocast.
+        """
+        G = pred_norm.shape[0]
+        mean = self.dof_mean[name].to(pred_norm.device)
+        std = self.dof_std[name].to(pred_norm.device)
+        pred = pred_norm.float() * std + mean
+        ndof = self.l_config.dof_elem
+        comps = []
+        for c in range(self.dim):
+            flat = torch.zeros(G, geom['num_dofs'], device=pred.device)
+            flat.index_add_(1, geom['scatter_index'],
+                            pred[:, :, c * ndof:(c + 1) * ndof].reshape(G, -1))
+            flat = flat / geom['counts']
+            comps.append(flat[:, geom['lltogl']])
+        out = torch.cat(comps, dim=2)
+        return (out - mean) / std
+
+    def _ss_prob(self, epoch: int) -> float:
+        """Scheduled-sampling probability of refreshing context from model predictions."""
+        mp = self.config['model_params']
+        start = mp.get('ss_start_epoch', None)
+        if start is None or epoch < start:
+            return 0.0
+        ramp = max(mp.get('ss_ramp_epochs', 1), 1)
+        return mp.get('ss_prob_max', 0.5) * min((epoch - start) / ramp, 1.0)
+
+    def _shift_tokens(self, tokens, new_frame):
+        """Append a reassembled frame to the context token window (G, E, cw*F)."""
+        cw = self.config['model_params'].get('context_window', 1)
+        if cw == 1:
+            return new_frame
+        G, E, F = new_frame.shape
+        tok_view = tokens.reshape(G, E, cw, F)
+        return torch.cat((tok_view[:, :, 1:], new_frame.unsqueeze(2)), dim=2).reshape(G, E, cw * F)
+
+    def _get_train_data_encdec(self):
+        """Build snapshot-grouped train/test loaders for the encdec model."""
+        if self.model is None:
+            return
+        logger.info('Getting training and test data (snapshot-grouped, tr_encdec)')
+        if not self.config['latent_params'].get('localized', False):
+            raise ValueError("model_type 'tr_encdec' requires latent_params.localized = true")
+        mp = self.config['model_params']
+        tl = mp['time_lag']
+        ta = mp['train_ahead']
+        cw = mp.get('context_window', 1)
+        ct = mp.get('context_time', 'window_end')
+
+        geom = self._encdec_geometry()
+        lltogl_cpu = torch.from_numpy(geom['lltogl_np']).long()
+
+        self.dof_mean = {}
+        self.dof_std = {}
+        self.train_loader = {}
+        self.test_loader = {}
+        self.sampler = {}
+
+        with h5py.File(self.paths_bib.latent_path, 'r') as f:
+            for source in self.config['train_data']:
+                name = source.get('name')
+                train_indices = self.indices['train_data'][name]['train_indices']
+                test_indices = self.indices['train_data'][name]['test_indices']
+
+                dof_u = f[name]['dof_u']
+                dof_v = f[name]['dof_v']
+                dof_w = f[name]['dof_w'] if self.dim == 3 else None
+
+                dofs = self._load_dof_rows(dof_u, dof_v, dof_w, train_indices, geom['lltogl_np'])
+                self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))
+                self.dof_std[name] = torch.std(dofs, dim=(0, 1))
+                logger.info(f"Mean/std shapes: {self.dof_mean[name].shape}, {self.dof_std[name].shape}")
+                del dofs
+
+                dof_comps = [torch.from_numpy(dof_u[:]).float(), torch.from_numpy(dof_v[:]).float()]
+                if self.dim == 3:
+                    dof_comps.append(torch.from_numpy(dof_w[:]).float())
+
+                train_set = datas.LocalGlobalDataset(
+                    dof_comps, lltogl_cpu, train_indices, tl, ta,
+                    self.dof_mean[name], self.dof_std[name], cw, ct)
+                test_set = datas.LocalGlobalDataset(
+                    dof_comps, lltogl_cpu, test_indices, tl, ta,
+                    self.dof_mean[name], self.dof_std[name], cw, ct)
+
+                if self.config['distributed']:
+                    self.train_loader[name], self.sampler[name] = datas.make_group_dataloader(
+                        train_set, batch_size=mp['batch_size'], shuffle=True, distributed=True)
+                else:
+                    self.train_loader[name] = datas.make_group_dataloader(
+                        train_set, batch_size=mp['batch_size'], shuffle=True)
+                self.test_loader[name] = datas.make_group_dataloader(
+                    test_set, batch_size=mp['batch_size'], shuffle=False)
+                logger.info(f"Data loaded for {name}: {len(train_set)} train / {len(test_set)} test snapshot groups "
+                            f"of {geom['lltogl_np'].shape[0]} elements")
+                logger.info(f"Train loader: {len(self.train_loader[name])} batches | Test loader: {len(self.test_loader[name])} batches")
+
+        with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as fs:
+            pickle.dump((self.dof_mean, self.dof_std), fs)
+
+    def _train_epoch_encdec(self, epoch: int, max_norm: float) -> float:
+        """Encdec training epoch: encode shared context per snapshot group, multi-step local loss."""
+        self.model.train()
+        geom = self._encdec_geometry()
+        coords = geom['coords']
+        ss_p = self._ss_prob(epoch)
+        epoch_loss = 0.0
+        for key in self.train_loader:
+            if self.config['distributed']:
+                self.sampler[key].set_epoch(epoch)
+            for inputs, targets, tokens, _ in self.train_loader[key]:
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                tokens = tokens.to(self.device)
+                self.optimizer.zero_grad()
+                total_loss = 0.0
+                for n in range(targets.shape[2]):
+                    target = targets[:, :, n, :]
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        outputs = self.model(inputs, tokens, coords)
+                        loss = self.criterion(outputs, target)
+                    total_loss += loss
+                    self.scaler.scale(loss).backward()
+                    inputs = torch.cat((inputs[:, :, 1:, :], outputs.detach().unsqueeze(2)), dim=2)
+                    if ss_p > 0 and torch.rand(()).item() < ss_p:
+                        new_frame = self._reassemble_tokens(outputs.detach(), key, geom)
+                        tokens = self._shift_tokens(tokens, new_frame)
+                epoch_loss += total_loss.item() / (targets.shape[2] * len(self.train_loader[key]))
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+        return epoch_loss
+
+    def _validate_epoch_encdec(self) -> float:
+        """Encdec validation epoch (teacher-forced context)."""
+        self.model.eval()
+        geom = self._encdec_geometry()
+        coords = geom['coords']
+        test_loss = 0.0
+        with torch.no_grad():
+            for key in self.test_loader:
+                for inputs, targets, tokens, _ in self.test_loader[key]:
+                    inputs = inputs.to(self.device)
+                    targets = targets.to(self.device)
+                    tokens = tokens.to(self.device)
+                    for n in range(targets.shape[2]):
+                        target = targets[:, :, n, :]
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            outputs = self.model(inputs, tokens, coords)
+                            loss = self.criterion(outputs, target)
+                        test_loss += loss.item() / (targets.shape[2] * len(self.test_loader[key]))
+                        inputs = torch.cat((inputs[:, :, 1:, :], outputs.unsqueeze(2)), dim=2)
         return test_loss
 
     def _model_fit(self):
@@ -673,9 +936,8 @@ class runner(nn.Module):
                 best_epoch = 0
 
             start_time = time.time()
-            new_lr = self.scheduler.get_last_lr() if self.scheduler is not None else self.config['model_params']['lr']
-            if new_lr is list:
-                new_lr = new_lr[0]
+            # ReduceLROnPlateau.get_last_lr only exists from torch ~2.2; read the optimizer directly
+            new_lr = self.optimizer.param_groups[0]['lr']
 
             for epoch in range(len(losses), self.config['model_params']['num_epochs']):
                 epoch_loss = self._train_epoch(epoch, GRAD_CLIP_MAX_NORM)
@@ -685,7 +947,7 @@ class runner(nn.Module):
                 test_losses.append(test_loss)
 
                 self.scheduler.step(test_loss)
-                new_lr = self.scheduler.get_last_lr()[0] if isinstance(new_lr, list) else new_lr
+                new_lr = self.optimizer.param_groups[0]['lr']
 
                 if epoch > 1:
                     if np.isnan(test_losses[-1]) or np.isnan(losses[-1]):
@@ -741,7 +1003,11 @@ class runner(nn.Module):
         ny = self.l_config.ny_g
         nz = self.l_config.nz_g if self.dim == 3 else 1
         dof_node = self.l_config.dof_node
-        num_unique_elems = (nx//skipx) * (ny//skipy) * (nz//skipz) if self.dim == 3 else (nx//skipx) * (ny//skipy)
+        # one element per loop iteration below; (nx//skipx)*(ny//skipy) overcounts when skip==1,
+        # leaving all-zero rows that alias every slot to global DOF 0
+        num_unique_elems = len(range(0, nx - 1, skipx)) * len(range(0, ny - 1, skipy))
+        if self.dim == 3:
+            num_unique_elems *= len(range(0, nz - 1, skipz))
         dof_elem = self.l_config.dof_elem
         lltogl_mat = np.zeros((num_unique_elems, dof_elem), dtype=int)
         elem_idx = 0
@@ -765,6 +1031,8 @@ class runner(nn.Module):
         Inputs dof_u/dof_v(/dof_w) are expected to contain at least `time_lag` snapshots.
         Returns full predicted trajectories with shape (total_steps, num_dofs).
         """
+        if self.config['model_params']['model_type'] == 'tr_encdec':
+            return self._predict_dofs_forward_encdec(name, dof_u, dof_v, dof_w, total_steps)
         time_lag = self.config['model_params']['time_lag']
         if total_steps is None:
             total_steps = dof_u.shape[0]
@@ -820,6 +1088,80 @@ class runner(nn.Module):
             if self.dim == 3:
                 dof_w_pred[:, lltogl_mat[i]] = predictions[i, :, 2*ndof:]
 
+        return dof_u_pred, dof_v_pred, dof_w_pred
+
+    def _predict_dofs_forward_encdec(self, name, dof_u, dof_v, dof_w=None, total_steps=None):
+        """Two-timescale autoregressive rollout for the encdec model.
+
+        Local dynamics advance every step; the global context is re-encoded from the
+        scatter-mean reassembled predicted field every `global_K` steps.
+        Returns (total_steps, num_dofs) trajectories like _predict_dofs_forward.
+        """
+        mp = self.config['model_params']
+        time_lag = mp['time_lag']
+        cw = mp.get('context_window', 1)
+        ct = mp.get('context_time', 'window_end')
+        global_K = mp.get('global_K', 10)
+        if total_steps is None:
+            total_steps = dof_u.shape[0]
+        if total_steps < time_lag:
+            raise ValueError(f"total_steps ({total_steps}) must be >= time_lag ({time_lag})")
+        if dof_u.shape[0] < time_lag or dof_v.shape[0] < time_lag:
+            raise ValueError("dof_u and dof_v must contain at least time_lag snapshots")
+        if self.dim == 3 and (dof_w is None or dof_w.shape[0] < time_lag):
+            raise ValueError("dof_w must contain at least time_lag snapshots for 3D predictions")
+
+        geom = self._encdec_geometry(use_skip=False)
+        lltogl_mat = geom['lltogl_np']
+        num_elems = lltogl_mat.shape[0]
+        coords = geom['coords']
+        mean_np = self.dof_mean[name].numpy()
+        std_np = self.dof_std[name].numpy()
+
+        comps = [dof_u[:time_lag, :][:, lltogl_mat], dof_v[:time_lag, :][:, lltogl_mat]]
+        if self.dim == 3:
+            comps.append(dof_w[:time_lag, :][:, lltogl_mat])
+        init = (np.concatenate(comps, axis=2) - mean_np) / std_np  # (tl, E, F)
+        dof_input = torch.from_numpy(init).float().permute(1, 0, 2).unsqueeze(0).to(self.device)  # (1, E, tl, F)
+
+        def window_tokens(window):
+            frames = window[:, :, -cw:, :] if ct == 'window_end' else window[:, :, :cw, :]
+            return frames.reshape(1, num_elems, cw * frames.shape[-1])
+
+        self.model.eval()
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        F_dim = self.dim * self.l_config.dof_elem
+        predictions = np.zeros((num_elems, total_steps, F_dim))
+        predictions[:, :time_lag, :] = dof_input[0].cpu().numpy()
+
+        with torch.no_grad():
+            context = model.encode(window_tokens(dof_input), coords)
+            for t in range(total_steps - time_lag):
+                output = model.decode(dof_input, context)  # (1, E, F)
+                predictions[:, t + time_lag, :] = output[0].cpu().numpy()
+                dof_input = torch.cat((dof_input[:, :, 1:, :], output.unsqueeze(2)), dim=2)
+                if (t + 1) % global_K == 0 and (t + 1) < total_steps - time_lag:
+                    frames = dof_input[:, :, -cw:, :] if ct == 'window_end' else dof_input[:, :, :cw, :]
+                    re = torch.stack(
+                        [self._reassemble_tokens(frames[:, :, i, :], name, geom) for i in range(cw)],
+                        dim=2)
+                    context = model.encode(re.reshape(1, num_elems, cw * F_dim), coords)
+
+        predictions = predictions * std_np + mean_np
+
+        # scatter-mean assembly of shared nodal DOFs (interior nodes belong to multiple elements)
+        num_dofs = geom['num_dofs']
+        ndof = self.l_config.dof_elem
+        counts = geom['counts_cpu'].numpy()
+        out = []
+        for c in range(self.dim):
+            acc = torch.zeros(total_steps, num_dofs, dtype=torch.float64)
+            vals = torch.from_numpy(
+                predictions[:, :, c * ndof:(c + 1) * ndof].transpose(1, 0, 2).reshape(total_steps, -1))
+            acc.index_add_(1, geom['scatter_index_cpu'], vals)
+            out.append((acc.numpy() / counts))
+        dof_u_pred, dof_v_pred = out[0], out[1]
+        dof_w_pred = out[2] if self.dim == 3 else None
         return dof_u_pred, dof_v_pred, dof_w_pred
 
 

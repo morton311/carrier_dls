@@ -113,10 +113,9 @@ class FFN_SwiGLU(nn.Module):
         self.W2 = nn.Linear(ff_dim, d_model, bias=False)
 
     def forward(self, x):
-        x = self.W(x)
-        swish = x * torch.sigmoid(x)
-        x = swish * self.V(x)
-        out = self.W2(x)
+        w = self.W(x)
+        swish = w * torch.sigmoid(w)
+        out = self.W2(swish * self.V(x))
 
         return out
     
@@ -280,6 +279,159 @@ class TransformerEncoderModel(nn.Module):
         x = self.fc(x[:, -1, :])
         return x
     
+
+## ============================ Global-Local Encoder-Decoder =====================================
+def _make_encoder_layer(d_model, ff_dim, nhead, activation, pre_norm):
+    """Build a TransformerEncoderLayer with the same SwiGLU substitution used by TransformerEncoderModel."""
+    base_activation = 'relu' if activation == 'swiglu' else activation
+    layer = nn.TransformerEncoderLayer(
+        d_model=d_model,
+        dim_feedforward=ff_dim,
+        nhead=nhead,
+        batch_first=True,
+        activation=base_activation,
+        norm_first=pre_norm,
+    )
+    if activation == 'swiglu':
+        layer.activation = SwiGLU(ff_dim)
+    return layer
+
+
+class CoordinateEmbedding(nn.Module):
+    """Fourier-feature embedding of continuous element centroid coordinates in [0, 1]."""
+    def __init__(self, d_model, spatial_dim=2, num_freqs=6):
+        super().__init__()
+        freqs = (2.0 ** torch.arange(num_freqs)) * math.pi
+        self.register_buffer('freqs', freqs)
+        self.proj = nn.Linear(2 * num_freqs * spatial_dim, d_model)
+
+    def forward(self, coords):
+        # coords: (E, spatial_dim) -> (E, d_model)
+        ang = coords.unsqueeze(-1) * self.freqs
+        feats = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+        return self.proj(feats.flatten(start_dim=-2))
+
+
+class SpatialEncoder(nn.Module):
+    """Transformer encoder over the set of GFEM element tokens at one global time.
+
+    tokens: (G, E, token_dim), coords: (E, spatial_dim) -> context (G, S, d_model)
+    where S = E, or S = num_context_tokens when perceiver-style pooling is enabled.
+    """
+    def __init__(self, token_dim, d_model, nhead=4, num_layers=2, ff_dim=1024,
+                 activation='swiglu', pre_norm=True, spatial_dim=2, num_freqs=6,
+                 num_context_tokens=0):
+        super().__init__()
+        self.token_proj = nn.Linear(token_dim, d_model)
+        self.coord_embed = CoordinateEmbedding(d_model, spatial_dim, num_freqs)
+        self.encoder_layers = nn.ModuleList([
+            _make_encoder_layer(d_model, ff_dim, nhead, activation, pre_norm)
+            for _ in range(num_layers)
+        ])
+        # prenorm layers leave the residual stream unnormalized; context feeds cross-attention K/V
+        self.final_norm = nn.LayerNorm(d_model) if pre_norm else nn.Identity()
+        self.num_context_tokens = num_context_tokens
+        if num_context_tokens > 0:
+            self.latent_queries = nn.Parameter(torch.randn(num_context_tokens, d_model) * d_model ** -0.5)
+            self.pool_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+
+    def forward(self, tokens, coords):
+        x = self.token_proj(tokens) + self.coord_embed(coords).unsqueeze(0)
+        for layer in self.encoder_layers:
+            x = layer(x)
+        x = self.final_norm(x)
+        if self.num_context_tokens > 0:
+            q = self.latent_queries.unsqueeze(0).expand(x.shape[0], -1, -1)
+            x, _ = self.pool_attn(q, x, x, need_weights=False)
+        return x
+
+
+class GlobalLocalDecoderLayer(nn.Module):
+    """Decoder layer: temporal self-attention per element + cross-attention to the shared context.
+
+    x: (G, E, tl, d_model), context: (G, S, d_model). Cross-attention reshapes queries to
+    (G, E*tl, d_model) so all E elements of a snapshot attend to one context without K/V duplication.
+    """
+    def __init__(self, d_model, nhead, ff_dim, activation='swiglu', pre_norm=True):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        if activation == 'swiglu':
+            self.ffn = FFN_SwiGLU(d_model, ff_dim)
+        else:
+            act = nn.ReLU() if activation == 'relu' else nn.GELU()
+            self.ffn = nn.Sequential(nn.Linear(d_model, ff_dim), act, nn.Linear(ff_dim, d_model))
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.pre_norm = pre_norm
+
+    def forward(self, x, context, attn_mask=None):
+        G, E, tl, d = x.shape
+        h = x.reshape(G * E, tl, d)
+        if self.pre_norm:
+            h2 = self.norm1(h)
+            a, _ = self.self_attn(h2, h2, h2, attn_mask=attn_mask, need_weights=False)
+            h = h + a
+            q = h.reshape(G, E * tl, d)
+            a, _ = self.cross_attn(self.norm2(q), context, context, need_weights=False)
+            q = q + a
+            q = q + self.ffn(self.norm3(q))
+        else:
+            a, _ = self.self_attn(h, h, h, attn_mask=attn_mask, need_weights=False)
+            h = self.norm1(h + a)
+            q = h.reshape(G, E * tl, d)
+            a, _ = self.cross_attn(q, context, context, need_weights=False)
+            q = self.norm2(q + a)
+            q = self.norm3(q + self.ffn(q))
+        return q.reshape(G, E, tl, d)
+
+
+class GlobalLocalTransformer(nn.Module):
+    """Globally-aware local dynamics model.
+
+    encode: element tokens (G, E, context_window*input_dim) + coords (E, spatial_dim)
+            -> context (G, S, d_model), refreshed on the slow global timescale.
+    decode: local windows (G, E, time_lag, input_dim) + context -> next step (G, E, input_dim).
+    """
+    def __init__(self, time_lag, input_dim, d_model=256, ff_dim=1024, nhead=4, num_layers=4,
+                 enc_num_layers=2, enc_nhead=4, enc_ff_dim=1024, activation='swiglu',
+                 pre_norm=True, spatial_dim=2, num_freqs=6, context_window=1,
+                 num_context_tokens=0, causal=True):
+        super().__init__()
+        self.encoder = SpatialEncoder(
+            token_dim=input_dim * context_window, d_model=d_model, nhead=enc_nhead,
+            num_layers=enc_num_layers, ff_dim=enc_ff_dim, activation=activation,
+            pre_norm=pre_norm, spatial_dim=spatial_dim, num_freqs=num_freqs,
+            num_context_tokens=num_context_tokens,
+        )
+        self.input_projection = nn.Linear(input_dim, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, max_len=time_lag)
+        self.decoder_layers = nn.ModuleList([
+            GlobalLocalDecoderLayer(d_model, nhead, ff_dim, activation, pre_norm)
+            for _ in range(num_layers)
+        ])
+        self.fc = nn.Linear(d_model, input_dim)
+        if causal:
+            mask = torch.triu(torch.ones(time_lag, time_lag, dtype=torch.bool), diagonal=1)
+            self.register_buffer('causal_mask', mask)
+        else:
+            self.causal_mask = None
+
+    def encode(self, tokens, coords):
+        return self.encoder(tokens, coords)
+
+    def decode(self, x, context):
+        G, E, tl, _ = x.shape
+        h = self.input_projection(x)
+        h = self.positional_encoding(h.reshape(G * E, tl, -1)).reshape(G, E, tl, -1)
+        for layer in self.decoder_layers:
+            h = layer(h, context, attn_mask=self.causal_mask)
+        return self.fc(h[:, :, -1, :])
+
+    def forward(self, x, tokens, coords):
+        return self.decode(x, self.encode(tokens, coords))
+
 
 ## ====================================== LSTM Model ============================================
 class LSTMModel(nn.Module):

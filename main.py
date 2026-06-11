@@ -64,6 +64,7 @@ if __name__ == "__main__":
     elif run.config['mode'] == 'latent':
         from lib.dls import latent_eval
         latent_eval(run)
+        
     # copy the config file to the model directory
     shutil.copy(args.c, run.paths_bib.model_dir + os.path.basename(args.c))
     
