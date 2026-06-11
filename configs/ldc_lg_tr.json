@@ -1,8 +1,8 @@
 {
     "model_params": {
-        "model_name": "ldc_encdec_smoke",
+        "model_name": "ldc_lg_tr",
         "model_type": "tr_encdec",
-        "time_lag": 20,
+        "time_lag": 64,
         "train_ahead": 5,
         "num_layers": 4,
         "nhead": 4,
@@ -20,9 +20,9 @@
         "lr": 0.001,
         "lr_factor": 0.5,
         "lr_patience": 5,
-        "batch_size": 8,
-        "num_epochs": 2,
-        "patience": 2,
+        "batch_size": 512,
+        "num_epochs": 100,
+        "patience": 10,
         "activation": "swiglu",
         "prenorm": true,
         "ss_start_epoch": 0,
