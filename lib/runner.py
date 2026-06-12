@@ -405,7 +405,7 @@ class runner(nn.Module):
             logger.info(f"Model initialized with {self.num_params} parameters")
 
             # print model summary 
-            summary(self.model, input_size=(self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim']))
+            # summary(self.model, input_size=(self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim']))
 
         if self.config['distributed']:
             from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1164,16 +1164,33 @@ class runner(nn.Module):
         num_dofs = self.l_config.num_gfem_nodes * self.l_config.dof_node
         ndof = self.l_config.dof_elem
 
-        dof_u_pred = np.zeros((total_steps, num_dofs))
-        dof_v_pred = np.zeros((total_steps, num_dofs))
-        dof_w_pred = np.zeros((total_steps, num_dofs)) if self.dim == 3 else None
+        flat_index = torch.from_numpy(lltogl_mat.reshape(-1)).long()
+        counts = torch.from_numpy(
+            np.bincount(flat_index.numpy(), minlength=num_dofs).astype(np.float64)
+        )
+        counts = counts.clamp_min(1.0)
 
-        for i in range(num_elems):
-            dof_u_pred[:, lltogl_mat[i]] = predictions[i, :, :ndof]
-            dof_v_pred[:, lltogl_mat[i]] = predictions[i, :, ndof:2*ndof]
-            if self.dim == 3:
-                dof_w_pred[:, lltogl_mat[i]] = predictions[i, :, 2*ndof:]
+        predictions_t = torch.from_numpy(predictions).double()
+        dof_u_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
+        dof_v_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
+        dof_w_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64) if self.dim == 3 else None
 
+        for c in range(self.dim):
+            vals = predictions_t[:, :, c * ndof:(c + 1) * ndof]
+            vals = vals.permute(1, 0, 2).reshape(total_steps, -1)
+            acc = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
+            acc.index_add_(1, flat_index, vals)
+            out = acc / counts
+            if c == 0:
+                dof_u_pred = out
+            elif c == 1:
+                dof_v_pred = out
+            else:
+                dof_w_pred = out
+
+        dof_u_pred = dof_u_pred.numpy()
+        dof_v_pred = dof_v_pred.numpy()
+        dof_w_pred = dof_w_pred.numpy() if self.dim == 3 else None
         return dof_u_pred, dof_v_pred, dof_w_pred
 
     def _predict_dofs_forward_encdec(self, name, dof_u, dof_v, dof_w=None, total_steps=None):
