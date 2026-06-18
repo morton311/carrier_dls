@@ -13,4 +13,4 @@ module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-torchrun main.py -c 'no_skip_z' -m 'train' -d "True"
+torchrun main.py -c 'carrier/no_skip_z' -m 'train' -d "True"

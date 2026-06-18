@@ -76,7 +76,7 @@ class runner(nn.Module):
         self.config['group_names'] = paths.data_dict
         if config['mode'] != 'compare' and config['log'] == 'file':
             log_path = paths.log_path
-            logging.info("To follow the log in real time, run 'tail -f {paths.log_path}'")
+            logging.info("To follow the log in real time, run 'tail -f %s'", log_path, exc_info=True)
             file_handler = logging.FileHandler(log_path, mode='w')
             formatter = logging.Formatter('%(message)s')
             file_handler.setFormatter(formatter)
@@ -291,7 +291,7 @@ class runner(nn.Module):
                 if self.config['latent_params'].get('localized', False):
                     input_dim = self.dim * self.l_config.dof_elem
                 else:
-                    input_dim = self.dim * self.l_config.num_gfem_elems * self.l_config.dof_node
+                    input_dim = self.dim * self.l_config.num_gfem_nodes * self.l_config.dof_node
         logger.info(f"Input dimension for model: {input_dim}")
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps

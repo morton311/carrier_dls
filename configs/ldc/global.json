@@ -4,16 +4,16 @@
         "model_type" :  "tr_enc",
         "time_lag" :    64,
         "train_ahead" : 5,
-        "num_layers" :  2,
+        "num_layers" :  4,
         "nhead" :       4,
         "d_model":      128,
         "ff_dim":       384,
         "lr" :          0.001,
         "lr_factor":    0.5,
         "lr_patience":  5,
-        "batch_size" :  4096,
+        "batch_size" :  256,
         "num_epochs" :  10000,
-        "patience" :    10,
+        "patience" :    50,
         "activation":   "swiglu",
         "prenorm":      true
     },
@@ -22,13 +22,10 @@
         "type" : "dls",
         "patch_size" : 49,
         "num_modes" : 20,
-        "localized": true,
+        "localized": false,
         "source_name" : "ldc_15k",
         "source_path" : "ldc_15k",
-        "batch_size" : 250,
-        "skipx" : 1,
-        "skipy" : 1,
-        "skipz" : 1
+        "batch_size" : 250
     },
 
     "train_data" : [
