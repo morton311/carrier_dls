@@ -319,8 +319,10 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
         nz_t = runner.l_config.nz_t
         x_grid, y_grid, z_grid = runner.x_grid, runner.y_grid, runner.z_grid
         x_grid_t, y_grid_t, z_grid_t = x_grid[:nx_t, :ny_t, :nz_t], y_grid[:nx_t, :ny_t, :nz_t], z_grid[:nx_t, :ny_t, :nz_t]
+
     time_lag = runner.config['model_params']['time_lag']
     val_id = ids
+    indx = indx + 1
 
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
@@ -447,6 +449,7 @@ def q_criterion(runner, rec_path: str, gt_path: str, name: str, ids, indx: int) 
     os.makedirs(q_dir, exist_ok=True)
     val_id = ids
     time_lag = runner.config['model_params']['time_lag']
+    indx = indx + 1
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
         Q_gt = f_gt['UV'][val_id[time_lag + indx]] - mean
