@@ -1334,22 +1334,31 @@ class runner(nn.Module):
             self.compute_RMS(rec_path, gt_path, name, source_group, ids)
 
             pl.plot_TKE(self, rec_path, gt_path, name, source_group,  ids)
-            pl.plot_RMS(self, rec_path, gt_path, name, source_group, z_slice=z_slice)
-            pl.plot_RMS(self, rec_path, gt_path, name, source_group, y_slice=y_slice)
-            pl.plot_RMS(self, rec_path, gt_path, name, source_group, x_slice=x_slice)
+            if self.dim == 3:
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group, z_slice=z_slice)
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group, y_slice=y_slice)
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group, x_slice=x_slice)
 
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  z_slice=z_slice)
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  z_slice=z_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  z_slice=z_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  z_slice=z_slice)
 
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  y_slice=y_slice)
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  y_slice=y_slice)
-            
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  x_slice=x_slice)
-            # pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  x_slice=x_slice)
-            
-            # pl.q_criterion(self, rec_path, gt_path, name, ids, 1)
-            # pl.q_criterion(self, rec_path, gt_path, name, ids, 30)
-            # pl.anim_q_criterion(self, rec_path, gt_path, name, ids)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  y_slice=y_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  y_slice=y_slice)
+                
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1,  x_slice=x_slice)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30,  x_slice=x_slice)
+                
+                pl.q_criterion(self, rec_path, gt_path, name, ids, 1)
+                pl.q_criterion(self, rec_path, gt_path, name, ids, 30)
+                pl.anim_q_criterion(self, rec_path, gt_path, name, ids)
+            else:
+                pl.plot_RMS(self, rec_path, gt_path, name, source_group)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 1)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 10)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 20)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 30)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 40)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 50)
 
             pl.plot_horizon_errors(self, rec_path, gt_path, name, source_group)
 

@@ -286,6 +286,7 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
     nx_t, ny_t = runner.l_config.nx_t, runner.l_config.ny_t
     x_grid, y_grid = runner.x_grid, runner.y_grid
     x_grid_t, y_grid_t = x_grid[:nx_t, :ny_t], y_grid[:nx_t, :ny_t]
+    
     if runner.dim == 3:
         nz = runner.l_config.nz
         nz_t = runner.l_config.nz_t
@@ -299,7 +300,7 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
         Q_gt = f_gt['UV'][val_id[time_lag + indx]] - mean
         Q_rec = f_rec['Q_rec'][indx]
 
-
+    slice_val = None
     if z_slice is not None:
         slice_dim = 'z'
         slice_val = z_slice
@@ -336,6 +337,13 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
         x_grid_t = y_grid_t[slice_val, :, :]
         y_grid_t = z_grid_t[slice_val, :, :]
         dim_mult = 2
+
+    if slice_val is None:
+        dim_mult = 2
+        x_label = 'x'
+        y_label = 'y'
+        slice_dim = ''
+        slice_val = 'full'
 
     # normalize Q_gt between -1 and 1 and apply same normalization to Q_rec
     Q_gt_max = np.max(np.abs(Q_gt), axis=(0, 1), keepdims=True)
