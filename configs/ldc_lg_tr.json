@@ -15,7 +15,7 @@
         "coord_freqs": 6,
         "context_window": 1,
         "context_time": "window_end",
-        "global_K": 10,
+        "global_K": 2,
         "causal": true,
         "lr": 0.001,
         "lr_factor": 0.5,

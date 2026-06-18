@@ -92,8 +92,8 @@ class runner(nn.Module):
             logger.setLevel(logging.INFO)
             logger.propagate = False
 
-            logger.info(f"Logging to {log_path}")
-        logger.info(f'Using device: {self.device}')
+            logger.info("Logging to %s", log_path, exc_info=True)
+        logger.info('Using device: %s', self.device, exc_info=True)
         return paths
     
     def _get_grid(self):
@@ -639,8 +639,8 @@ class runner(nn.Module):
                     )
                     logger.info(f"Train loader: {len(self.train_loader[name])} batches | Test loader: {len(self.test_loader[name])} batches")
 
-                    with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as f:
-                        pickle.dump((self.dof_mean, self.dof_std), f)
+                    with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as pkl_f:
+                        pickle.dump((self.dof_mean, self.dof_std), pkl_f)
 
 
     def _model_fit(self):
