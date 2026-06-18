@@ -174,8 +174,8 @@ def make_group_dataloader(
         import os
         from torch.utils.data.distributed import DistributedSampler
         world_rank = int(os.environ["RANK"])
-        sampler = DistributedSampler(dataset, seed=world_rank)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, sampler=sampler)
+        sampler = DistributedSampler(dataset, seed=world_rank)  # Ensure different shuffling for each process
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, sampler=sampler, pin_memory=True, num_workers=4, persistent_workers=True)
         return dataloader, sampler
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
