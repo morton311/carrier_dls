@@ -1132,19 +1132,22 @@ class runner(nn.Module):
         init_u = dof_u[:time_lag, :]
         init_v = dof_v[:time_lag, :]
         init_w = dof_w[:time_lag, :] if self.dim == 3 else None
-
-        lltogl_mat = self._compute_lltogl_mat()
-        num_elems = lltogl_mat.shape[0]
+        if self.config['model_params'].get('localized', False):
+            lltogl_mat = None
+            num_elems = None
+        else:
+            lltogl_mat = self._compute_lltogl_mat()
+            num_elems = lltogl_mat.shape[0]
 
         if self.dim == 3:
             u_sel = init_u[:, lltogl_mat] # shape: (time_lag, num_elems, dof_elem)
             v_sel = init_v[:, lltogl_mat]
             w_sel = init_w[:, lltogl_mat]
-            dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2)) # shape: (num_elems, time_lag, dim * dof_elem)
+            dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2)).squeeze() # shape: (num_elems, time_lag, dim * dof_elem)
         else:
             u_sel = init_u[:, lltogl_mat]
             v_sel = init_v[:, lltogl_mat]
-            dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2))
+            dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2)).squeeze()
 
         dof_input = (dof_input - self.dof_mean[name].numpy()) / self.dof_std[name].numpy()
         dof_input = torch.from_numpy(dof_input).float().to(self.device)
@@ -1162,35 +1165,41 @@ class runner(nn.Module):
         predictions = predictions * self.dof_std[name].numpy() + self.dof_mean[name].numpy()
 
         num_dofs = self.l_config.num_gfem_nodes * self.l_config.dof_node
-        ndof = self.l_config.dof_elem
 
-        flat_index = torch.from_numpy(lltogl_mat.reshape(-1)).long()
-        counts = torch.from_numpy(
-            np.bincount(flat_index.numpy(), minlength=num_dofs).astype(np.float64)
-        )
-        counts = counts.clamp_min(1.0)
+        if self.config['model_params'].get('localized', False):
+            ndof = self.l_config.dof_elem
+            flat_index = torch.from_numpy(lltogl_mat.reshape(-1)).long()
+            counts = torch.from_numpy(
+                np.bincount(flat_index.numpy(), minlength=num_dofs).astype(np.float64)
+            )
+            counts = counts.clamp_min(1.0)
 
-        predictions_t = torch.from_numpy(predictions).double()
-        dof_u_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
-        dof_v_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
-        dof_w_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64) if self.dim == 3 else None
+            predictions_t = torch.from_numpy(predictions).double()
+            dof_u_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
+            dof_v_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
+            dof_w_pred = torch.zeros((total_steps, num_dofs), dtype=torch.float64) if self.dim == 3 else None
 
-        for c in range(self.dim):
-            vals = predictions_t[:, :, c * ndof:(c + 1) * ndof]
-            vals = vals.permute(1, 0, 2).reshape(total_steps, -1)
-            acc = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
-            acc.index_add_(1, flat_index, vals)
-            out = acc / counts
-            if c == 0:
-                dof_u_pred = out
-            elif c == 1:
-                dof_v_pred = out
-            else:
-                dof_w_pred = out
+            for c in range(self.dim):
+                vals = predictions_t[:, :, c * ndof:(c + 1) * ndof]
+                vals = vals.permute(1, 0, 2).reshape(total_steps, -1)
+                acc = torch.zeros((total_steps, num_dofs), dtype=torch.float64)
+                acc.index_add_(1, flat_index, vals)
+                out = acc / counts
+                if c == 0:
+                    dof_u_pred = out
+                elif c == 1:
+                    dof_v_pred = out
+                else:
+                    dof_w_pred = out
 
-        dof_u_pred = dof_u_pred.numpy()
-        dof_v_pred = dof_v_pred.numpy()
-        dof_w_pred = dof_w_pred.numpy() if self.dim == 3 else None
+            dof_u_pred = dof_u_pred.numpy()
+            dof_v_pred = dof_v_pred.numpy()
+            dof_w_pred = dof_w_pred.numpy() if self.dim == 3 else None
+        else:
+            dof_u_pred = predictions[:, :, :num_dofs].squeeze()
+            dof_v_pred = predictions[:, :, num_dofs:2 * num_dofs].squeeze()
+            dof_w_pred = predictions[:, :, 2 * num_dofs:].squeeze() if self.dim == 3 else None
+
         return dof_u_pred, dof_v_pred, dof_w_pred
 
     def _predict_dofs_forward_encdec(self, name, dof_u, dof_v, dof_w=None, total_steps=None):

@@ -13,6 +13,6 @@ module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-torchrun main.py -c ldc/global -m train -d True
+# torchrun main.py -c ldc/global -m train -d True 
 python main.py -c ldc/global -m pred
 python main.py -c ldc/global -m eval
