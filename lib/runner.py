@@ -1138,12 +1138,12 @@ class runner(nn.Module):
         init_u = dof_u[:time_lag, :]
         init_v = dof_v[:time_lag, :]
         init_w = dof_w[:time_lag, :] if self.dim == 3 else None
-        if self.config['model_params'].get('localized', False):
-            lltogl_mat = None
-            num_elems = None
-        else:
+        if self.config['latent_params'].get('localized', False):
             lltogl_mat = self._compute_lltogl_mat()
             num_elems = lltogl_mat.shape[0]
+        else:
+            lltogl_mat = None
+            num_elems = None
 
         if self.dim == 3:
             u_sel = init_u[:, lltogl_mat] # shape: (time_lag, num_elems, dof_elem)
@@ -1172,7 +1172,7 @@ class runner(nn.Module):
 
         num_dofs = self.l_config.num_gfem_nodes * self.l_config.dof_node
 
-        if self.config['model_params'].get('localized', False):
+        if self.config['latent_params'].get('localized', False):
             ndof = self.l_config.dof_elem
             flat_index = torch.from_numpy(lltogl_mat.reshape(-1)).long()
             counts = torch.from_numpy(
