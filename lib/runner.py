@@ -404,8 +404,14 @@ class runner(nn.Module):
             self.num_params = sum(p.numel() for p in self.model.parameters())
             logger.info(f"Model initialized with {self.num_params} parameters")
 
-            # print model summary 
-            # summary(self.model, input_size=(self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim']))
+            # print model summary
+            if self.config['latent_params'].get('localized', False):
+                input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.l_config.dof_elem * self.dim)
+            elif self.config['model_params']['model_type'] == 'tr_enc':
+                input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.l_config.num_gfem_nodes * self.l_config.dof_node * self.dim)
+
+            if not self.config['model_params']['model_type'] == 'tr_encdec':
+                summary(self.model, input_size=input_size)
 
         if self.config['distributed']:
             from torch.nn.parallel import DistributedDataParallel as DDP
