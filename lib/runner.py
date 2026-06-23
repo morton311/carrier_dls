@@ -1149,11 +1149,11 @@ class runner(nn.Module):
             u_sel = init_u[:, lltogl_mat] # shape: (time_lag, num_elems, dof_elem)
             v_sel = init_v[:, lltogl_mat]
             w_sel = init_w[:, lltogl_mat]
-            dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2)).squeeze() # shape: (num_elems, time_lag, dim * dof_elem)
+            dof_input = np.transpose(np.concatenate([u_sel, v_sel, w_sel], axis=2), (1, 0, 2)) # shape: (num_elems, time_lag, dim * dof_elem)
         else:
             u_sel = init_u[:, lltogl_mat]
             v_sel = init_v[:, lltogl_mat]
-            dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2)).squeeze()
+            dof_input = np.transpose(np.concatenate([u_sel, v_sel], axis=2), (1, 0, 2))
 
         dof_input = (dof_input - self.dof_mean[name].numpy()) / self.dof_std[name].numpy()
         dof_input = torch.from_numpy(dof_input).float().to(self.device)
