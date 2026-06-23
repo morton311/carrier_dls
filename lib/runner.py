@@ -1159,7 +1159,7 @@ class runner(nn.Module):
         dof_input = torch.from_numpy(dof_input).float().to(self.device)
 
         self.model.eval()
-        predictions = np.zeros((num_elems, total_steps, self.dim * self.l_config.dof_elem))
+        predictions = np.zeros((num_elems, total_steps, self.config['model_params']['input_dim']), dtype=np.float64)
         predictions[:, :time_lag, :] = dof_input.cpu().numpy()
 
         with torch.no_grad():
