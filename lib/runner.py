@@ -151,48 +151,68 @@ class runner(nn.Module):
 
         
 
+    def _compress_data(self, data_path, group_name, latent_config=None):
+        """Dispatch latent-coefficient computation for one dataset to the
+        configured latent backend ('dls' or 'pod'), writing the coefficients to
+        the latent file under ``group_name``. Returns the latent config object.
+
+        ``latent_config`` reuses an existing basis (modes) so that every dataset
+        shares the same latent space; pass ``None`` for the source dataset that
+        defines the basis.
+        """
+        lp = self.config['latent_params']
+        if lp['type'] == 'dls':
+            return self.dls.gfem_compress_flexible(
+                data_source=data_path,
+                field_name='UV',
+                group_name=group_name,
+                patch_size=lp['patch_size'],
+                num_modes=lp['num_modes'],
+                latent_target=self.paths_bib.latent_path,
+                batch_size=lp['batch_size'],
+                dls_config=latent_config,
+            )
+        elif lp['type'] == 'pod':
+            if lp.get('localized', False):
+                raise ValueError("latent_params.type 'pod' does not support localized=true")
+            return pod.pod_compress(
+                data_source=data_path,
+                field_name='UV',
+                group_name=group_name,
+                num_modes=lp['num_modes'],
+                latent_target=self.paths_bib.latent_path,
+                batch_size=lp['batch_size'],
+                pod_config=latent_config,
+            )
+        else:
+            raise ValueError(f"latent_params.type '{lp['type']}' not recognized. Use 'dls' or 'pod'.")
+
     def _compute_latent_coefficients(self):
-        
+
         logger.info("Computing latent coefficients...")
         # compute the latent coefficients from source data
         logger.info(f"Source path: {self.paths_bib.source_path}")
-        
-        if self.config['latent_params']['type'] == 'dls':
-            # Check if latent_path exists and contains the source_name group
-            if os.path.exists(self.paths_bib.latent_path):
-                with h5py.File(self.paths_bib.latent_path, 'r+') as f:
-                    if self.config['latent_params']['source_name'] in f:
-                        logger.info(f"Latent coefficients for source {self.config['latent_params']['source_name']} already exist in {self.paths_bib.latent_path}, skipping computation.")
-                    else:
-                        logger.info(f"Latent coefficients for source {self.config['latent_params']['source_name']} not found in {self.paths_bib.latent_path}, computing...")
-                        latent_config = self.dls.gfem_compress_flexible(
-                            data_source = self.paths_bib.source_path,
-                            field_name = 'UV',
-                            group_name = self.config['latent_params']['source_name'],
-                            patch_size = self.config['latent_params']['patch_size'],
-                            num_modes = self.config['latent_params']['num_modes'],
-                            latent_target = self.paths_bib.latent_path,
-                            batch_size = self.config['latent_params']['batch_size'],
-                        )
-                        with open(self.paths_bib.latent_config_path, 'wb') as f:
-                            pickle.dump(latent_config, f)
-                        logger.info("Latent coefficient config saved")
-            else:
-                logger.info(f"Latent file {self.paths_bib.latent_path} not found, computing latent coefficients for source {self.config['latent_params']['source_name']}...")
-                latent_config = self.dls.gfem_compress_flexible(
-                    data_source = self.paths_bib.source_path,
-                    field_name = 'UV',
-                    group_name = self.config['latent_params']['source_name'],
-                    patch_size = self.config['latent_params']['patch_size'],
-                    num_modes = self.config['latent_params']['num_modes'],
-                    latent_target = self.paths_bib.latent_path,
-                    batch_size = self.config['latent_params']['batch_size'],
-                )
-            
-        
-                with open(self.paths_bib.latent_config_path, 'wb') as f:
-                    pickle.dump(latent_config, f)
-                logger.info("Latent coefficient config saved")
+
+        source_name = self.config['latent_params']['source_name']
+        # Compute the source dataset first; it defines the latent basis that all
+        # other datasets are projected onto.
+        source_exists = False
+        if os.path.exists(self.paths_bib.latent_path):
+            with h5py.File(self.paths_bib.latent_path, 'r') as f:
+                source_exists = source_name in f
+
+        if source_exists:
+            logger.info(f"Latent coefficients for source {source_name} already exist in {self.paths_bib.latent_path}, skipping computation.")
+        else:
+            logger.info(f"Computing latent coefficients for source {source_name}...")
+            latent_config = self._compress_data(
+                data_path=self.paths_bib.source_path,
+                group_name=source_name,
+                latent_config=None,
+            )
+            with open(self.paths_bib.latent_config_path, 'wb') as f:
+                pickle.dump(latent_config, f)
+            logger.info("Latent coefficient config saved")
 
         # load latent_config for use in computing latent coefficients for train and eval data
         with open(self.paths_bib.latent_config_path, 'rb') as f:
@@ -206,7 +226,7 @@ class runner(nn.Module):
                     path = source.get('path')
                     path = self.paths_bib.data_dir + path + '.h5'
                     data_name = source.get('name')
-                    
+
                     if path == self.paths_bib.source_path:
                         logger.info(f"Source data {self.config['latent_params']['source_name']} found in {data_source}, skipping latent coefficient computation for this data.")
                         continue
@@ -216,19 +236,13 @@ class runner(nn.Module):
                             if data_name in f:
                                 logger.info(f"Group {data_name} already exists in latent file, skipping computation.")
                                 continue
-                        
+
                         logger.info(f"Computing latent coefficients for {data_source} {data_name}...")
-                        if self.config['latent_params']['type'] == 'dls':
-                            self.dls.gfem_compress_flexible(
-                                data_source = path,
-                                field_name = 'UV',
-                                group_name = data_name,
-                                patch_size = self.config['latent_params']['patch_size'],
-                                num_modes = self.config['latent_params']['num_modes'],
-                                latent_target = self.paths_bib.latent_path,
-                                batch_size = self.config['latent_params']['batch_size'],
-                                dls_config = latent_config
-                            )
+                        self._compress_data(
+                            data_path=path,
+                            group_name=data_name,
+                            latent_config=latent_config,
+                        )
         
 
     def _latent_split(self):
@@ -292,6 +306,9 @@ class runner(nn.Module):
                     input_dim = self.dim * self.l_config.dof_elem
                 else:
                     input_dim = self.dim * self.l_config.num_gfem_nodes * self.l_config.dof_node
+            elif self.config['latent_params']['type'] == 'pod':
+                # one temporal coefficient block (num_modes) per velocity component
+                input_dim = self.dim * self.l_config.num_modes
         logger.info(f"Input dimension for model: {input_dim}")
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
@@ -407,8 +424,8 @@ class runner(nn.Module):
             # print model summary
             if self.config['latent_params'].get('localized', False):
                 input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.l_config.dof_elem * self.dim)
-            elif self.config['model_params']['model_type'] == 'tr_enc':
-                input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.l_config.num_gfem_nodes * self.l_config.dof_node * self.dim)
+            else:
+                input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim'])
 
             if not self.config['model_params']['model_type'] == 'tr_encdec':
                 summary(self.model, input_size=input_size)
@@ -579,7 +596,7 @@ class runner(nn.Module):
                     train_indices = self.indices['train_data'][name]['train_indices']
                     test_indices = self.indices['train_data'][name]['test_indices']
 
-                    if self.config['latent_params']['type'] == 'dls':
+                    if self.config['latent_params']['type'] in ('dls', 'pod'):
                         dof_u = f[name]['dof_u']
                         dof_v = f[name]['dof_v']
                         dof_w = f[name]['dof_w'] if self.dim == 3 else None
@@ -1399,7 +1416,16 @@ class runner(nn.Module):
                 dof_v_pred = f['dof_v'][:]
                 dof_w_pred = f['dof_w'][:] if self.dim == 3 else None
 
-            if self.dim == 3:
+            if self.config['latent_params']['type'] == 'pod':
+                pod.pod_recon(
+                    rec_target=pred_path.replace('.h5', '_rec.h5'),
+                    config=self.l_config,
+                    dof_u=dof_u_pred,
+                    dof_v=dof_v_pred,
+                    dof_w=dof_w_pred,
+                    batch_size=self.config['latent_params'].get('batch_size', 100),
+                )
+            elif self.dim == 3:
                 self.dls.gfem_recon_flexible(
                         rec_target=pred_path.replace('.h5', '_rec.h5'),
                         config=self.l_config,

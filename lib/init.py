@@ -39,8 +39,10 @@ class pathsBib:
             lins_str = '_'.join(str(l) for l in config['latent_params']['linear'])
             
             self.latent_id = source_name + '_bvae_l' + str(config['latent_params']['latent_dim']) + '_b' + str(config['latent_params']['beta']) + '_f_' + filters_str + '_lin_' + lins_str
+        elif config['latent_params']['type'] == 'pod':
+            self.latent_id = source_name + '_pod_m' + str(config['latent_params']['num_modes'])
         else:
-            self.latent_id = source_name + '_pod' # + str(config['latent_params']['num_modes'])
+            self.latent_id = source_name + '_pod'
         self.latent_id = self.latent_id.replace('.', '_')
 
         self.source_path = self.data_dir + source_path + '.h5'
