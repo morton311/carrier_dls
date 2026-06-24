@@ -537,6 +537,8 @@ def gfem_recon_flexible(
         for i in range(config.nx_g - 1):
             for j in range(config.ny_g - 1):
                 lltogl = build_lltogl(i, j, config.ny_g, dof_node, IJK)
+                indx_cell = i * nskip
+                indy_cell = j * nskip
 
                 dof_local_u = dof_u_arr[snap_start:snap_end, :][:, lltogl].T
                 dof_local_v = dof_v_arr[snap_start:snap_end, :][:, lltogl].T
@@ -546,9 +548,6 @@ def gfem_recon_flexible(
 
                 Q_local_u = Q_local_u_vec.reshape((nskip + 1, nskip + 1, snap_end - snap_start), order="F")
                 Q_local_v = Q_local_v_vec.reshape((nskip + 1, nskip + 1, snap_end - snap_start), order="F")
-
-                indx_cell = i * nskip
-                indy_cell = j * nskip
 
                 Q_rec_u[indx_cell:indx_cell + nskip + 1, indy_cell:indy_cell + nskip + 1, :] = Q_local_u
                 Q_rec_v[indx_cell:indx_cell + nskip + 1, indy_cell:indy_cell + nskip + 1, :] = Q_local_v

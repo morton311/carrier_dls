@@ -1143,7 +1143,7 @@ class runner(nn.Module):
             num_elems = lltogl_mat.shape[0]
         else:
             lltogl_mat = None
-            num_elems = None
+            num_elems = 1
 
         if self.dim == 3:
             u_sel = init_u[:, lltogl_mat] # shape: (time_lag, num_elems, dof_elem)
