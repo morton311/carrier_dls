@@ -1,7 +1,7 @@
 #!/bin/bash
 # JOB HEADERS HERE
 #SBATCH --job-name=challenge
-#SBATCH --account=NAWCP24632466
+#SBATCH --account=AFMNG31652E99
 #SBATCH --qos=debug
 #SBATCH --constraint=mla
 #SBATCH --nodes=1
