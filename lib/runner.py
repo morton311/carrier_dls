@@ -246,7 +246,6 @@ class runner(nn.Module):
         
 
     def _latent_split(self):
-
         # Load existing splits if available
         if os.path.exists(self.paths_bib.model_dir + 'split_ids.pkl'):
             with open(self.paths_bib.model_dir + 'split_ids.pkl', 'rb') as f:

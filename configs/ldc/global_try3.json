@@ -1,6 +1,6 @@
 {
     "model_params" : {
-        "model_name" :  "pod",
+        "model_name" :  "ldc",
         "model_type" :  "tr_enc",
         "time_lag" :    64,
         "train_ahead" : 5,
@@ -17,10 +17,11 @@
         "activation":   "swiglu",
         "prenorm":      true
     },
-
+    
     "latent_params" : {
-        "type" : "pod",
-        "num_modes" : 100,
+        "type" : "dls",
+        "patch_size" : 99,
+        "num_modes" : 10,
         "localized": false,
         "source_name" : "ldc_15k",
         "source_path" : "ldc_15k",
