@@ -111,8 +111,8 @@ def _read_static(data_source: DataInput, field_name: str):
     if isinstance(data_source, str):
         with h5py.File(data_source, "r") as f:
             mode_data = f[field_name][0, :, :, :] - f["mean"][:]
-            grid_x = f["x_grid"][:].T
-            grid_y = f["y_grid"][:].T
+            grid_x = f["x_grid"][:]
+            grid_y = f["y_grid"][:]
         return mode_data, grid_x, grid_y
     mode_data = data_source[field_name][0, :, :, :] - data_source["mean"]
     return mode_data, data_source["x_grid"], data_source["y_grid"]
@@ -276,8 +276,8 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
         
         for ky in range((nskip+1)):
             
-            x_val = x_grid[kx, ky]
-            y_val = y_grid[kx, ky]
+            x_val = x_grid[ky, kx]
+            y_val = y_grid[ky, kx]
             iind = ky*(nskip+1) + kx
             N = FEM_shape_calculator_ortho_gfemlr(x_val, y_val, xpt, ypt)
             N1[iind] = N[0][0]

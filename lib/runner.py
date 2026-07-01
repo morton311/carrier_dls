@@ -665,87 +665,6 @@ class runner(nn.Module):
                         pickle.dump((self.dof_mean, self.dof_std), pkl_f)
 
 
-    def _model_fit(self):
-        
-        if self.model is not None:
-            if self.checkpointed:
-                best_epoch = self.epoch
-                losses = self.losses
-                test_losses = self.test_losses
-                best_model = copy.deepcopy(self.model.state_dict())
-                early_stop_counter = self.early_stop_counter
-                best_test_loss = min(test_losses)
-            else:
-                losses = []
-                test_losses = []
-                best_model = None
-                early_stop_counter = 0
-                best_test_loss = float('inf')
-                best_epoch = 0
-
-            start_time = time.time()
-            
-            max_norm = 0.2
-            new_lr = self.scheduler.get_last_lr() if self.scheduler is not None else self.config['model_params']['lr']
-            if new_lr is list:
-                new_lr = new_lr[0]
-
-
-            for epoch in range(len(losses), self.config['model_params']['num_epochs']):
-                self.model.train()
-                epoch_loss = 0
-                
-
-                ## --------------------------------------- Train ---------------------------------------
-                for key in self.train_loader: 
-                    if self.config['distributed']:
-                        self.sampler[key].set_epoch(epoch)  # set epoch for distributed sampler if using distributed training
-                    for inputs, targets in self.train_loader[key]: 
-                        inputs, targets = inputs.to(self.device), targets.to(self.device)
-                        self.optimizer.zero_grad()
-                        total_loss = 0.0
-                        
-
-                        for n in range(targets.shape[1]):
-                            # print(f"Step {n+1}/{targets.shape[1]}, VRAM usage: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-                            target = targets[:, n, :]  # shape: [B, input_dim]
-
-                            # Forward pass
-                            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                outputs = self.model(inputs)  # shape: [B, input_dim]
-                                loss = self.criterion(outputs, target)
-
-                            # Backward and optimization for current step only
-                            total_loss += loss
-                            self.scaler.scale(loss).backward()
-
-                            # Prepare input for next step
-                            inputs = torch.cat((inputs[:, 1:, :], outputs.detach().unsqueeze(1)), dim=1)
-
-                        epoch_loss += total_loss.item() / (targets.shape[1] * len(self.train_loader[key]))
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-
-                losses.append(epoch_loss)
-
-                ## --------------------------------------- Test ---------------------------------------
-                # Evaluate the model on the test set
-                self.model.eval()
-                test_loss = 0
-                with torch.no_grad():
-                    for key in self.test_loader:
-                        for inputs, targets in self.test_loader[key]:
-                            inputs, targets = inputs.to(self.device), targets.to(self.device)
-                            for n in range(targets.shape[1]):
-                                target = targets[:, n, :]
-                                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                    outputs = self.model(inputs)
-                                    loss = self.criterion(outputs, target)
-                                test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
-                                inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
-
     def _train_epoch(self, epoch: int, max_norm: float) -> float:
         """Single forward+backward pass over all training loaders. Returns mean epoch loss."""
         if self.config['model_params']['model_type'] == 'tr_encdec':
@@ -1092,8 +1011,8 @@ class runner(nn.Module):
                 logger.info(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} | LR: {new_lr:.2e} | Time: {(time.time() - start_time)/60:10.2f} min |")
 
             end_time = time.time()
-            logger.info('\n\nTime taken for training: ', end_time - start_time)
-            logger.info('Time taken per epoch: ', (end_time - start_time) / (epoch + 1))
+            logger.info('\n\nTime taken for training: %s minutes', (end_time - start_time) / 60, exc_info=True)
+            logger.info('Time taken per epoch: %s minutes', (end_time - start_time) / 60 / len(losses), exc_info=True)
 
             torch.save(self.model.state_dict(), self.paths_bib.model_path)
             logger.info(f"Final model saved to {self.paths_bib.model_path}")

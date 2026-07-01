@@ -1,0 +1,47 @@
+{
+    "model_params" : {
+        "model_name" :  "challenge",
+        "model_type" :  "tr_enc",
+        "time_lag" :    70,
+        "train_ahead" : 5,
+        "num_layers" :  4,
+        "nhead" :       4,
+        "d_model":      128,
+        "ff_dim":       384,
+        "lr" :          0.001,
+        "lr_factor":    0.5,
+        "lr_patience":  5,
+        "batch_size" :  512,
+        "num_epochs" :  1000,
+        "patience" :    50,
+        "activation":   "swiglu",
+        "prenorm":      true,
+        "num_models" :  3,
+        "base_seed" :   0
+    },
+    
+    "latent_params" : {
+        "type" : "pod",
+        "num_modes" : 20,
+        "source_name" : "cavity",
+        "source_path" : "Challenge2_1_train",
+        "batch_size" : 1000
+    },
+
+    "train_data" : [
+        {
+            "name" : "cavity",
+            "path" : "Challenge2_1_train",
+            "train_split" : 0.9,
+            "test_split" : 0.1
+        }
+    ],
+
+    "eval_data" : [
+        {
+            "name" : "cavity",
+            "path" : "Challenge2_1_train",
+            "pred_split" : 0.1
+        }
+    ]
+}
