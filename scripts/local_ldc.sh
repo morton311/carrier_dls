@@ -1,7 +1,7 @@
 #!/bin/bash
 # JOB HEADERS HERE
 #SBATCH --job-name=local_ldc_dls
-#SBATCH --account=AFMNG31652E99
+#SBATCH --account=NAWCP24632466
 #SBATCH --qos=standard
 #SBATCH --constraint=mla
 #SBATCH --nodes=1
