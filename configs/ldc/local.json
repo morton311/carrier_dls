@@ -11,21 +11,24 @@
         "lr" :          0.001,
         "lr_factor":    0.5,
         "lr_patience":  5,
-        "batch_size" :  256,
-        "num_epochs" :  10000,
-        "patience" :    50,
+        "batch_size" :  4096,
+        "num_epochs" :  5000,
+        "patience" :    10,
         "activation":   "swiglu",
         "prenorm":      true
     },
     
     "latent_params" : {
         "type" : "dls",
-        "patch_size" : 99,
-        "num_modes" : 10,
-        "localized": false,
+        "patch_size" : 49,
+        "num_modes" : 20,
+        "localized": true,
         "source_name" : "ldc_15k",
         "source_path" : "ldc_15k",
-        "batch_size" : 250
+        "batch_size" : 250,
+        "skipx" : 1,
+        "skipy" : 1,
+        "skipz" : 1
     },
 
     "train_data" : [

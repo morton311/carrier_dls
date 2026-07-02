@@ -1,18 +1,18 @@
 #!/bin/bash
 # JOB HEADERS HERE
-#SBATCH --job-name=ldc_lg_tr
+#SBATCH --job-name=global_ldc_dls
 #SBATCH --account=AFMNG31652E99
 #SBATCH --qos=standard
 #SBATCH --constraint=mla
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH -t 12:00:00
-#SBATCH --output=out/ldc_lg_tr.out
+#SBATCH -t 24:00:00
+#SBATCH --output=out/global_ldc_dls.out
 
 module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-# torchrun main.py -c 'ldc/ldc_lg_tr' -m 'train' -d "True"
-python main.py -c 'ldc/ldc_lg_tr' -m 'pred'
-python main.py -c 'ldc/ldc_lg_tr' -m 'eval'
+torchrun main.py -c ldc/global_dls -m train -d True 
+python main.py -c ldc/global_dls -m pred
+python main.py -c ldc/global_dls -m eval

@@ -1,18 +1,18 @@
 #!/bin/bash
 # JOB HEADERS HERE
-#SBATCH --job-name=short
+#SBATCH --job-name=local_ldc_dls
 #SBATCH --account=AFMNG31652E99
 #SBATCH --qos=standard
 #SBATCH --constraint=mla
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH -t 12:00:00
-#SBATCH --output=output/short.out
+#SBATCH -t 24:00:00
+#SBATCH --output=out/local_ldc_dls.out
 
 module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-# torchrun main.py -c 'ldc/ldc_short' -m 'train' -d "True"
-python main.py -c 'ldc/ldc_short' -m 'pred'
-python main.py -c 'ldc/ldc_short' -m 'eval'
+torchrun main.py -c ldc/local_dls -m train -d True 
+python main.py -c ldc/local_dls -m pred
+python main.py -c ldc/local_dls -m eval
