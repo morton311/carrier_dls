@@ -2,8 +2,8 @@
     "model_params" : {
         "model_name" :  "challenge",
         "model_type" :  "tr_enc",
-        "time_lag" :    20,
-        "train_ahead" : 5,
+        "time_lag" :    70,
+        "train_ahead" : 1,
         "num_layers" :  4,
         "nhead" :       4,
         "d_model":      256,
@@ -20,8 +20,8 @@
     
     "latent_params" : {
         "type" : "dls",
-        "patch_size" : 19,
-        "num_modes" : 50,
+        "patch_size" : 13,
+        "num_modes" : 20,
         "localized": true,
         "source_name" : "cavity",
         "source_path" : "Challenge2_1_train",

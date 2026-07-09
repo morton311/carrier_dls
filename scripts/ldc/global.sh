@@ -1,18 +1,18 @@
 #!/bin/bash
 # JOB HEADERS HERE
-#SBATCH --job-name=local_ldc_dls
+#SBATCH --job-name=global_ldc_dls
 #SBATCH --account=NAWCP24632466
 #SBATCH --qos=standard
 #SBATCH --constraint=mla
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH -t 24:00:00
-#SBATCH --output=out/local_ldc_dls.out
+#SBATCH --output=out/global_ldc_dls.out
 
 module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-torchrun main.py -c ldc/local_dls -m train -d True 
-python main.py -c ldc/local_dls -m pred
-python main.py -c ldc/local_dls -m eval
+python main.py -c ldc/global_dls2 -m train
+python main.py -c ldc/global_dls2 -m pred
+python main.py -c ldc/global_dls2 -m eval
