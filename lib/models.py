@@ -433,6 +433,39 @@ class GlobalLocalTransformer(nn.Module):
         return self.decode(x, self.encode(tokens, coords))
 
 
+## ======================================= Spatial Transformer ===================================
+class SpatialTransformer(nn.Module):
+    """Spatial-attention model over GFEM element tokens.
+
+    One token per element, carrying its `time_lag` most recent frames of concatenated
+    u, v(, w) local DOFs. Attention runs over the element (spatial) axis rather than
+    the time axis, and the model predicts the next snapshot in one shot.
+
+    x: (G, E, time_lag, input_dim), coords: (E, spatial_dim) -> (G, E, input_dim)
+    """
+    def __init__(self, time_lag, input_dim, d_model=256, ff_dim=1024, nhead=4, num_layers=4,
+                 activation='swiglu', pre_norm=True, spatial_dim=2, num_freqs=6,
+                 residual=False):
+        super().__init__()
+        # num_context_tokens must stay 0: the head needs one output token per element
+        self.encoder = SpatialEncoder(
+            token_dim=input_dim * time_lag, d_model=d_model, nhead=nhead,
+            num_layers=num_layers, ff_dim=ff_dim, activation=activation,
+            pre_norm=pre_norm, spatial_dim=spatial_dim, num_freqs=num_freqs,
+            num_context_tokens=0,
+        )
+        self.fc = nn.Linear(d_model, input_dim)
+        self.residual = residual
+
+    def forward(self, x, coords):
+        G, E, tl, F_dim = x.shape
+        h = self.encoder(x.reshape(G, E, tl * F_dim), coords)
+        out = self.fc(h)
+        if self.residual:
+            out = out + x[:, :, -1, :]
+        return out
+
+
 ## ====================================== LSTM Model ============================================
 class LSTMModel(nn.Module):
     def __init__(self, time_lag, input_dim, hidden_dim=256, num_layers=2, batch_size = 256):

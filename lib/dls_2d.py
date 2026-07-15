@@ -138,7 +138,7 @@ def _read_batch(data_source: DataInput, field_name: str, snap_start: int, snap_e
     return q_u, q_v
 
 def random_patch_sampling(data, patch_size):
-    num_patches = 1000
+    num_patches = 10000
     num_images = 1
     ndim = data.ndim 
     nx = data.shape[0]

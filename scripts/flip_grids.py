@@ -35,17 +35,17 @@ with h5py.File(path, 'r+') as f:
     #     print("ERROR: non-square grids cannot be transposed in place; aborting.")
     #     sys.exit(1)
 
-    f['x_grid'][...] = yg
-    f['y_grid'][...] = xg
-    print("x_grid/y_grid now swapped in place. Re-checking variation along axes:")
+    # f['x_grid'][...] = xg.T
+    # f['y_grid'][...] = yg.T
+    # print("x_grid/y_grid now swapped in place. Re-checking variation along axes:")
 
-    xg = f['x_grid'][:]
-    yg = f['y_grid'][:]
-    x_axis0 = np.ptp(xg[:, 0])
-    x_axis1 = np.ptp(xg[0, :])
-    y_axis0 = np.ptp(yg[:, 0])
-    y_axis1 = np.ptp(yg[0, :])
-    print(f"{path}: x_grid {xg.shape}, y_grid {yg.shape}")
-    print(f"  x_grid variation  axis0: {x_axis0:.6g}  axis1: {x_axis1:.6g}")
-    print(f"  y_grid variation  axis0: {y_axis0:.6g}  axis1: {y_axis1:.6g}")
+    # xg = f['x_grid'][:]
+    # yg = f['y_grid'][:]
+    # x_axis0 = np.ptp(xg[:, 0])
+    # x_axis1 = np.ptp(xg[0, :])
+    # y_axis0 = np.ptp(yg[:, 0])
+    # y_axis1 = np.ptp(yg[0, :])
+    # print(f"{path}: x_grid {xg.shape}, y_grid {yg.shape}")
+    # print(f"  x_grid variation  axis0: {x_axis0:.6g}  axis1: {x_axis1:.6g}")
+    # print(f"  y_grid variation  axis0: {y_axis0:.6g}  axis1: {y_axis1:.6g}")
     

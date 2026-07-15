@@ -76,7 +76,7 @@ class runner(nn.Module):
         self.config['group_names'] = paths.data_dict
         if config['mode'] != 'compare' and config['log'] == 'file':
             log_path = paths.log_path
-            logging.info("To follow the log in real time, run 'tail -f %s'", log_path, exc_info=True)
+            logging.info("To follow the log in real time, run 'tail -f %s'", log_path)
             file_handler = logging.FileHandler(log_path, mode='w')
             formatter = logging.Formatter('%(message)s')
             file_handler.setFormatter(formatter)
@@ -92,8 +92,8 @@ class runner(nn.Module):
             logger.setLevel(logging.INFO)
             logger.propagate = False
 
-            logger.info("Logging to %s", log_path, exc_info=True)
-        logger.info('Using device: %s', self.device, exc_info=True)
+            logger.info("Logging to %s", log_path)
+        logger.info('Using device: %s', self.device)
         return paths
     
     def _get_grid(self):
@@ -405,10 +405,25 @@ class runner(nn.Module):
                         num_context_tokens=mp.get('num_context_tokens', 0),
                         causal=mp.get('causal', True),
                         )
+        elif self.config['model_params']['model_type'] == 'tr_spatial':
+            mp = self.config['model_params']
+            self.model = models.SpatialTransformer(
+                        time_lag=mp['time_lag'],
+                        input_dim=mp['input_dim'],
+                        d_model=mp['d_model'],
+                        ff_dim=mp.get('ff_dim', 4 * mp['d_model']),
+                        nhead=mp['nhead'],
+                        num_layers=mp['num_layers'],
+                        activation=mp.get('activation', 'relu'),
+                        pre_norm=mp.get('prenorm', False),
+                        spatial_dim=self.dim,
+                        num_freqs=mp.get('coord_freqs', 6),
+                        residual=mp.get('residual', False),
+                        )
         elif self.config['model_params']['model_type'] == 'f_extrap':
             self.model = None
         else:
-            raise ValueError(f"Model {self.config['model_params']['model_type']} not recognized. Please use 'tr_enc', 'tr_encdec', or 'lstm'.")
+            raise ValueError(f"Model {self.config['model_params']['model_type']} not recognized. Please use 'tr_enc', 'tr_encdec', 'tr_spatial', or 'lstm'.")
         
         # Load the model weights if they exist and overwrite is not set to 'l' or 'm'
         if os.path.exists(self.paths_bib.model_path) and not self.config['overwrite'] in ['l', 'm']:
@@ -426,8 +441,9 @@ class runner(nn.Module):
             else:
                 input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim'])
 
-            if not self.config['model_params']['model_type'] == 'tr_encdec':
-                summary(self.model, input_size=input_size)
+            if self.config['model_params']['model_type'] not in ('tr_encdec', 'tr_spatial'):
+                model_summary = summary(self.model, input_size=input_size, verbose=0)
+                logger.info("Model summary:\n%s", model_summary)
 
         if self.config['distributed']:
             from torch.nn.parallel import DistributedDataParallel as DDP
@@ -450,12 +466,13 @@ class runner(nn.Module):
             
             self.criterion = nn.MSELoss()
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['model_params']['lr'])
+            
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode='min',
                 factor=self.config['model_params'].get('lr_factor', 0.5),
                 patience=self.config['model_params'].get('lr_patience', 5),
-                min_lr=1e-7
+                min_lr=self.config['model_params'].get('lr_min', 1e-6)
             )
             # torch.amp.GradScaler exists from torch 2.3; fall back for older versions
             if hasattr(torch.amp, 'GradScaler'):
@@ -566,8 +583,8 @@ class runner(nn.Module):
 
     def _get_train_data(self):
         """Get training and test data as torch tensors, minimizing memory usage."""
-        if self.config['model_params']['model_type'] == 'tr_encdec':
-            return self._get_train_data_encdec()
+        if self.config['model_params']['model_type'] in ('tr_encdec', 'tr_spatial'):
+            return self._get_train_data_grouped()
         if self.model is not None:
             logger.info('Getting training and test data')
             tl = self.config['model_params']['time_lag']
@@ -669,6 +686,8 @@ class runner(nn.Module):
         """Single forward+backward pass over all training loaders. Returns mean epoch loss."""
         if self.config['model_params']['model_type'] == 'tr_encdec':
             return self._train_epoch_encdec(epoch, max_norm)
+        if self.config['model_params']['model_type'] == 'tr_spatial':
+            return self._train_epoch_spatial(epoch, max_norm)
         self.model.train()
         epoch_loss = 0.0
         for key in self.train_loader:
@@ -697,6 +716,8 @@ class runner(nn.Module):
         """Single forward pass over all test loaders. Returns mean test loss."""
         if self.config['model_params']['model_type'] == 'tr_encdec':
             return self._validate_epoch_encdec()
+        if self.config['model_params']['model_type'] == 'tr_spatial':
+            return self._validate_epoch_spatial()
         self.model.eval()
         test_loss = 0.0
         with torch.no_grad():
@@ -714,8 +735,8 @@ class runner(nn.Module):
 
     ## ======================= Global-local encoder-decoder (tr_encdec) ==========================
 
-    def _encdec_geometry(self, use_skip=True):
-        """Precompute and cache element geometry for the encdec model.
+    def _elem_geometry(self, use_skip=True):
+        """Precompute and cache element geometry for the element-token models (encdec, spatial).
 
         use_skip=True follows the training element subsampling (skipx/y/z);
         use_skip=False uses all elements (prediction/rollout, matching baseline behavior).
@@ -727,10 +748,10 @@ class runner(nn.Module):
         else:
             skipx = skipy = skipz = 1
         key = (skipx, skipy, skipz)
-        if not hasattr(self, '_encdec_geom_cache'):
-            self._encdec_geom_cache = {}
-        if key in self._encdec_geom_cache:
-            return self._encdec_geom_cache[key]
+        if not hasattr(self, '_geom_cache'):
+            self._geom_cache = {}
+        if key in self._geom_cache:
+            return self._geom_cache[key]
 
         lltogl_mat = self._compute_lltogl_mat(skipx=skipx, skipy=skipy, skipz=skipz)
         coords = self._compute_elem_centroids(skipx=skipx, skipy=skipy, skipz=skipz)
@@ -748,8 +769,8 @@ class runner(nn.Module):
             'counts_cpu': torch.from_numpy(counts).float(),
             'num_dofs': num_dofs,
         }
-        self._encdec_geom_cache[key] = geom
-        logger.info(f"encdec geometry (skip={key}): {lltogl_mat.shape[0]} elements, {num_dofs} nodal DOFs")
+        self._geom_cache[key] = geom
+        logger.info(f"element geometry (skip={key}): {lltogl_mat.shape[0]} elements, {num_dofs} nodal DOFs")
         return geom
 
     def _compute_elem_centroids(self, skipx=1, skipy=1, skipz=1):
@@ -826,20 +847,21 @@ class runner(nn.Module):
         tok_view = tokens.reshape(G, E, cw, F)
         return torch.cat((tok_view[:, :, 1:], new_frame.unsqueeze(2)), dim=2).reshape(G, E, cw * F)
 
-    def _get_train_data_encdec(self):
-        """Build snapshot-grouped train/test loaders for the encdec model."""
+    def _get_train_data_grouped(self):
+        """Build snapshot-grouped train/test loaders for the encdec and spatial models."""
         if self.model is None:
             return
-        logger.info('Getting training and test data (snapshot-grouped, tr_encdec)')
+        model_type = self.config['model_params']['model_type']
+        logger.info(f'Getting training and test data (snapshot-grouped, {model_type})')
         if not self.config['latent_params'].get('localized', False):
-            raise ValueError("model_type 'tr_encdec' requires latent_params.localized = true")
+            raise ValueError(f"model_type '{model_type}' requires latent_params.localized = true")
         mp = self.config['model_params']
         tl = mp['time_lag']
         ta = mp['train_ahead']
         cw = mp.get('context_window', 1)
         ct = mp.get('context_time', 'window_end')
 
-        geom = self._encdec_geometry()
+        geom = self._elem_geometry()
         lltogl_cpu = torch.from_numpy(geom['lltogl_np']).long()
 
         self.dof_mean = {}
@@ -893,7 +915,7 @@ class runner(nn.Module):
     def _train_epoch_encdec(self, epoch: int, max_norm: float) -> float:
         """Encdec training epoch: encode shared context per snapshot group, multi-step local loss."""
         self.model.train()
-        geom = self._encdec_geometry()
+        geom = self._elem_geometry()
         coords = geom['coords']
         ss_p = self._ss_prob(epoch)
         epoch_loss = 0.0
@@ -927,7 +949,7 @@ class runner(nn.Module):
     def _validate_epoch_encdec(self) -> float:
         """Encdec validation epoch (teacher-forced context)."""
         self.model.eval()
-        geom = self._encdec_geometry()
+        geom = self._elem_geometry()
         coords = geom['coords']
         test_loss = 0.0
         with torch.no_grad():
@@ -940,6 +962,55 @@ class runner(nn.Module):
                         target = targets[:, :, n, :]
                         with torch.autocast(device_type="cuda", dtype=torch.float16):
                             outputs = self.model(inputs, tokens, coords)
+                            loss = self.criterion(outputs, target)
+                        test_loss += loss.item() / (targets.shape[2] * len(self.test_loader[key]))
+                        inputs = torch.cat((inputs[:, :, 1:, :], outputs.unsqueeze(2)), dim=2)
+        return test_loss
+
+    ## ============================ Spatial attention (tr_spatial) ===============================
+
+    def _train_epoch_spatial(self, epoch: int, max_norm: float) -> float:
+        """Spatial-attention training epoch: attention over elements, multi-step next-snapshot loss."""
+        self.model.train()
+        coords = self._elem_geometry()['coords']
+        epoch_loss = 0.0
+        for key in self.train_loader:
+            if self.config['distributed']:
+                self.sampler[key].set_epoch(epoch)
+            for inputs, targets, _, _ in self.train_loader[key]:
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                self.optimizer.zero_grad()
+                total_loss = 0.0
+                for n in range(targets.shape[2]):
+                    target = targets[:, :, n, :]
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        outputs = self.model(inputs, coords)
+                        loss = self.criterion(outputs, target)
+                    total_loss += loss
+                    self.scaler.scale(loss).backward()
+                    inputs = torch.cat((inputs[:, :, 1:, :], outputs.detach().unsqueeze(2)), dim=2)
+                epoch_loss += total_loss.item() / (targets.shape[2] * len(self.train_loader[key]))
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+        return epoch_loss
+
+    def _validate_epoch_spatial(self) -> float:
+        """Spatial-attention validation epoch."""
+        self.model.eval()
+        coords = self._elem_geometry()['coords']
+        test_loss = 0.0
+        with torch.no_grad():
+            for key in self.test_loader:
+                for inputs, targets, _, _ in self.test_loader[key]:
+                    inputs = inputs.to(self.device)
+                    targets = targets.to(self.device)
+                    for n in range(targets.shape[2]):
+                        target = targets[:, :, n, :]
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            outputs = self.model(inputs, coords)
                             loss = self.criterion(outputs, target)
                         test_loss += loss.item() / (targets.shape[2] * len(self.test_loader[key]))
                         inputs = torch.cat((inputs[:, :, 1:, :], outputs.unsqueeze(2)), dim=2)
@@ -1011,8 +1082,8 @@ class runner(nn.Module):
                 logger.info(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} | LR: {new_lr:.2e} | Time: {(time.time() - start_time)/60:10.2f} min |")
 
             end_time = time.time()
-            logger.info('\n\nTime taken for training: %s minutes', (end_time - start_time) / 60, exc_info=True)
-            logger.info('Time taken per epoch: %s minutes', (end_time - start_time) / 60 / len(losses), exc_info=True)
+            logger.info('\n\nTime taken for training: %s minutes', (end_time - start_time) / 60)
+            logger.info('Time taken per epoch: %s minutes', (end_time - start_time) / 60 / len(losses))
 
             torch.save(self.model.state_dict(), self.paths_bib.model_path)
             logger.info(f"Final model saved to {self.paths_bib.model_path}")
@@ -1060,6 +1131,8 @@ class runner(nn.Module):
         """
         if self.config['model_params']['model_type'] == 'tr_encdec':
             return self._predict_dofs_forward_encdec(name, dof_u, dof_v, dof_w, total_steps)
+        if self.config['model_params']['model_type'] == 'tr_spatial':
+            return self._predict_dofs_forward_spatial(name, dof_u, dof_v, dof_w, total_steps)
         time_lag = self.config['model_params']['time_lag']
         if total_steps is None:
             total_steps = dof_u.shape[0]
@@ -1164,7 +1237,7 @@ class runner(nn.Module):
         if self.dim == 3 and (dof_w is None or dof_w.shape[0] < time_lag):
             raise ValueError("dof_w must contain at least time_lag snapshots for 3D predictions")
 
-        geom = self._encdec_geometry(use_skip=False)
+        geom = self._elem_geometry(use_skip=False)
         lltogl_mat = geom['lltogl_np']
         num_elems = lltogl_mat.shape[0]
         coords = geom['coords']
@@ -1201,8 +1274,15 @@ class runner(nn.Module):
                     context = model.encode(re.reshape(1, num_elems, cw * F_dim), coords)
 
         predictions = predictions * std_np + mean_np
+        return self._assemble_dof_preds(predictions, geom)
 
-        # scatter-mean assembly of shared nodal DOFs (interior nodes belong to multiple elements)
+    def _assemble_dof_preds(self, predictions, geom):
+        """Scatter-mean element-local predictions (E, T, dim*dof_elem) onto the shared nodal DOFs.
+
+        Interior nodes belong to multiple elements, so their duplicate slots are averaged.
+        Returns (dof_u, dof_v, dof_w) each of shape (T, num_dofs); dof_w is None in 2D.
+        """
+        total_steps = predictions.shape[1]
         num_dofs = geom['num_dofs']
         ndof = self.l_config.dof_elem
         counts = geom['counts_cpu'].numpy()
@@ -1213,9 +1293,58 @@ class runner(nn.Module):
                 predictions[:, :, c * ndof:(c + 1) * ndof].transpose(1, 0, 2).reshape(total_steps, -1))
             acc.index_add_(1, geom['scatter_index_cpu'], vals)
             out.append((acc.numpy() / counts))
-        dof_u_pred, dof_v_pred = out[0], out[1]
         dof_w_pred = out[2] if self.dim == 3 else None
-        return dof_u_pred, dof_v_pred, dof_w_pred
+        return out[0], out[1], dof_w_pred
+
+    def _predict_dofs_forward_spatial(self, name, dof_u, dof_v, dof_w=None, total_steps=None):
+        """Autoregressive rollout for the spatial-attention model.
+
+        Every step attends across all element tokens and emits the next snapshot. With
+        `reassemble` enabled (default), each predicted frame is projected onto the shared
+        nodal DOFs and regathered before being fed back, so elements stay consistent at
+        the nodes they share instead of drifting apart over the rollout.
+        """
+        mp = self.config['model_params']
+        time_lag = mp['time_lag']
+        if total_steps is None:
+            total_steps = dof_u.shape[0]
+        if total_steps < time_lag:
+            raise ValueError(f"total_steps ({total_steps}) must be >= time_lag ({time_lag})")
+        if dof_u.shape[0] < time_lag or dof_v.shape[0] < time_lag:
+            raise ValueError("dof_u and dof_v must contain at least time_lag snapshots")
+        if self.dim == 3 and (dof_w is None or dof_w.shape[0] < time_lag):
+            raise ValueError("dof_w must contain at least time_lag snapshots for 3D predictions")
+
+        geom = self._elem_geometry(use_skip=False)
+        lltogl_mat = geom['lltogl_np']
+        num_elems = lltogl_mat.shape[0]
+        coords = geom['coords']
+        mean_np = self.dof_mean[name].numpy()
+        std_np = self.dof_std[name].numpy()
+        reassemble = mp.get('reassemble', True)
+
+        comps = [dof_u[:time_lag, :][:, lltogl_mat], dof_v[:time_lag, :][:, lltogl_mat]]
+        if self.dim == 3:
+            comps.append(dof_w[:time_lag, :][:, lltogl_mat])
+        init = (np.concatenate(comps, axis=2) - mean_np) / std_np  # (tl, E, F)
+        dof_input = torch.from_numpy(init).float().permute(1, 0, 2).unsqueeze(0).to(self.device)  # (1, E, tl, F)
+
+        self.model.eval()
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        F_dim = self.dim * self.l_config.dof_elem
+        predictions = np.zeros((num_elems, total_steps, F_dim))
+        predictions[:, :time_lag, :] = dof_input[0].cpu().numpy()
+
+        with torch.no_grad():
+            for t in range(total_steps - time_lag):
+                output = model(dof_input, coords)  # (1, E, F)
+                if reassemble:
+                    output = self._reassemble_tokens(output, name, geom)
+                predictions[:, t + time_lag, :] = output[0].cpu().numpy()
+                dof_input = torch.cat((dof_input[:, :, 1:, :], output.unsqueeze(2)), dim=2)
+
+        predictions = predictions * std_np + mean_np
+        return self._assemble_dof_preds(predictions, geom)
 
 
     def pred(self) -> None:
