@@ -8,8 +8,9 @@
         "nhead" :       4,
         "d_model":      256,
         "ff_dim":       768,
-        "lr" :          0.001,
-        "lr_factor":    0.5,
+        "lr" :          1e-3,
+        "lr_factor":    0,
+        "lr_min":       1e-3,
         "lr_patience":  5,
         "batch_size" :  4096,
         "num_epochs" :  5000,
@@ -20,7 +21,7 @@
     
     "latent_params" : {
         "type" : "dls",
-        "patch_size" : 49,
+        "patch_size" : 99,
         "num_modes" : 20,
         "localized": true,
         "source_name" : "ldc_15k",

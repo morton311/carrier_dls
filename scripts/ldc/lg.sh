@@ -3,7 +3,8 @@
 #SBATCH --job-name=local_global_ldc
 #SBATCH --account=NAWCP24632466
 #SBATCH --qos=standard
-#SBATCH --constraint=mla
+# --constraint=mla
+#SBATCH --gres=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH -t 24:00:00
@@ -13,6 +14,6 @@ module use $HOME/my_modules
 module load torch_module
 source $HOME/.venv/bin/activate
 
-torchrun main.py -c ldc/local_global -m train -d True 
-python main.py -c ldc/local_global -m pred
+# torchrun main.py -c ldc/local_global -m train -d True 
+# python main.py -c ldc/local_global -m pred
 python main.py -c ldc/local_global -m eval

@@ -1552,6 +1552,7 @@ class runner(nn.Module):
                 pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 29)
                 pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 39)
                 pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 49)
+                pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 99)
 
             pl.plot_horizon_errors(self, rec_path, gt_path, name, source_group)
 
