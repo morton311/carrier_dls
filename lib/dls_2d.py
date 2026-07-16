@@ -96,14 +96,76 @@ def _validate_data_dict(data_dict: ArrayDict, field_name: str) -> None:
         raise KeyError(f"Missing required keys for in-memory input: {missing}")
 
 
+def _is_column_major(x_grid: np.ndarray, y_grid: np.ndarray) -> bool:
+    """True when spatial arrays are stored [x, y] instead of the required [y, x].
+
+    This module indexes every spatial array as [y_index, x_index] (see
+    local_modemat_over_elem: x_val = x_grid[ky, kx]), i.e. x must vary along
+    axis 1 and y along axis 0 (numpy meshgrid 'xy' indexing).  A file written by
+    a column-major language (MATLAB/Fortran) as (ny, nx) comes back out of h5py
+    as (nx, ny), with every spatial array transposed.  Left uncorrected, dxpt is
+    identically zero and the GFEM mass matrix is exactly singular.
+
+    The grids are self-describing, so infer the layout from them rather than
+    trusting the caller.
+    """
+    x_axis0, x_axis1 = np.ptp(x_grid[:, 0]), np.ptp(x_grid[0, :])
+    y_axis0, y_axis1 = np.ptp(y_grid[:, 0]), np.ptp(y_grid[0, :])
+    if x_axis1 > 0 and y_axis0 > 0:
+        return False
+    if x_axis0 > 0 and y_axis1 > 0:
+        return True
+    raise ValueError(
+        "Cannot infer grid orientation: expected each of x_grid/y_grid to vary "
+        "along exactly one axis, got x_grid variation "
+        f"(axis0={x_axis0:.6g}, axis1={x_axis1:.6g}) and y_grid variation "
+        f"(axis0={y_axis0:.6g}, axis1={y_axis1:.6g})."
+    )
+
+
+def _needs_transpose(data_source: DataInput) -> bool:
+    if isinstance(data_source, str):
+        with h5py.File(data_source, "r") as f:
+            return _is_column_major(f["x_grid"][:], f["y_grid"][:])
+    return _is_column_major(data_source["x_grid"], data_source["y_grid"])
+
+
+def normalize_orientation(data_dict: ArrayDict, field_name: str) -> ArrayDict:
+    """Return data_dict with its spatial axes swapped if it is stored [x, y].
+
+    Use this to bring ground-truth arrays and grids into the same layout the
+    solver returns, so comparisons and contour plots line up:
+
+        input_dict = dls.normalize_orientation(input_dict, 'UV')
+
+    Note that x_grid/y_grid are transposed but *not* renamed: x_grid.T still
+    holds x-coordinates, and after the transpose they vary along axis 1.
+    Swapping the names instead also yields a non-singular system (the element
+    geometry is merely reflected across its diagonal) but silently mislabels the
+    axes, so plots come out with x and y interchanged.
+    """
+    _validate_data_dict(data_dict, field_name)
+    if not _is_column_major(data_dict["x_grid"], data_dict["y_grid"]):
+        return data_dict
+
+    out = dict(data_dict)
+    out[field_name] = data_dict[field_name].transpose(0, 2, 1, 3)
+    out["mean"] = data_dict["mean"].transpose(1, 0, 2)
+    out["x_grid"] = data_dict["x_grid"].T
+    out["y_grid"] = data_dict["y_grid"].T
+    return out
+
+
 def _source_metadata(data_source: DataInput, field_name: str) -> Tuple[int, int, int, int, int]:
     if isinstance(data_source, str):
         with h5py.File(data_source, "r") as f:
             shape = f[field_name].shape
-        return shape[0], shape[1], shape[2], shape[3]
+    else:
+        _validate_data_dict(data_source, field_name)
+        shape = data_source[field_name].shape
 
-    _validate_data_dict(data_source, field_name)
-    shape = data_source[field_name].shape
+    if _needs_transpose(data_source):
+        return shape[0], shape[2], shape[1], shape[3]
     return shape[0], shape[1], shape[2], shape[3]
 
 
@@ -113,9 +175,20 @@ def _read_static(data_source: DataInput, field_name: str):
             mode_data = f[field_name][0, :, :, :] - f["mean"][:]
             grid_x = f["x_grid"][:]
             grid_y = f["y_grid"][:]
-        return mode_data, grid_x, grid_y
-    mode_data = data_source[field_name][0, :, :, :] - data_source["mean"]
-    return mode_data, data_source["x_grid"], data_source["y_grid"]
+    else:
+        mode_data = data_source[field_name][0, :, :, :] - data_source["mean"]
+        grid_x = data_source["x_grid"]
+        grid_y = data_source["y_grid"]
+
+    if _is_column_major(grid_x, grid_y):
+        logger.info(
+            "Source is stored [x, y] (column-major writer); transposing spatial "
+            "axes on read to the required [y, x] layout."
+        )
+        mode_data = mode_data.transpose(1, 0, 2)
+        grid_x = grid_x.T
+        grid_y = grid_y.T
+    return mode_data, grid_x, grid_y
 
 
 def _read_batch(data_source: DataInput, field_name: str, snap_start: int, snap_end: int):
@@ -129,6 +202,11 @@ def _read_batch(data_source: DataInput, field_name: str, snap_start: int, snap_e
         mean = data_source["mean"]
         q_u = data_source[field_name][snap_start:snap_end, :, :, 0]
         q_v = data_source[field_name][snap_start:snap_end, :, :, 1]
+
+    if _needs_transpose(data_source):
+        mean = mean.transpose(1, 0, 2)
+        q_u = q_u.transpose(0, 2, 1)
+        q_v = q_v.transpose(0, 2, 1)
 
     u_mean = mean[:, :, 0]
     v_mean = mean[:, :, 1]
