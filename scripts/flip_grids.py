@@ -98,52 +98,27 @@ def main():
         xg, yg = f["x_grid"][:], f["y_grid"][:]
     x_a0, x_a1, y_a0, y_a1 = describe(xg, yg)
     print(f"{path}: x_grid {xg.shape}, y_grid {yg.shape}")
-    print(f"  x_grid variation  axis0: {x_a0:.6g}  axis1: {x_a1:.6g}")
-    print(f"  y_grid variation  axis0: {y_a0:.6g}  axis1: {y_a1:.6g}")
+    print(f"  x_grid variation  axis0: {x_axis0:.6g}  axis1: {x_axis1:.6g}")
+    print(f"  y_grid variation  axis0: {y_axis0:.6g}  axis1: {y_axis1:.6g}")
 
-    if not needs_transpose(xg, yg):
-        print("  layout OK: x along axis 1, y along axis 0 (row-major / 'xy') "
-              "- nothing to do.")
-        return
-    print("  layout is COLUMN-MAJOR: x along axis 0, y along axis 1 "
-          "- spatial arrays need transposing.")
+    # if x_axis0 > 0 and y_axis1 > 0:
+    #     print("Grids already stored as expected (x along axis 0, y along axis 1) - nothing to do.")
+    #     sys.exit(0)
+    # if xg.shape[0] != xg.shape[1] or yg.shape[0] != yg.shape[1]:
+    #     print("ERROR: non-square grids cannot be transposed in place; aborting.")
+    #     sys.exit(1)
 
-    if not args.transpose:
-        print("\nRe-run with --transpose to fix (add -o OUT.h5 to write a copy).")
-        return
+    # f['x_grid'][...] = xg.T
+    # f['y_grid'][...] = yg.T
+    # print("x_grid/y_grid now swapped in place. Re-checking variation along axes:")
 
-    if args.output:
-        print(f"\nCopying {path} -> {args.output}")
-        shutil.copyfile(path, args.output)
-        path = args.output
-
-    gshape = xg.shape
-    with h5py.File(path, "r+") as f:
-        names = []
-        f.visititems(lambda n, o: names.append(n) if isinstance(o, h5py.Dataset) else None)
-        skipped = []
-        for name in names:
-            ax = spatial_axes(f[name].shape, gshape)
-            if ax is None:
-                skipped.append((name, f[name].shape))
-                continue
-            old, new = transpose_dataset(f, name, ax)
-            print(f"  transposed {name:52s} {old} -> {new}")
-
-        if skipped:
-            print("\n  left untouched (no adjacent "
-                  f"{gshape} axis pair):")
-            for name, shape in skipped:
-                print(f"    {name:52s} {shape}")
-
-        xg, yg = f["x_grid"][:], f["y_grid"][:]
-
-    x_a0, x_a1, y_a0, y_a1 = describe(xg, yg)
-    print(f"\n{path}: x_grid {xg.shape}, y_grid {yg.shape}")
-    print(f"  x_grid variation  axis0: {x_a0:.6g}  axis1: {x_a1:.6g}")
-    print(f"  y_grid variation  axis0: {y_a0:.6g}  axis1: {y_a1:.6g}")
-    print("  layout OK" if not needs_transpose(xg, yg) else "  STILL WRONG")
-
-
-if __name__ == "__main__":
-    main()
+    # xg = f['x_grid'][:]
+    # yg = f['y_grid'][:]
+    # x_axis0 = np.ptp(xg[:, 0])
+    # x_axis1 = np.ptp(xg[0, :])
+    # y_axis0 = np.ptp(yg[:, 0])
+    # y_axis1 = np.ptp(yg[0, :])
+    # print(f"{path}: x_grid {xg.shape}, y_grid {yg.shape}")
+    # print(f"  x_grid variation  axis0: {x_axis0:.6g}  axis1: {x_axis1:.6g}")
+    # print(f"  y_grid variation  axis0: {y_axis0:.6g}  axis1: {y_axis1:.6g}")
+    

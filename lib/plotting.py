@@ -312,8 +312,16 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
     nx, ny = runner.l_config.nx, runner.l_config.ny
     nx_t, ny_t = runner.l_config.nx_t, runner.l_config.ny_t
     x_grid, y_grid = runner.x_grid, runner.y_grid
+    needs_transpose = runner.dls._is_column_major(runner.x_grid, runner.y_grid)
+    if needs_transpose:
+        x_grid = x_grid.transpose(2, 1, 0) if runner.dim == 3 else x_grid.transpose(1, 0)
+        y_grid = y_grid.transpose(2, 1, 0) if runner.dim == 3 else y_grid.transpose(1, 0)
+        z_grid = runner.z_grid.transpose(2, 1, 0) if runner.dim == 3 else None
+
     x_grid_t, y_grid_t = x_grid[:nx_t, :ny_t], y_grid[:nx_t, :ny_t]
-    
+
+
+
     if runner.dim == 3:
         nz = runner.l_config.nz
         nz_t = runner.l_config.nz_t
@@ -327,6 +335,8 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
         Q_gt = f_gt['UV'][val_id[time_lag + indx]] - mean
+        if needs_transpose:
+            Q_gt = Q_gt.transpose(0, 3, 2, 1, 4) if runner.dim == 3 else Q_gt.transpose(0, 2, 1, 3)
         Q_rec = f_rec['Q_rec'][time_lag + indx]
     slice_val = None
 

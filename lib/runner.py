@@ -96,6 +96,20 @@ class runner(nn.Module):
         logger.info('Using device: %s', self.device)
         return paths
     
+    def _is_column_major(x_grid: np.ndarray, y_grid: np.ndarray) -> bool:
+        x_axis0, x_axis1 = np.ptp(x_grid[:, 0]), np.ptp(x_grid[0, :])
+        y_axis0, y_axis1 = np.ptp(y_grid[:, 0]), np.ptp(y_grid[0, :])
+        if x_axis1 > 0 and y_axis0 > 0:
+            return False
+        if x_axis0 > 0 and y_axis1 > 0:
+            return True
+        raise ValueError(
+            "Cannot infer grid orientation: expected each of x_grid/y_grid to vary "
+            "along exactly one axis, got x_grid variation "
+            f"(axis0={x_axis0:.6g}, axis1={x_axis1:.6g}) and y_grid variation "
+            f"(axis0={y_axis0:.6g}, axis1={y_axis1:.6g})."
+        )
+    
     def _get_grid(self):
         with h5py.File(self.paths_bib.source_path, 'r') as f:
             self.dim = 3 if 'z_grid' in f else 2
@@ -1576,6 +1590,9 @@ class runner(nn.Module):
         nx = self.l_config.nx_t
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
+
+        needs_transpose = self.dls._is_column_major(self.x_grid, self.y_grid)
+
         # Check if weights are already computed and saved, if not compute and save them
         with h5py.File(gt_path, 'r+') as f:
             if 'weights' in f:
@@ -1589,7 +1606,14 @@ class runner(nn.Module):
                     weights = wg.generate_weights_grid_2d(self.x_grid, self.y_grid)
                 f.create_dataset('weights', data=weights)
                 logger.info(f"Weights computed and saved to {gt_path}.")
-    
+
+        if needs_transpose:
+            logger.info(f"Transposing weights for column-major order...")
+            if self.dim == 3:
+                weights = np.transpose(weights, (2, 1, 0))  # Transpose for 3D
+            else:
+                weights = np.transpose(weights, (1, 0))  # Transpose for 2D
+
         if self.dim == 3:
             weights = weights[:nx, :ny, :nz]
         else:
@@ -1647,6 +1671,9 @@ class runner(nn.Module):
         nx = self.l_config.nx_t
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
+
+        needs_transpose = self.dls._is_column_major(self.x_grid, self.y_grid)
+
         with h5py.File(rec_path, 'r+') as f:
             if 'RMS_rec' in f:
                 logger.info(f"RMS for reconstructed already computed and found in {rec_path}. Skipping computation...")
@@ -1673,15 +1700,15 @@ class runner(nn.Module):
                 if self.dim == 3:
                     mean_gt = f['mean'][:]
                     Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
-                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
+                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1, order='F') 
                     RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0)) 
-                    RMS_gt = RMS_gt.reshape(nx, ny, nz, 3) 
+                    RMS_gt = RMS_gt.reshape(nx, ny, nz, 3, order='F') 
                 else:
                     mean_gt = f['mean'][:]
                     Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
-                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1)
+                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1, order='F') 
                     RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0)) # shape: (snaps, ...)
-                    RMS_gt = RMS_gt.reshape(nx, ny, 2)
+                    RMS_gt = RMS_gt.reshape(nx, ny, 2, order='F') 
 
 
                 f.create_dataset('RMS_gt_'+self.latent_id + '_' + name+ source, data=RMS_gt)
