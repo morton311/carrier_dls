@@ -96,26 +96,28 @@ class runner(nn.Module):
         logger.info('Using device: %s', self.device)
         return paths
     
-    def _is_column_major(x_grid: np.ndarray, y_grid: np.ndarray) -> bool:
-        x_axis0, x_axis1 = np.ptp(x_grid[:, 0]), np.ptp(x_grid[0, :])
-        y_axis0, y_axis1 = np.ptp(y_grid[:, 0]), np.ptp(y_grid[0, :])
-        if x_axis1 > 0 and y_axis0 > 0:
-            return False
-        if x_axis0 > 0 and y_axis1 > 0:
-            return True
-        raise ValueError(
-            "Cannot infer grid orientation: expected each of x_grid/y_grid to vary "
-            "along exactly one axis, got x_grid variation "
-            f"(axis0={x_axis0:.6g}, axis1={x_axis1:.6g}) and y_grid variation "
-            f"(axis0={y_axis0:.6g}, axis1={y_axis1:.6g})."
-        )
-    
     def _get_grid(self):
+        """Load the grids, in the [x, y(, z)] layout the DLS modules work in.
+
+        A 2D source stored [y, x] is transposed on read by lib/dls_2d, so its
+        grids are transposed here too; ``source_is_yx`` records that, since
+        fields read straight from the source file are still [y, x].
+        """
+        import lib.dls_2d as dls_2d
+
         with h5py.File(self.paths_bib.source_path, 'r') as f:
             self.dim = 3 if 'z_grid' in f else 2
             self.x_grid = f['x_grid'][:]
             self.y_grid = f['y_grid'][:]
             self.z_grid = f['z_grid'][:] if self.dim == 3 else None
+
+            self.source_is_yx = (
+                self.dim == 2 and dls_2d._is_yx_ordered(self.x_grid, self.y_grid)
+            )
+            if self.source_is_yx:
+                logger.info("Source is stored [y, x]; transposing grids to [x, y].")
+                self.x_grid = self.x_grid.T
+                self.y_grid = self.y_grid.T
 
             if 'x' in f:
                 self.x = f['x'][:]
@@ -123,9 +125,24 @@ class runner(nn.Module):
                 self.z = f['z'][:] if 'z' in f else None
             else:
                 self.x = self.x_grid.shape[0]
-                self.y = self.y_grid.shape[0]
-                self.z = self.z_grid.shape[0] if self.dim == 3 else None
-        
+                self.y = self.y_grid.shape[1]
+                self.z = self.z_grid.shape[2] if self.dim == 3 else None
+
+    def _to_xy(self, arr: np.ndarray, spatial_axis: int) -> np.ndarray:
+        """Swap the two spatial axes of a source-layout array into [x, y]."""
+        if not self.source_is_yx:
+            return arr
+        perm = list(range(arr.ndim))
+        perm[spatial_axis], perm[spatial_axis + 1] = perm[spatial_axis + 1], perm[spatial_axis]
+        return arr.transpose(perm)
+
+    def _xy_crop(self, nx: int, ny: int) -> tuple:
+        """Spatial slices cropping a source-layout array to (nx, ny) in [x, y]."""
+        if self.source_is_yx:
+            return (slice(None, ny), slice(None, nx))
+        return (slice(None, nx), slice(None, ny))
+
+
     def _log_config(self):
         logger.info(f"{'#'*20} Configuration {'#'*20}")
         for key, val in self.config.items():
@@ -1591,8 +1608,6 @@ class runner(nn.Module):
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
 
-        needs_transpose = self.dls._is_column_major(self.x_grid, self.y_grid)
-
         # Check if weights are already computed and saved, if not compute and save them
         with h5py.File(gt_path, 'r+') as f:
             if 'weights' in f:
@@ -1602,23 +1617,21 @@ class runner(nn.Module):
                 logger.info(f"Weights not found in {gt_path}. Computing weights...")
                 if self.dim == 3:
                     weights = wg.generate_weights_grid_3d(self.x_grid, self.y_grid, self.z_grid)
+                elif self.source_is_yx:
+                    # stored in the source's own layout, like every other array there
+                    weights = wg.generate_weights_grid_2d(self.x_grid.T, self.y_grid.T)
                 else:
                     weights = wg.generate_weights_grid_2d(self.x_grid, self.y_grid)
                 f.create_dataset('weights', data=weights)
                 logger.info(f"Weights computed and saved to {gt_path}.")
 
-        if needs_transpose:
-            logger.info(f"Transposing weights for column-major order...")
-            if self.dim == 3:
-                weights = np.transpose(weights, (2, 1, 0))  # Transpose for 3D
-            else:
-                weights = np.transpose(weights, (1, 0))  # Transpose for 2D
+        weights = self._to_xy(weights, 0)
 
         if self.dim == 3:
             weights = weights[:nx, :ny, :nz]
         else:
             weights = weights[:nx, :ny]
-            
+
 
         with h5py.File(rec_path, 'r+') as f:
             if 'TKE_rec' in f:
@@ -1647,13 +1660,14 @@ class runner(nn.Module):
                     mean_gt = f['mean'][:nx, :ny, :nz, :] # shape: (nx, ny, nz, dim)
                     Q_gt = f['UV'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
                     Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
-                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1) 
+                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1, order='F') 
                     
                 else:
-                    mean_gt = f['mean'][:nx, :ny, :] # shape: (nx, ny, dim)
-                    Q_gt = f['UV'][:, :nx, :ny, :] - mean_gt[np.newaxis]
+                    crop = self._xy_crop(nx, ny)
+                    mean_gt = self._to_xy(f['mean'][crop], 0) # shape: (nx, ny, dim)
+                    Q_gt = self._to_xy(f['UV'][(slice(None),) + crop], 1) - mean_gt[np.newaxis]
                     Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
-                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1)
+                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1, order='F')
 
                 TKE_gt = 0.5 * np.sum(Q_gt_weighted**2, axis=-1) # shape: (snaps, ...)
                 f.create_dataset('TKE_gt_'+self.latent_id + '_' + name + source, data=TKE_gt)
@@ -1672,7 +1686,7 @@ class runner(nn.Module):
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
 
-        needs_transpose = self.dls._is_column_major(self.x_grid, self.y_grid)
+        print(f"nx: {nx}, ny: {ny}, nz: {nz}")
 
         with h5py.File(rec_path, 'r+') as f:
             if 'RMS_rec' in f:
@@ -1681,15 +1695,9 @@ class runner(nn.Module):
             else:
                 logger.info(f"RMS for reconstructed not found in {rec_path}. Computing RMS...")
                 Q_rec = f['Q_rec'][time_lag:] # shape: (snaps, ..., dim)
-                Q_rec = Q_rec.reshape(Q_rec.shape[0], -1)
                 RMS_rec = np.sqrt(np.mean(Q_rec**2, axis=0)) # shape: (snaps, ...)
-                RMS_rec = RMS_rec.reshape(nx, ny, nz, 3) if self.dim == 3 else RMS_rec.reshape(nx, ny, 2)
                 f.create_dataset('RMS_rec', data=RMS_rec)
 
-
-        nx = self.l_config.nx
-        ny = self.l_config.ny
-        nz = self.l_config.nz if self.dim == 3 else 1
 
         with h5py.File(gt_path, 'r+') as f:
             if 'RMS_gt_'+self.latent_id + '_' + name+ source in f:
@@ -1697,27 +1705,17 @@ class runner(nn.Module):
                 RMS_gt = f['RMS_gt_'+self.latent_id + '_' + name+ source][:]
             else:
                 logger.info(f"RMS for GT not found in {gt_path}. Computing RMS...")
-                if self.dim == 3:
-                    mean_gt = f['mean'][:]
-                    Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
-                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1, order='F') 
-                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0)) 
-                    RMS_gt = RMS_gt.reshape(nx, ny, nz, 3, order='F') 
-                else:
-                    mean_gt = f['mean'][:]
-                    Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
-                    Q_gt = Q_gt.reshape(Q_gt.shape[0], -1, order='F') 
-                    RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0)) # shape: (snaps, ...)
-                    RMS_gt = RMS_gt.reshape(nx, ny, 2, order='F') 
-
+                # kept in the source's own layout, like every other array there
+                mean_gt = f['mean'][:]
+                Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+                RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0))  # shape: (..., dim)
 
                 f.create_dataset('RMS_gt_'+self.latent_id + '_' + name+ source, data=RMS_gt)
                 logger.info(f"RMS computed and saved to {gt_path}.")
 
-        nx = self.l_config.nx_t
-        ny = self.l_config.ny_t
-        nz = self.l_config.nz_t if self.dim == 3 else 1
+        RMS_gt = self._to_xy(RMS_gt, 0)
         RMS_gt = RMS_gt[:nx, :ny, :nz, :] if self.dim == 3 else RMS_gt[:nx, :ny, :]
+        print(f"RMS_gt shape: {RMS_gt.shape}, RMS_rec shape: {RMS_rec.shape}")
         RMS_error = pl.l2_err_norm(RMS_gt, RMS_rec)
         logger.info(f"RMS error for {name} {source}: {100 * RMS_error:.4f}%")
         RMS_u_error = pl.l2_err_norm(RMS_gt[..., 0], RMS_rec[..., 0])

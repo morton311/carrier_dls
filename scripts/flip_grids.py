@@ -1,22 +1,22 @@
 """Diagnose (and optionally fix) the x/y axis orientation of an HDF5 source file.
 
-lib/dls_2d.py indexes every spatial array as [y_index, x_index]:
+lib/dls_2d.py indexes every spatial array as [x_index, y_index]:
 
-    x_val = x_grid[ky, kx]              # local_modemat_over_elem
-    q_u   = f[field][snaps, :, :, 0]    # -> (ny, nx) per snapshot
+    x_val = x_grid[ix, iy]              # local_modemat_over_elem
+    q_u   = f[field][snaps, :, :, 0]    # -> (nx, ny) per snapshot
 
-so a source file must store x varying along axis 1 and y varying along axis 0
-(numpy meshgrid 'xy' indexing).  data/ldc_15k.h5 is stored that way and works.
+so a source file should store x varying along axis 0 and y varying along axis 1
+(numpy meshgrid 'ij' indexing).  data/Challenge2_1_train.h5 is stored that way.
 
-A file written by a column-major language (MATLAB/Fortran) that built its arrays
-as (ny, nx) comes back out of h5py as (nx, ny) -- every spatial array arrives
-transposed.  dxpt (or dypt) is then identically zero, FEM_shape_calculator
-divides by zero, and the GFEM mass matrix is exactly singular.
-data/Challenge2_1_train.h5 is in that state.
+A source built with meshgrid 'xy' indexing stores every spatial array the other
+way round, as (ny, nx); data/ldc_15k.h5 is in that state.  lib/dls_2d.py detects
+that from the grids and transposes on read, so such a file still works -- this
+script is for converting one on disk, e.g. to keep the whole pipeline (weights,
+RMS/TKE ground truth, plots) on a single layout.
 
 The fix is to transpose the two spatial axes of every spatial array, *without*
 renaming x_grid <-> y_grid: x_grid.T still holds x-coordinates, and after the
-transpose they vary along axis 1, which is what the solver wants.  Swapping the
+transpose they vary along axis 0, which is what the solver wants.  Swapping the
 names instead (x_grid = y_grid.T) also produces a non-singular system -- the
 element geometry is just reflected across the diagonal -- but it silently
 mislabels the axes, so contour plots come out with x and y interchanged.
@@ -41,11 +41,11 @@ def describe(xg, yg):
 
 
 def needs_transpose(xg, yg):
-    """True if x varies down axis 0 and y across axis 1 (column-major layout)."""
+    """True if the file is [y, x]: x varies across axis 1 and y down axis 0."""
     x_a0, x_a1, y_a0, y_a1 = describe(xg, yg)
-    if x_a1 > 0 and y_a0 > 0:
-        return False
     if x_a0 > 0 and y_a1 > 0:
+        return False
+    if x_a1 > 0 and y_a0 > 0:
         return True
     raise SystemExit(
         "ERROR: cannot classify grid orientation (a grid is constant along both axes?)"
@@ -98,27 +98,44 @@ def main():
         xg, yg = f["x_grid"][:], f["y_grid"][:]
     x_a0, x_a1, y_a0, y_a1 = describe(xg, yg)
     print(f"{path}: x_grid {xg.shape}, y_grid {yg.shape}")
-    print(f"  x_grid variation  axis0: {x_axis0:.6g}  axis1: {x_axis1:.6g}")
-    print(f"  y_grid variation  axis0: {y_axis0:.6g}  axis1: {y_axis1:.6g}")
+    print(f"  x_grid variation  axis0: {x_a0:.6g}  axis1: {x_a1:.6g}")
+    print(f"  y_grid variation  axis0: {y_a0:.6g}  axis1: {y_a1:.6g}")
 
-    # if x_axis0 > 0 and y_axis1 > 0:
-    #     print("Grids already stored as expected (x along axis 0, y along axis 1) - nothing to do.")
-    #     sys.exit(0)
-    # if xg.shape[0] != xg.shape[1] or yg.shape[0] != yg.shape[1]:
-    #     print("ERROR: non-square grids cannot be transposed in place; aborting.")
-    #     sys.exit(1)
+    if not needs_transpose(xg, yg):
+        print("Stored [x, y] (x along axis 0, y along axis 1) - nothing to do.")
+        sys.exit(0)
 
-    # f['x_grid'][...] = xg.T
-    # f['y_grid'][...] = yg.T
-    # print("x_grid/y_grid now swapped in place. Re-checking variation along axes:")
+    print("Stored [y, x]; lib/dls_2d transposes it on read.")
+    if not args.transpose:
+        print("Pass --transpose to rewrite the file in the [x, y] layout.")
+        sys.exit(0)
 
-    # xg = f['x_grid'][:]
-    # yg = f['y_grid'][:]
-    # x_axis0 = np.ptp(xg[:, 0])
-    # x_axis1 = np.ptp(xg[0, :])
-    # y_axis0 = np.ptp(yg[:, 0])
-    # y_axis1 = np.ptp(yg[0, :])
-    # print(f"{path}: x_grid {xg.shape}, y_grid {yg.shape}")
-    # print(f"  x_grid variation  axis0: {x_axis0:.6g}  axis1: {x_axis1:.6g}")
-    # print(f"  y_grid variation  axis0: {y_axis0:.6g}  axis1: {y_axis1:.6g}")
-    
+    if args.output:
+        print(f"Copying {path} -> {args.output}")
+        shutil.copyfile(path, args.output)
+        path = args.output
+
+    gshape = xg.shape
+    with h5py.File(path, "r+") as f:
+        names = []
+        f.visititems(lambda n, o: names.append(n) if isinstance(o, h5py.Dataset) else None)
+        for name in names:
+            ax = spatial_axes(f[name].shape, gshape)
+            if ax is None:
+                print(f"  skip     {name} {f[name].shape}")
+                continue
+            before, after = transpose_dataset(f, name, ax)
+            print(f"  transpose {name} {before} -> {after}  (axes {ax}, {ax + 1})")
+
+        xg, yg = f["x_grid"][:], f["y_grid"][:]
+
+    x_a0, x_a1, y_a0, y_a1 = describe(xg, yg)
+    print(f"{path}: x_grid {xg.shape}, y_grid {yg.shape}")
+    print(f"  x_grid variation  axis0: {x_a0:.6g}  axis1: {x_a1:.6g}")
+    print(f"  y_grid variation  axis0: {y_a0:.6g}  axis1: {y_a1:.6g}")
+    print("Done." if not needs_transpose(xg, yg) else "WARNING: still [y, x]!")
+
+
+if __name__ == "__main__":
+    main()
+

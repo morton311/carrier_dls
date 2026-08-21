@@ -1,3 +1,14 @@
+"""2D local-DLS compression on [x, y] ordered fields.
+
+Every spatial array handled here is indexed ``[x_index, y_index]`` -- x varies
+along axis 0, y along axis 1 (numpy meshgrid ``indexing='ij'``), matching
+``lib/dls.py``.  Snapshot fields are therefore ``(num_snaps, nx, ny, num_vars)``
+and grids are ``(nx, ny)``.
+
+Sources written the other way round ([y, x], i.e. meshgrid ``indexing='xy'``)
+are detected from x_grid/y_grid and transposed on read, so they still work; the
+arrays this module returns are always [x, y].
+"""
 import sys
 import time
 from dataclasses import dataclass
@@ -96,24 +107,24 @@ def _validate_data_dict(data_dict: ArrayDict, field_name: str) -> None:
         raise KeyError(f"Missing required keys for in-memory input: {missing}")
 
 
-def _is_column_major(x_grid: np.ndarray, y_grid: np.ndarray) -> bool:
-    """True when spatial arrays are stored [x, y] instead of the required [y, x].
+def _is_yx_ordered(x_grid: np.ndarray, y_grid: np.ndarray) -> bool:
+    """True when spatial arrays are stored [y, x] instead of the required [x, y].
 
-    This module indexes every spatial array as [y_index, x_index] (see
-    local_modemat_over_elem: x_val = x_grid[ky, kx]), i.e. x must vary along
-    axis 1 and y along axis 0 (numpy meshgrid 'xy' indexing).  A file written by
-    a column-major language (MATLAB/Fortran) as (ny, nx) comes back out of h5py
-    as (nx, ny), with every spatial array transposed.  Left uncorrected, dxpt is
-    identically zero and the GFEM mass matrix is exactly singular.
+    This module indexes every spatial array as [x_index, y_index] (see
+    local_modemat_over_elem: x_val = x_grid[ix, iy]), i.e. x must vary along
+    axis 0 and y along axis 1 (numpy meshgrid 'ij' indexing).  Sources built
+    with meshgrid 'xy' indexing store the two spatial axes the other way round;
+    left uncorrected the element spacing along one axis is identically zero and
+    the GFEM mass matrix is exactly singular.
 
     The grids are self-describing, so infer the layout from them rather than
     trusting the caller.
     """
     x_axis0, x_axis1 = np.ptp(x_grid[:, 0]), np.ptp(x_grid[0, :])
     y_axis0, y_axis1 = np.ptp(y_grid[:, 0]), np.ptp(y_grid[0, :])
-    if x_axis1 > 0 and y_axis0 > 0:
-        return False
     if x_axis0 > 0 and y_axis1 > 0:
+        return False
+    if x_axis1 > 0 and y_axis0 > 0:
         return True
     raise ValueError(
         "Cannot infer grid orientation: expected each of x_grid/y_grid to vary "
@@ -126,12 +137,12 @@ def _is_column_major(x_grid: np.ndarray, y_grid: np.ndarray) -> bool:
 def _needs_transpose(data_source: DataInput) -> bool:
     if isinstance(data_source, str):
         with h5py.File(data_source, "r") as f:
-            return _is_column_major(f["x_grid"][:], f["y_grid"][:])
-    return _is_column_major(data_source["x_grid"], data_source["y_grid"])
+            return _is_yx_ordered(f["x_grid"][:], f["y_grid"][:])
+    return _is_yx_ordered(data_source["x_grid"], data_source["y_grid"])
 
 
 def normalize_orientation(data_dict: ArrayDict, field_name: str) -> ArrayDict:
-    """Return data_dict with its spatial axes swapped if it is stored [x, y].
+    """Return data_dict with its spatial axes swapped if it is stored [y, x].
 
     Use this to bring ground-truth arrays and grids into the same layout the
     solver returns, so comparisons and contour plots line up:
@@ -139,13 +150,13 @@ def normalize_orientation(data_dict: ArrayDict, field_name: str) -> ArrayDict:
         input_dict = dls.normalize_orientation(input_dict, 'UV')
 
     Note that x_grid/y_grid are transposed but *not* renamed: x_grid.T still
-    holds x-coordinates, and after the transpose they vary along axis 1.
+    holds x-coordinates, and after the transpose they vary along axis 0.
     Swapping the names instead also yields a non-singular system (the element
     geometry is merely reflected across its diagonal) but silently mislabels the
     axes, so plots come out with x and y interchanged.
     """
     _validate_data_dict(data_dict, field_name)
-    if not _is_column_major(data_dict["x_grid"], data_dict["y_grid"]):
+    if not _is_yx_ordered(data_dict["x_grid"], data_dict["y_grid"]):
         return data_dict
 
     out = dict(data_dict)
@@ -157,6 +168,7 @@ def normalize_orientation(data_dict: ArrayDict, field_name: str) -> ArrayDict:
 
 
 def _source_metadata(data_source: DataInput, field_name: str) -> Tuple[int, int, int, int, int]:
+    """(num_snaps, nx, ny, num_vars) of the source once brought into [x, y]."""
     if isinstance(data_source, str):
         with h5py.File(data_source, "r") as f:
             shape = f[field_name].shape
@@ -180,10 +192,10 @@ def _read_static(data_source: DataInput, field_name: str):
         grid_x = data_source["x_grid"]
         grid_y = data_source["y_grid"]
 
-    if _is_column_major(grid_x, grid_y):
+    if _is_yx_ordered(grid_x, grid_y):
         logger.info(
-            "Source is stored [x, y] (column-major writer); transposing spatial "
-            "axes on read to the required [y, x] layout."
+            "Source is stored [y, x] (meshgrid 'xy' indexing); transposing "
+            "spatial axes on read to the required [x, y] layout."
         )
         mode_data = mode_data.transpose(1, 0, 2)
         grid_x = grid_x.T
@@ -254,19 +266,27 @@ def Modal_decomp(data, patch_size):
     return local_modes, eigVal
 
 
-def FEM_shape_calculator_ortho_gfemlr(x, y, xpt, ypt):
-    sumxpt = np.sum(xpt) / 4
-    sumypt = np.sum(ypt) / 4
+def FEM_shape_calculator_ortho_gfemlr(zeta_coord, eta_coord, zeta_pts, eta_pts):
+    """Bilinear shape functions of a parallelogram element at one grid point.
 
-    dxpt = (-xpt[0] + xpt[1] + xpt[2] - xpt[3]) / 2
-    dypt = (ypt[0] + ypt[1] - ypt[2] - ypt[3]) / 2
+    The element's zeta direction runs along array axis 1 and its eta direction
+    along axis 0, so under this module's [x, y] layout the ``zeta_*`` arguments
+    carry y-coordinates and the ``eta_*`` arguments x-coordinates.  ``*_pts``
+    are the four corner values in the adopted nodal order (see
+    local_modemat_over_elem).
+    """
+    sum_zeta_pt = np.sum(zeta_pts) / 4
+    sum_eta_pt = np.sum(eta_pts) / 4
+
+    dzeta_pt = (-zeta_pts[0] + zeta_pts[1] + zeta_pts[2] - zeta_pts[3]) / 2
+    deta_pt = (eta_pts[0] + eta_pts[1] - eta_pts[2] - eta_pts[3]) / 2
 
     zeta_i = [-1, 1, 1, -1]
     eta_i = [1, 1, -1, -1]
 
     # Inverse transform for parallelogram elements, bilinear shape functions
-    zeta = 2 * (x - sumxpt) / dxpt
-    eta = 2 * (y - sumypt) / dypt
+    zeta = 2 * (zeta_coord - sum_zeta_pt) / dzeta_pt
+    eta = 2 * (eta_coord - sum_eta_pt) / deta_pt
 
     N = np.zeros((4,1))
     # shape function values
@@ -332,6 +352,9 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
     # local modal matrix for single element
     i, j = 1, 1
 
+    # Corners of the reference element, in the adopted nodal order.  The index
+    # pairs are (axis 0, axis 1) = (x, y) under this module's [x, y] layout, so
+    # the element's zeta direction (axis 1) carries y and eta (axis 0) carries x.
     x1 = x_grid[ i   *nskip,  (j-1)*nskip]
     x2 = x_grid[ i   *nskip,   j   *nskip]
     x3 = x_grid[(i-1)*nskip,   j   *nskip]
@@ -350,14 +373,14 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
     N3 = np.zeros(((nskip+1)**2))
     N4 = np.zeros(((nskip+1)**2))
 
-    for kx in range((nskip+1)):
-        
-        for ky in range((nskip+1)):
-            
-            x_val = x_grid[ky, kx]
-            y_val = y_grid[ky, kx]
-            iind = ky*(nskip+1) + kx
-            N = FEM_shape_calculator_ortho_gfemlr(x_val, y_val, xpt, ypt)
+    for iy in range((nskip+1)):
+
+        for ix in range((nskip+1)):
+
+            x_val = x_grid[ix, iy]
+            y_val = y_grid[ix, iy]
+            iind = ix*(nskip+1) + iy
+            N = FEM_shape_calculator_ortho_gfemlr(y_val, x_val, ypt, xpt)
             N1[iind] = N[0][0]
             N2[iind] = N[1][0]
             N3[iind] = N[2][0]
@@ -398,12 +421,16 @@ def gfem_compress_flexible(
 
     data_source:
       - str path to an HDF5 file
-      - dict with in-memory arrays keyed by: field_name, mean, x_grid, y_grid, z_grid
+      - dict with in-memory arrays keyed by: field_name, mean, x_grid, y_grid
+
+    Spatial arrays are [x, y]: field_name is (num_snaps, nx, ny, num_vars),
+    mean is (nx, ny, num_vars) and the grids are (nx, ny).  A [y, x] source is
+    detected from its grids and transposed on read.
 
     latent_target:
       - None: returns dof arrays in-memory
-      - str path: writes dof_u/dof_v/dof_w to an HDF5 file
-      - dict: stores dof arrays in provided dict keys dof_u/dof_v/dof_w
+      - str path: writes dof_u/dof_v to an HDF5 file
+      - dict: stores dof arrays in provided dict keys dof_u/dof_v
     """
     ndim = 2
     num_snaps, nx, ny, _ = _source_metadata(data_source, field_name)
@@ -523,11 +550,11 @@ def gfem_compress_flexible(
                     Q_local_u_vec = np.zeros((q_rows, q_cols))
                     Q_local_v_vec = np.zeros((q_rows, q_cols))
 
-                    for kx in range(nskip + 1):
-                        for ky in range(nskip + 1):
-                            iind = ky * (nskip + 1) + kx
-                            Q_local_u_vec[iind, :] = Q_local_u[kx, ky, :]
-                            Q_local_v_vec[iind, :] = Q_local_v[kx, ky, :]
+                    for ix in range(nskip + 1):
+                        for iy in range(nskip + 1):
+                            iind = iy * (nskip + 1) + ix
+                            Q_local_u_vec[iind, :] = Q_local_u[ix, iy, :]
+                            Q_local_v_vec[iind, :] = Q_local_v[ix, iy, :]
 
                     L_u[lltogl, :] += modemat_local_wt_u.T @ Q_local_u_vec
                     L_v[lltogl, :] += modemat_local_wt_v.T @ Q_local_v_vec
@@ -576,6 +603,10 @@ def gfem_recon_flexible(
     dof_v: Optional[np.ndarray] = None,
     batch_size: int = 100,
 ):
+    """Rebuild the field from its dofs as (num_snaps, nx_t, ny_t, num_vars).
+
+    The reconstruction is [x, y] regardless of how the source was stored.
+    """
     if isinstance(dof_u, str):
         with h5py.File(dof_u, "r") as f:
             dof_u_arr = f["dof_u"][:]

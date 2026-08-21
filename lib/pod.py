@@ -28,6 +28,8 @@ import h5py
 import numpy as np
 from scipy.sparse.linalg import svds
 
+import lib.dls_2d as dls_2d
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,24 @@ def _field_layout(data_source: DataInput, field_name: str) -> Tuple[int, Tuple[i
     return shape[0], tuple(int(s) for s in shape[1:-1]), int(shape[-1])
 
 
+def _is_yx_source(data_source: DataInput, spatial: Tuple[int, ...]) -> bool:
+    """True when a 2D source stores its spatial axes [y, x] (see lib/dls_2d).
+
+    Undetectable without grids (an in-memory dict need not carry them), in
+    which case the source is taken at face value.
+    """
+    if len(spatial) != 2:
+        return False
+    if isinstance(data_source, str):
+        with h5py.File(data_source, "r") as f:
+            if "x_grid" not in f or "y_grid" not in f:
+                return False
+            return dls_2d._is_yx_ordered(f["x_grid"][:], f["y_grid"][:])
+    if "x_grid" not in data_source or "y_grid" not in data_source:
+        return False
+    return dls_2d._is_yx_ordered(data_source["x_grid"], data_source["y_grid"])
+
+
 def _load_fluctuations(
     data_source: DataInput,
     field_name: str,
@@ -102,8 +122,15 @@ def _load_fluctuations(
     Returns ``(X_list, spatial, num_vars)`` where each ``X_list[c]`` has shape
     ``(P, T)`` (spatial points by snapshots) in float64. The spatial axes are
     flattened in C order; reconstruction must use the same ordering.
+
+    A 2D source stored [y, x] is transposed on read, so ``spatial`` is (nx, ny)
+    and reconstructions come back [x, y], as in lib/dls_2d.
     """
     num_snaps, spatial, num_vars = _field_layout(data_source, field_name)
+    to_xy = _is_yx_source(data_source, spatial)
+    if to_xy:
+        logger.info("POD: source is stored [y, x]; transposing spatial axes to [x, y].")
+        spatial = spatial[::-1]
     n_points = int(np.prod(spatial))
 
     X_list = [np.zeros((n_points, num_snaps), dtype=np.float64) for _ in range(num_vars)]
@@ -116,12 +143,16 @@ def _load_fluctuations(
         close = False
     try:
         mean = f["mean"][:]  # (*spatial, num_vars)
+        if to_xy:
+            mean = mean.transpose(1, 0, 2)
         dset = f[field_name]
         loops = num_snaps // batch_size + (1 if num_snaps % batch_size else 0)
         for ib in range(loops):
             s0 = ib * batch_size
             s1 = min((ib + 1) * batch_size, num_snaps)
             batch = np.asarray(dset[s0:s1])  # (b, *spatial, num_vars)
+            if to_xy:
+                batch = batch.transpose(0, 2, 1, 3)
             fluc = batch - mean[np.newaxis, ...]
             b = s1 - s0
             for c in range(num_vars):
