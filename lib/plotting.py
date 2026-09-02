@@ -16,6 +16,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.ticker import FuncFormatter
 
 from lib.metrics import l2_err_norm
+import lib.metrics as l_metrics
 
 import logging
 logger = logging.getLogger(__name__)
@@ -606,3 +607,254 @@ def plot_horizon_errors(runner, rec_path: str, gt_path: str, name: str, source: 
     plt.grid(visible=True, linestyle='--', linewidth=0.5)
     plt.savefig(os.path.join(runner.paths_bib.pred_fig_dir, 'horizon_errors.png'), dpi=300)
     plt.close()
+
+## ============================ Rollout statistics diagnostics ===============================
+# Pointwise error says how far the prediction drifted from the reference
+# trajectory; these say whether it still behaves like the right flow after it
+# has. That distinction is the whole point of scoring a chaotic rollout.
+
+_STAT_MAX_SNAPS = 128
+
+
+def _pred_index(runner, rec_path, ids):
+    """Aligned (rec_idx, gt_idx) over the predicted part of a rollout.
+
+    The first `time_lag` reconstructed snapshots are the seeded initial
+    condition copied from ground truth, so they are excluded; thereafter
+    rec[i] corresponds to gt[ids[i]] (the alignment plot_TKE uses).
+    """
+    time_lag = runner.config['model_params']['time_lag']
+    with h5py.File(rec_path, 'r') as f:
+        n_rec = f['Q_rec'].shape[0]
+    n = min(n_rec, len(ids))
+    return np.arange(time_lag, n), np.asarray(ids[time_lag:n])
+
+
+def _load_pair(runner, rec_path, gt_path, ids, frac=None, max_snaps=_STAT_MAX_SNAPS,
+               rec_is_reference=False):
+    """Load aligned ground-truth and predicted fluctuation fields.
+
+    `frac` selects a (lo, hi) fraction of the prediction window, so the same
+    statistic can be measured early and late in a rollout. Snapshots are
+    strided down to `max_snaps` to bound the FFT allocations.
+
+    Returns (Q_gt, Q_rec), each (T, *spatial, ncomp).
+    """
+    if rec_is_reference:
+        # the codec reference is reconstructed over `ids` directly, so its row i
+        # is ids[i]; drop the same leading time_lag rows the prediction drops
+        time_lag = runner.config['model_params']['time_lag']
+        with h5py.File(rec_path, 'r') as f:
+            n_ref = f['Q_rec'].shape[0]
+        n = min(n_ref, len(ids))
+        rec_idx = np.arange(time_lag, n)
+        gt_idx = np.asarray(ids[time_lag:n])
+    else:
+        rec_idx, gt_idx = _pred_index(runner, rec_path, ids)
+    if frac is not None:
+        lo = int(len(rec_idx) * frac[0])
+        hi = max(lo + 1, int(len(rec_idx) * frac[1]))
+        rec_idx, gt_idx = rec_idx[lo:hi], gt_idx[lo:hi]
+    if len(rec_idx) > max_snaps:
+        sel = np.linspace(0, len(rec_idx) - 1, max_snaps).astype(int)
+        rec_idx, gt_idx = rec_idx[sel], gt_idx[sel]
+
+    nx, ny = runner.l_config.nx_t, runner.l_config.ny_t
+    nz = runner.l_config.nz_t if runner.dim == 3 else None
+
+    with h5py.File(rec_path, 'r') as f:
+        Q_rec = f['Q_rec'][rec_idx]
+
+    with h5py.File(gt_path, 'r') as f:
+        if runner.dim == 3:
+            mean_gt = f['mean'][:nx, :ny, :nz, :]
+            Q_gt = f['UV'][gt_idx][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
+        else:
+            crop = runner._xy_crop(nx, ny)
+            mean_gt = runner._to_xy(f['mean'][crop], 0)
+            Q_gt = runner._to_xy(f['UV'][gt_idx][(slice(None),) + crop], 1) - mean_gt[np.newaxis]
+    return Q_gt, Q_rec
+
+
+def _save(runner, fname):
+    plt.savefig(os.path.join(runner.paths_bib.pred_fig_dir, fname), dpi=300)
+    plt.close()
+
+
+def plot_energy_spectrum(runner, rec_path, gt_path, name, source, ids, n_windows=3,
+                         ref_path=None):
+    """Energy spectrum E(k), ground truth vs prediction, in rollout time windows.
+
+    Mean regression shows up as the predicted spectrum sagging below the true
+    one at high k, with the gap widening from the early window to the late one.
+
+    Returns scalars for the metrics record.
+    """
+    labels = ['early', 'mid', 'late'][:n_windows]
+    bounds = [(i / n_windows, (i + 1) / n_windows) for i in range(n_windows)]
+    colors = plt.cm.viridis(np.linspace(0.15, 0.85, n_windows))
+
+    out = {}
+    size = 0.9
+    plt.figure(figsize=(size * width, size * height))
+    for label, frac, color in zip(labels, bounds, colors):
+        Q_gt, Q_rec = _load_pair(runner, rec_path, gt_path, ids, frac=frac)
+        k, E_gt = l_metrics.energy_spectrum(Q_gt)
+        _, E_rec = l_metrics.energy_spectrum(Q_rec)
+        m = k > 0
+        hi = k >= 0.5 * k.max()
+        plt.loglog(k[m], E_gt[m], color=color, linestyle='-', label=f'True ({label})')
+        plt.loglog(k[m], E_rec[m], color=color, linestyle='--', label=f'Pred ({label})')
+
+        # vs raw truth: reports the codec floor as much as the model
+        out[f'spectrum_kl_vs_gt_{label}'] = l_metrics.spectrum_kl(E_gt, E_rec)
+        out[f'spectrum_hik_vs_gt_{label}'] = float(E_rec[hi].sum() / E_gt[hi].sum())
+
+        # vs the codec round trip: the model's own contribution, and the
+        # number to compare across runs
+        if ref_path is not None:
+            _, Q_ref = _load_pair(runner, ref_path, gt_path, ids, frac=frac,
+                                  rec_is_reference=True)
+            _, E_ref = l_metrics.energy_spectrum(Q_ref)
+            if label == labels[-1]:
+                plt.loglog(k[m], E_ref[m], color='0.5', linestyle=':',
+                           label='Codec round trip')
+            out[f'spectrum_logratio_{label}'] = l_metrics.spectrum_error(E_ref, E_rec)
+            out[f'spectrum_kl_{label}'] = l_metrics.spectrum_kl(E_ref, E_rec)
+            out[f'spectrum_hik_ratio_{label}'] = float(E_rec[hi].sum() / E_ref[hi].sum())
+
+    plt.xlabel(r'$k$ (cycles per domain)')
+    plt.ylabel(r'$E(k)$')
+    plt.title('Energy spectrum: true (solid) vs predicted (dashed)', pad=10)
+    plt.legend(frameon=False, fontsize=7, ncol=n_windows)
+    plt.grid(visible=True, which='both', linestyle='--', linewidth=0.4)
+    _save(runner, 'energy_spectrum.png')
+    return out
+
+
+def plot_energy_retention(runner, rec_path, gt_path, name, source, ids):
+    """Fluctuation energy over the rollout, normalized by the true mean.
+
+    This is the direct measurement of "the rollout is losing energy": the
+    headline number is the ratio over the final tenth of the rollout.
+    """
+    time_lag = runner.config['model_params']['time_lag']
+    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+        TKE_rec = f_rec['TKE_rec'][:]
+        TKE_gt = f_gt['TKE_gt_' + runner.latent_id + '_' + name + source][:]
+
+    n = min(len(TKE_rec), len(ids))
+    rec = TKE_rec[time_lag:n]
+    gt = TKE_gt[np.asarray(ids[time_lag:n])]
+    ref = float(gt.mean())
+    dt = np.arange(len(rec))
+
+    size = 0.8
+    plt.figure(figsize=(size * width, size * height))
+    plt.plot(dt, gt / ref, color='k', linestyle='-', label='True')
+    plt.plot(dt, rec / ref, color='r', linestyle='-.', label='Predicted')
+    plt.axhline(1.0, color='0.6', linewidth=0.6, linestyle=':')
+    plt.xlabel(r'$\Delta t$ (time steps)')
+    plt.ylabel(r'$\mathrm{TKE}/\langle \mathrm{TKE}_{\mathrm{true}}\rangle$')
+    plt.title('Fluctuation energy retention over the rollout', pad=10)
+    plt.legend(frameon=False, fontsize=8)
+    plt.grid(visible=True, linestyle='--', linewidth=0.5)
+    _save(runner, 'energy_retention.png')
+
+    tail = max(1, len(rec) // 10)
+    return {
+        'energy_retention_final': float(rec[-tail:].mean() / max(gt[-tail:].mean(), 1e-30)),
+        'energy_retention_mean': float(rec.mean() / max(ref, 1e-30)),
+    }
+
+
+def plot_field_error_vs_time(runner, rec_path, gt_path, name, source, ids):
+    """Relative L2 error of the reconstructed field over the whole rollout.
+
+    The existing horizon study covers 30 restarts x 10 steps in *latent* space;
+    this is the long rollout in physical space. Full decorrelation saturates
+    near sqrt(2); settling below that means energy has been lost.
+    """
+    Q_gt, Q_rec = _load_pair(runner, rec_path, gt_path, ids, max_snaps=512)
+    err = l_metrics.field_l2_vs_time(Q_gt, Q_rec)
+    dt = np.linspace(0, 1, len(err)) * len(err)
+
+    size = 0.8
+    plt.figure(figsize=(size * width, size * height))
+    plt.plot(dt, err, color='r')
+    plt.axhline(np.sqrt(2), color='0.6', linewidth=0.7, linestyle=':',
+                label=r'$\sqrt{2}$ (decorrelated)')
+    plt.xlabel(r'$\Delta t$ (time steps)')
+    plt.ylabel(r'$\|u-\hat u\|/\|u\|$')
+    plt.title('Field error over the rollout', pad=10)
+    plt.legend(frameon=False, fontsize=8)
+    plt.grid(visible=True, linestyle='--', linewidth=0.5)
+    _save(runner, 'field_error_vs_time.png')
+
+    tail = max(1, len(err) // 10)
+    return {'field_l2_mean': float(err.mean()),
+            'field_l2_final': float(err[-tail:].mean()),
+            'field_l2_first': float(err[0])}
+
+
+def plot_velocity_pdf(runner, rec_path, gt_path, name, source, ids):
+    """PDF of fluctuation velocity values, true vs predicted.
+
+    Mean regression narrows the distribution and grows a spike at zero.
+    """
+    Q_gt, Q_rec = _load_pair(runner, rec_path, gt_path, ids)
+    lim = float(np.abs(Q_gt).max())
+    centers, pdf_gt = l_metrics.velocity_pdf(Q_gt, rng=(-lim, lim))
+    _, pdf_rec = l_metrics.velocity_pdf(Q_rec, rng=(-lim, lim))
+
+    comps = ['u', 'v', 'w'][:pdf_gt.shape[0]]
+    size = 0.9
+    fig, axes = plt.subplots(1, len(comps), figsize=(size * width, size * height * 0.8),
+                             squeeze=False)
+    for i, comp in enumerate(comps):
+        ax = axes[0][i]
+        ax.semilogy(centers, pdf_gt[i], color='k', linestyle='-', label='True')
+        ax.semilogy(centers, pdf_rec[i], color='r', linestyle='-.', label='Predicted')
+        ax.set_xlabel(rf"${comp}'$")
+        ax.grid(visible=True, linestyle='--', linewidth=0.4)
+        if i == 0:
+            ax.set_ylabel('PDF')
+            ax.legend(frameon=False, fontsize=7)
+    fig.suptitle('Fluctuation velocity PDF', y=1.02)
+    _save(runner, 'velocity_pdf.png')
+
+    return {'pdf_std_ratio': float(Q_rec.std() / max(Q_gt.std(), 1e-30)),
+            'pdf_flatness_ratio': float(
+                (np.mean(Q_rec ** 4) / max(np.mean(Q_rec ** 2) ** 2, 1e-30)) /
+                max(np.mean(Q_gt ** 4) / max(np.mean(Q_gt ** 2) ** 2, 1e-30), 1e-30))}
+
+
+def plot_autocorrelation(runner, rec_path, gt_path, name, source, ids, n_probes=64):
+    """Probe-averaged temporal autocorrelation, true vs predicted.
+
+    Separates the two failure modes a variance-matching loss can confuse:
+    drifting to a steady state keeps rho near 1 at all lags, while emitting
+    uncorrelated noise collapses rho at lag 1.
+    """
+    Q_gt, Q_rec = _load_pair(runner, rec_path, gt_path, ids, max_snaps=512)
+    n_time = Q_gt.shape[0]
+    flat_gt = Q_gt.reshape(n_time, -1)
+    flat_rec = Q_rec.reshape(n_time, -1)
+    # fixed strided probes so both fields are sampled at the same points
+    probes = np.linspace(0, flat_gt.shape[1] - 1, n_probes).astype(int)
+    lags, rho_gt = l_metrics.temporal_autocorr(flat_gt[:, probes])
+    _, rho_rec = l_metrics.temporal_autocorr(flat_rec[:, probes])
+
+    size = 0.8
+    plt.figure(figsize=(size * width, size * height))
+    plt.plot(lags, rho_gt, color='k', linestyle='-', label='True')
+    plt.plot(lags, rho_rec, color='r', linestyle='-.', label='Predicted')
+    plt.axhline(0.0, color='0.6', linewidth=0.6, linestyle=':')
+    plt.xlabel(r'lag $\tau$ (time steps)')
+    plt.ylabel(r'$\rho(\tau)$')
+    plt.title('Temporal autocorrelation', pad=10)
+    plt.legend(frameon=False, fontsize=8)
+    plt.grid(visible=True, linestyle='--', linewidth=0.5)
+    _save(runner, 'autocorrelation.png')
+
+    return {'autocorr_l2': float(np.linalg.norm(rho_gt - rho_rec) / np.sqrt(len(lags)))}

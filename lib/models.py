@@ -218,8 +218,12 @@ class TransformerEncoderModel(nn.Module):
             self.encoder_layers.append(layer)
         self.fc = nn.Linear(d_model, input_dim)
 
-        # Attention outputs storage
+        # Attention outputs storage. Capture is off by default: asking for the
+        # weights forces need_weights=True, which disables the fused attention
+        # kernel, and the hook copies them to host on every forward. Enable it
+        # only around the forward whose weights you want (see get_attn).
         self.encoder_attn_outputs = {}
+        self.capture_attn = False
         self.patch_attention()
 
     def patch_attention_layer(self, m):
@@ -227,8 +231,9 @@ class TransformerEncoderModel(nn.Module):
         forward_orig = m.forward
 
         def wrap(*args, **kwargs):
-            kwargs["need_weights"] = True
-            kwargs["average_attn_weights"] = False
+            if self.capture_attn:
+                kwargs["need_weights"] = True
+                kwargs["average_attn_weights"] = False
 
             # If ALiBi is enabled, add an attention mask bias
             if getattr(self, 'use_alibi', False):
@@ -263,10 +268,33 @@ class TransformerEncoderModel(nn.Module):
 
     def save_output_encoder(self, m, i, o, label='0'):
         """Save the attention weights from the encoder."""
+        if not self.capture_attn or o[1] is None:
+            return
         self.encoder_attn_outputs[label] = o[1].cpu().detach()
 
-    def get_attn(self):
-        """Retrieve the saved attention weights."""
+    def attn_capture(self):
+        """Context manager enabling attention capture for the forwards inside it."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            prev = self.capture_attn
+            self.capture_attn = True
+            try:
+                yield
+            finally:
+                self.capture_attn = prev
+        return _ctx()
+
+    def get_attn(self, x=None):
+        """Retrieve the saved attention weights.
+
+        Pass an input tensor to run one capturing forward first; with no
+        argument this returns whatever a previous capturing forward stored.
+        """
+        if x is not None:
+            with self.attn_capture(), torch.no_grad():
+                self(x)
         return self.encoder_attn_outputs.copy()
 
     def forward(self, x):

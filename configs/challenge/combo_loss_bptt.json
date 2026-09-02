@@ -1,0 +1,71 @@
+{
+    "model_params" : {
+        "model_name" :  "challenge",
+        "model_type" :  "tr_enc",
+        "time_lag" :    70,
+        "train_ahead" : 30,
+        "num_layers" :  4,
+        "nhead" :       4,
+        "d_model":      128,
+        "ff_dim":       384,
+        "lr" :          1e-4,
+        "lr_factor":    0.5,
+        "lr_min":       1e-7,
+        "lr_patience":  5,
+        "grad_clip": 5.0,
+        "loss": {
+            "type": "combo",
+            "terms": [
+                {
+                    "type": "huber",
+                    "delta": 0.1,
+                    "weight": 1.0
+                },
+                {
+                    "type": "rel_l2",
+                    "weight": 0.1
+                }
+            ]
+        },
+        "batch_size" :  32,
+        "num_epochs" :  1000,
+        "patience" :    50,
+        "activation":   "swiglu",
+        "prenorm":      true,
+        "rollout": {
+            "mode": "bptt",
+            "chunk": 0,
+            "checkpoint": false,
+            "ramp_epochs": 5
+        },
+        "es_min_delta": 0.01,
+        "lr_floor_patience": 20
+    },
+    
+    "latent_params" : {
+        "type" : "dls",
+        "patch_size" : 13,
+        "num_modes" : 20,
+        "localized": false,
+        "source_name" : "cavity",
+        "source_path" : "Challenge2_1_train",
+        "batch_size" : 1000
+    },
+
+    "train_data" : [
+        {
+            "name" : "cavity",
+            "path" : "Challenge2_1_train",
+            "train_split" : 0.9,
+            "test_split" : 0.1
+        }
+    ],
+
+    "eval_data" : [
+        {
+            "name" : "cavity",
+            "path" : "Challenge2_1_train",
+            "pred_split" : 0.1
+        }
+    ]
+}

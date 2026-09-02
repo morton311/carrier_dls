@@ -2,26 +2,32 @@
     "model_params" : {
         "model_name" :  "ldc_global_dls",
         "model_type" :  "tr_enc",
-        "time_lag" :    32,
+        "time_lag" :    16,
         "train_ahead" : 1,
         "num_layers" :  4,
         "nhead" :       4,
-        "d_model":      512,
-        "ff_dim":       2048,
+        "d_model":      128,
+        "ff_dim":       384,
         "lr" :          1e-3,
-        "lr_factor":    0,
-        "lr_min":       1e-3,
+        "lr_factor":    0.5,
+        "lr_min":       1e-6,
         "lr_patience":  5,
-        "batch_size" :  256,
+        "loss": {"type": "combo", 
+                    "terms": [  
+                        {"type": "huber", "delta": 0.1, "weight": 1.0},
+                        {"type": "rel_l2", "weight": 0.1}
+                    ]
+                },
+        "batch_size" :  16,
         "num_epochs" :  5000,
         "patience" :    50,
-        "activation":   "relu",
+        "activation":   "swiglu",
         "prenorm":      true
     },
     
     "latent_params" : {
         "type" : "dls",
-        "patch_size" : 49,
+        "patch_size" : 99,
         "num_modes" : 10,
         "localized": false,
         "source_name" : "ldc_15k",

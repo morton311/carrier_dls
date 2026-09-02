@@ -1,0 +1,58 @@
+{
+    "model_params": {
+        "model_name": "ldc_global_dls",
+        "model_type": "tr_enc",
+        "time_lag": 16,
+        "train_ahead": 16,
+        "num_layers": 4,
+        "nhead": 4,
+        "d_model": 128,
+        "ff_dim": 384,
+        "lr": 0.001,
+        "lr_factor": 0.5,
+        "lr_min": 1e-06,
+        "lr_patience": 5,
+        "grad_clip": 1.0,
+        "loss": "mse",
+        "batch_size": 16,
+        "num_epochs": 5000,
+        "patience": 50,
+        "activation": "swiglu",
+        "prenorm": true,
+        "rollout": {
+            "mode": "bptt",
+            "chunk": 0,
+            "checkpoint": false,
+            "ramp_epochs": 5
+        },
+        "es_min_delta": 0.01,
+        "lr_floor_patience": 20,
+        "loss_metric": "gram",
+        "norm": "per_dof",
+        "amp_growth_interval": 10000
+    },
+    "latent_params": {
+        "type": "dls",
+        "patch_size": 99,
+        "num_modes": 10,
+        "localized": false,
+        "source_name": "ldc_15k",
+        "source_path": "ldc_15k",
+        "batch_size": 250
+    },
+    "train_data": [
+        {
+            "name": "ldc_15k",
+            "path": "ldc_15k",
+            "train_split": 0.8,
+            "test_split": 0.1
+        }
+    ],
+    "eval_data": [
+        {
+            "name": "ldc_15k",
+            "path": "ldc_15k",
+            "pred_split": 0.2
+        }
+    ]
+}

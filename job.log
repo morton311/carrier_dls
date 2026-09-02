@@ -1,0 +1,13 @@
+To follow the log in real time, run 'tail -f results/ldc_15k_dls_p99m10/gram_perdof/logs/train.log'
+To follow the log in real time, run 'tail -f results/ldc_15k_dls_p99m10/gram_perdof/logs/pred.log'
+To follow the log in real time, run 'tail -f results/ldc_15k_dls_p99m10/gram_perdof/logs/eval.log'
+nx: 491, ny: 491, nz: 1
+RMS_gt shape: (491, 491, 2), RMS_rec shape: (491, 491, 2)
+x_grid shape: (512, 512), y_grid shape: (512, 512)
+x_grid_t shape: (491, 491), y_grid_t shape: (491, 491)
+rms_true shape: (512, 512, 2), rms_pred shape: (491, 491, 2)
+nx: 491, ny: 491, nz: 1
+RMS_gt shape: (491, 491, 2), RMS_rec shape: (491, 491, 2)
+x_grid shape: (512, 512), y_grid shape: (512, 512)
+x_grid_t shape: (491, 491), y_grid_t shape: (491, 491)
+rms_true shape: (512, 512, 2), rms_pred shape: (491, 491, 2)

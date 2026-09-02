@@ -16,14 +16,40 @@ import lib.init as init
 import lib.pod as pod
 import lib.models as models
 import lib.datas as datas
+import lib.decode as decode
+import lib.losses as losses
 import lib.plotting as pl
 from lib.metrics import l2_err_norm
 
 logger = logging.getLogger(__name__)
 
 GRAD_CLIP_MAX_NORM = 0.2
+# Relative improvement required to reset the early-stopping counter. Bare `<`
+# lets plateau noise reset it indefinitely, so a run never stops.
+ES_MIN_DELTA = 0.01
+# Shorter patience once the LR scheduler has hit lr_min and cannot reduce further.
+LR_FLOOR_PATIENCE = 20
 CHECKPOINT_INTERVAL = 5
+# Reprint the training-table header every N epochs so a long log stays readable.
+EPOCH_HEADER_INTERVAL = 25
 MAX_ERROR_HORIZONS = 30
+
+
+class _RolloutAdapter:
+    """Per-model-type glue for the shared rollout driver.
+
+    The three model families differ in only four ways; this normalizes them:
+        time_axis   axis of ``inputs`` holding the time window (1 or 2)
+        unpack      batch -> (inputs, targets, state); state is a mutable dict
+        call        (inputs, state) -> outputs for one rollout step
+        after_step  optional per-step side effect (scheduled sampling)
+    """
+
+    def __init__(self, time_axis, unpack, call, after_step=None):
+        self.time_axis = time_axis
+        self.unpack = unpack
+        self.call = call
+        self.after_step = after_step
 
 
 class runner(nn.Module):
@@ -495,7 +521,15 @@ class runner(nn.Module):
 
         if self.model is not None: 
             
-            self.criterion = nn.MSELoss()
+            mp_ = self.config['model_params']
+            self.criterion = losses.build_loss(mp_.get('loss', 'mse'))
+            self.rollout_cfg = self._rollout_config()
+            self.last_grad_norm = float('nan')
+            self.last_skipped = 0
+            self.last_steps = 0
+            self.last_terms = None
+            self._term_totals = None
+            self._term_count = 0
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['model_params']['lr'])
             
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -506,12 +540,20 @@ class runner(nn.Module):
                 min_lr=self.config['model_params'].get('lr_min', 1e-6)
             )
             # torch.amp.GradScaler exists from torch 2.3; fall back for older versions
+            # growth_interval bounds how fast the loss scale climbs. The default
+            # (2000) doubles it every ~5.6 epochs here, so after ~22 epochs the
+            # scaled gradients reach the fp16 ceiling and overflow in bursts.
+            scaler_kwargs = {
+                'init_scale': mp_.get('amp_init_scale', 65536.0),
+                'growth_interval': mp_.get('amp_growth_interval', 2000),
+            }
             if hasattr(torch.amp, 'GradScaler'):
-                self.scaler = torch.amp.GradScaler()
+                self.scaler = torch.amp.GradScaler(**scaler_kwargs)
             else:
-                self.scaler = torch.cuda.amp.GradScaler()
+                self.scaler = torch.cuda.amp.GradScaler(**scaler_kwargs)
 
             logger.info(f"Loss function: {self.criterion}")
+            logger.info(f"Rollout: {self.rollout_cfg}")
             logger.info(f"Optimizer: {self.optimizer}")
             logger.info(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)})")
             logger.info(f"Using mixed precision training with GradScaler: {self.scaler}")
@@ -572,7 +614,37 @@ class runner(nn.Module):
         # Load the latent coefficients
         logger.info(f"{'#'*20}\t{'Training model...':<20}\t{'#'*20}")
         self._get_train_data()
+        self._apply_loss_metric()
         self._model_fit()
+
+    def _apply_loss_metric(self) -> None:
+        """Optionally re-express the loss in field-energy coordinates.
+
+        `model_params.loss_metric`:
+            'latent' (default)  score raw latent DOF error, as before
+            'gram'              score DLS field-reconstruction energy
+
+        Needs dof_std, so it runs after _get_train_data rather than at compile
+        time. Applies to whichever source the loss is built for; with several
+        train sources the first one's scaler is used, since the criterion is
+        shared across them.
+        """
+        if self.model is None:
+            return
+        mode = self.config['model_params'].get('loss_metric', 'latent')
+        if mode == 'latent':
+            return
+        if mode != 'gram':
+            raise ValueError(
+                f"model_params.loss_metric '{mode}' not recognized. Use 'latent' or 'gram'.")
+        name = next(iter(self.dof_std))
+        metric = decode.build_gram_metric(self, name)
+        if metric is None:
+            logger.warning("loss_metric='gram' requested but unavailable; "
+                           "falling back to the latent metric.")
+            return
+        self.criterion = losses.MetricLoss(self.criterion, metric).to(self.device)
+        logger.info(f"Loss re-expressed in field-energy coordinates: {self.criterion}")
 
 
     def _load_dof_rows(self, dof_u, dof_v, dof_w, indices, lltogl_mat=None) -> torch.Tensor:
@@ -612,6 +684,36 @@ class runner(nn.Module):
         dof = (dof - self.dof_mean[name]) / self.dof_std[name]
         return dof
 
+    def _dof_stats(self, dofs):
+        """Mean/std for normalizing latent DOFs, per model_params.norm.
+
+        'scalar' (default) reproduces the historical reduction over axes (0, 1).
+        For localized configs that already yields one value per element-local
+        DOF slot, so the two modes agree there; it is only the non-localized
+        case, where `dofs` is 2-D, that collapses to a single global scalar.
+
+        'per_dof' always reduces over every axis but the last, giving one
+        mean/std per feature. On the cavity latent the per-DOF spread is ~3e3,
+        so a single scale leaves some coefficients at ~170 sigma while the
+        median sits near 0.2.
+        """
+        mode = self.config['model_params'].get('norm', 'scalar')
+        if mode == 'per_dof':
+            dims = tuple(range(dofs.dim() - 1))
+        elif mode == 'scalar':
+            dims = (0, 1)
+        else:
+            raise ValueError(
+                f"model_params.norm '{mode}' not recognized. Use 'scalar' or 'per_dof'.")
+        mean = torch.mean(dofs, dim=dims)
+        std = torch.std(dofs, dim=dims)
+        if std.ndim > 0:
+            # a feature with no variance would otherwise be amplified without
+            # bound; floor it relative to the typical scale
+            floor = float(std.mean()) * 1e-6
+            std = std.clamp_min(floor)
+        return mean, std
+
     def _get_train_data(self):
         """Get training and test data as torch tensors, minimizing memory usage."""
         if self.config['model_params']['model_type'] in ('tr_encdec', 'tr_spatial'):
@@ -650,9 +752,10 @@ class runner(nn.Module):
 
                         dofs = self._load_dof_rows(dof_u, dof_v, dof_w, train_indices, lltogl_mat)
 
-                    self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))
-                    self.dof_std[name] = torch.std(dofs, dim=(0, 1))
-                    logger.info(f"Mean/std shapes: {self.dof_mean[name].shape}, {self.dof_std[name].shape}")
+                    self.dof_mean[name], self.dof_std[name] = self._dof_stats(dofs)
+                    logger.info(f"Normalization '{self.config['model_params'].get('norm','scalar')}': "
+                                f"mean/std shapes {tuple(self.dof_mean[name].shape)}, "
+                                f"{tuple(self.dof_std[name].shape)}")
 
                     latent_type = self.config['latent_params']['type']
                     if localized:
@@ -713,56 +816,224 @@ class runner(nn.Module):
                         pickle.dump((self.dof_mean, self.dof_std), pkl_f)
 
 
+    def _rollout_config(self) -> dict:
+        """Normalize model_params.rollout. Absent means today's detached behavior.
+
+        mode        'detached' (per-step backward, gradients never cross steps)
+                    or 'bptt' (carry the graph across up to `chunk` steps)
+        chunk       truncated-BPTT length; 0 means the whole train_ahead rollout
+        checkpoint  gradient-checkpoint each model call: ~+33% forward cost for
+                    O(1) activation memory in the rollout depth
+        ramp_epochs grow backprop depth 1 -> train_ahead over this many epochs
+        """
+        ro = dict(self.config['model_params'].get('rollout', {}))
+        ro.setdefault('mode', 'detached')
+        ro.setdefault('chunk', 0)
+        ro.setdefault('checkpoint', False)
+        ro.setdefault('ramp_epochs', 0)
+        if ro['mode'] not in ('detached', 'bptt'):
+            raise ValueError(
+                f"rollout.mode '{ro['mode']}' not recognized. Use 'detached' or 'bptt'.")
+        return ro
+
+    def _rollout_adapter(self, epoch: int, train: bool) -> _RolloutAdapter:
+        """Build the per-model-type glue for one epoch of _rollout_epoch."""
+        model_type = self.config['model_params']['model_type']
+
+        if model_type == 'tr_encdec':
+            geom = self._elem_geometry()
+            coords = geom['coords']
+            # scheduled sampling perturbs the encoder context only while training
+            ss_p = self._ss_prob(epoch) if train else 0.0
+
+            def unpack(batch):
+                inputs, targets, tokens, _ = batch
+                return (inputs.to(self.device), targets.to(self.device),
+                        {'tokens': tokens.to(self.device)})
+
+            def call(inputs, state):
+                return self.model(inputs, state['tokens'], coords)
+
+            def after_step(outputs, state):
+                if ss_p > 0 and torch.rand(()).item() < ss_p:
+                    new_frame = self._reassemble_tokens(outputs.detach(), state['key'], geom)
+                    state['tokens'] = self._shift_tokens(state['tokens'], new_frame)
+
+            return _RolloutAdapter(2, unpack, call, after_step)
+
+        if model_type == 'tr_spatial':
+            coords = self._elem_geometry()['coords']
+
+            def unpack(batch):
+                inputs, targets, _, _ = batch
+                return inputs.to(self.device), targets.to(self.device), {}
+
+            return _RolloutAdapter(2, unpack, lambda inputs, state: self.model(inputs, coords))
+
+        def unpack(batch):
+            inputs, targets = batch
+            return inputs.to(self.device), targets.to(self.device), {}
+
+        return _RolloutAdapter(1, unpack, lambda inputs, state: self.model(inputs))
+
+    def _bptt_depth(self, epoch: int, steps: int) -> int:
+        """Backprop depth for this epoch, ramping 1 -> steps over ramp_epochs.
+
+        A fresh model rolled out many steps diverges immediately, which makes
+        every gradient non-finite and stalls training silently, so the depth is
+        grown in over the first epochs when ramp_epochs is set.
+        """
+        ramp = self.rollout_cfg['ramp_epochs']
+        if ramp <= 0:
+            return steps
+        frac = min((epoch + 1) / ramp, 1.0)
+        return max(1, int(round(1 + (steps - 1) * frac)))
+
+    def _rollout_batch(self, batch, adapter, key, train, max_norm, epoch=0):
+        """One optimizer step's worth of multi-step rollout.
+
+        With rollout.mode == 'detached' each step is backpropagated on its own
+        and the fed-back prediction is detached, so gradients never cross steps.
+        With 'bptt' the graph is carried across up to `chunk` steps before a
+        single backward, which is what lets the model learn to compensate for
+        compounding rollout error.
+
+        Returns (mean per-step loss, pre-clip grad norm or None).
+        """
+        inputs, targets, state = adapter.unpack(batch)
+        state['key'] = key
+        t_ax = adapter.time_axis
+        steps = targets.shape[t_ax]
+        window = inputs.shape[t_ax]
+
+        ro = self.rollout_cfg
+        bptt = train and ro['mode'] == 'bptt'
+        chunk = min(ro['chunk'] or steps, self._bptt_depth(epoch, steps)) if bptt else 1
+        use_ckpt = bptt and ro['checkpoint']
+
+        if train:
+            self.optimizer.zero_grad()
+
+        total = 0.0
+        chunk_loss = None
+        for n in range(steps):
+            target = targets.select(t_ax, n)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                if use_ckpt:
+                    outputs = torch.utils.checkpoint.checkpoint(
+                        adapter.call, inputs, state, use_reentrant=False)
+                else:
+                    outputs = adapter.call(inputs, state)
+                loss = self.criterion(outputs, target)
+            # accumulate as a float: holding the tensor would pin its autograd graph
+            total += float(loss.detach())
+            self._accumulate_terms()
+
+            did_backward = False
+            if train:
+                if bptt:
+                    chunk_loss = loss if chunk_loss is None else chunk_loss + loss
+                    if (n + 1) % chunk == 0 or (n + 1) == steps:
+                        self.scaler.scale(chunk_loss).backward()
+                        chunk_loss = None
+                        did_backward = True
+                else:
+                    self.scaler.scale(loss).backward()
+                    did_backward = True
+
+            # carry the graph forward only while it is still alive; backward()
+            # frees it, so the window must be detached at every chunk boundary
+            carry = outputs if (not train or (bptt and not did_backward)) else outputs.detach()
+            inputs = torch.cat(
+                (inputs.narrow(t_ax, 1, window - 1), carry.unsqueeze(t_ax)), dim=t_ax)
+            if bptt and did_backward:
+                inputs = inputs.detach()
+            if adapter.after_step is not None:
+                adapter.after_step(outputs, state)
+
+        grad_norm = None
+        if train:
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm))
+            # a non-finite norm means fp16 overflow; scaler.step then skips the
+            # update and halves the scale, so no corrupted step is ever applied
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        return total / steps, grad_norm
+
+    def _rollout_epoch(self, epoch: int, train: bool, max_norm: float = None) -> float:
+        """One epoch of multi-step rollouts over every loader. Returns the mean loss.
+
+        Shared by all model types and by both training and validation; the
+        per-model differences live in the adapter.
+        """
+        loaders = self.train_loader if train else self.test_loader
+        self.model.train(train)
+        adapter = self._rollout_adapter(epoch, train)
+
+        epoch_loss = 0.0
+        grad_norms = []
+        n_steps = 0
+        n_skipped = 0
+        self._term_totals = None
+        self._term_count = 0
+        with torch.set_grad_enabled(train):
+            for key in loaders:
+                if train and self.config['distributed']:
+                    self.sampler[key].set_epoch(epoch)
+                n_batches = len(loaders[key])
+                for batch in loaders[key]:
+                    loss, grad_norm = self._rollout_batch(
+                        batch, adapter, key, train, max_norm, epoch)
+                    epoch_loss += loss / n_batches
+                    if grad_norm is not None:
+                        n_steps += 1
+                        # inf/nan means fp16 overflow and a skipped optimizer step;
+                        # averaging it in would poison the whole epoch's reported norm
+                        if np.isfinite(grad_norm):
+                            grad_norms.append(grad_norm)
+                        else:
+                            n_skipped += 1
+
+        self.last_terms = self._mean_terms()
+        if train:
+            self.last_grad_norm = float(np.mean(grad_norms)) if grad_norms else float('nan')
+            self.last_skipped = n_skipped
+            self.last_steps = n_steps
+            if n_steps and n_skipped > n_steps // 2:
+                logger.warning(
+                    "Epoch %d: GradScaler skipped %d/%d optimizer steps (fp16 overflow). "
+                    "Training is barely progressing; lower the learning rate or the "
+                    "rollout depth.", epoch + 1, n_skipped, n_steps)
+        return epoch_loss
+
+    def _accumulate_terms(self):
+        """Sum each combo-loss term's contribution on device (no host sync)."""
+        terms = getattr(self.criterion, 'last_terms', None)
+        if terms is None:
+            return
+        if self._term_totals is None:
+            self._term_totals = [t.clone() for t in terms]
+        else:
+            for total, term in zip(self._term_totals, terms):
+                total += term
+        self._term_count += 1
+
+    def _mean_terms(self):
+        """Per-term mean contributions for the epoch, as {name: float}."""
+        if not self._term_totals or not self._term_count:
+            return None
+        names = getattr(self.criterion, 'names', None) or [
+            f"term{i}" for i in range(len(self._term_totals))]
+        return {n: float(t) / self._term_count for n, t in zip(names, self._term_totals)}
+
     def _train_epoch(self, epoch: int, max_norm: float) -> float:
         """Single forward+backward pass over all training loaders. Returns mean epoch loss."""
-        if self.config['model_params']['model_type'] == 'tr_encdec':
-            return self._train_epoch_encdec(epoch, max_norm)
-        if self.config['model_params']['model_type'] == 'tr_spatial':
-            return self._train_epoch_spatial(epoch, max_norm)
-        self.model.train()
-        epoch_loss = 0.0
-        for key in self.train_loader:
-            if self.config['distributed']:
-                self.sampler[key].set_epoch(epoch)
-            for inputs, targets in self.train_loader[key]:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                self.optimizer.zero_grad()
-                total_loss = 0.0
-                for n in range(targets.shape[1]):
-                    target = targets[:, n, :]
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        outputs = self.model(inputs)
-                        loss = self.criterion(outputs, target)
-                    total_loss += loss
-                    self.scaler.scale(loss).backward()
-                    inputs = torch.cat((inputs[:, 1:, :], outputs.detach().unsqueeze(1)), dim=1)
-                epoch_loss += total_loss.item() / (targets.shape[1] * len(self.train_loader[key]))
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-        return epoch_loss
+        return self._rollout_epoch(epoch, train=True, max_norm=max_norm)
 
     def _validate_epoch(self) -> float:
         """Single forward pass over all test loaders. Returns mean test loss."""
-        if self.config['model_params']['model_type'] == 'tr_encdec':
-            return self._validate_epoch_encdec()
-        if self.config['model_params']['model_type'] == 'tr_spatial':
-            return self._validate_epoch_spatial()
-        self.model.eval()
-        test_loss = 0.0
-        with torch.no_grad():
-            for key in self.test_loader:
-                for inputs, targets in self.test_loader[key]:
-                    inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    for n in range(targets.shape[1]):
-                        target = targets[:, n, :]
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            outputs = self.model(inputs)
-                            loss = self.criterion(outputs, target)
-                        test_loss += loss.item() / (targets.shape[1] * len(self.test_loader[key]))
-                        inputs = torch.cat((inputs[:, 1:, :], outputs.unsqueeze(1)), dim=1)
-        return test_loss
+        return self._rollout_epoch(0, train=False)
 
     ## ======================= Global-local encoder-decoder (tr_encdec) ==========================
 
@@ -912,9 +1183,10 @@ class runner(nn.Module):
                 dof_w = f[name]['dof_w'] if self.dim == 3 else None
 
                 dofs = self._load_dof_rows(dof_u, dof_v, dof_w, train_indices, geom['lltogl_np'])
-                self.dof_mean[name] = torch.mean(dofs, dim=(0, 1))
-                self.dof_std[name] = torch.std(dofs, dim=(0, 1))
-                logger.info(f"Mean/std shapes: {self.dof_mean[name].shape}, {self.dof_std[name].shape}")
+                self.dof_mean[name], self.dof_std[name] = self._dof_stats(dofs)
+                logger.info(f"Normalization '{self.config['model_params'].get('norm','scalar')}': "
+                            f"mean/std shapes {tuple(self.dof_mean[name].shape)}, "
+                            f"{tuple(self.dof_std[name].shape)}")
                 del dofs
 
                 dof_comps = [torch.from_numpy(dof_u[:]).float(), torch.from_numpy(dof_v[:]).float()]
@@ -943,109 +1215,29 @@ class runner(nn.Module):
         with open(os.path.join(self.paths_bib.model_dir, 'dof_scaler.pkl'), 'wb') as fs:
             pickle.dump((self.dof_mean, self.dof_std), fs)
 
-    def _train_epoch_encdec(self, epoch: int, max_norm: float) -> float:
-        """Encdec training epoch: encode shared context per snapshot group, multi-step local loss."""
-        self.model.train()
-        geom = self._elem_geometry()
-        coords = geom['coords']
-        ss_p = self._ss_prob(epoch)
-        epoch_loss = 0.0
-        for key in self.train_loader:
-            if self.config['distributed']:
-                self.sampler[key].set_epoch(epoch)
-            for inputs, targets, tokens, _ in self.train_loader[key]:
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
-                tokens = tokens.to(self.device)
-                self.optimizer.zero_grad()
-                total_loss = 0.0
-                for n in range(targets.shape[2]):
-                    target = targets[:, :, n, :]
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        outputs = self.model(inputs, tokens, coords)
-                        loss = self.criterion(outputs, target)
-                    total_loss += loss
-                    self.scaler.scale(loss).backward()
-                    inputs = torch.cat((inputs[:, :, 1:, :], outputs.detach().unsqueeze(2)), dim=2)
-                    if ss_p > 0 and torch.rand(()).item() < ss_p:
-                        new_frame = self._reassemble_tokens(outputs.detach(), key, geom)
-                        tokens = self._shift_tokens(tokens, new_frame)
-                epoch_loss += total_loss.item() / (targets.shape[2] * len(self.train_loader[key]))
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-        return epoch_loss
+    def _epoch_header(self, terms):
+        """Header rows for the compact training table."""
+        cols = [f"{'Epoch':>10}", f"{'Train':>9}", f"{'Test':>9}", 'B',
+                f"{'Patience':>7}", 'C', f"{'LR':>7}", f"{'GrdNrm':>7}", 'Skp']
+        if terms:
+            cols += [f"{losses.abbrev(n):>8}" for n in terms]
+        cols.append(f"{'Time':>6}")
+        head = '| ' + ' | '.join(cols) + ' |'
+        return ['-' * len(head), head, '-' * len(head)]
 
-    def _validate_epoch_encdec(self) -> float:
-        """Encdec validation epoch (teacher-forced context)."""
-        self.model.eval()
-        geom = self._elem_geometry()
-        coords = geom['coords']
-        test_loss = 0.0
-        with torch.no_grad():
-            for key in self.test_loader:
-                for inputs, targets, tokens, _ in self.test_loader[key]:
-                    inputs = inputs.to(self.device)
-                    targets = targets.to(self.device)
-                    tokens = tokens.to(self.device)
-                    for n in range(targets.shape[2]):
-                        target = targets[:, :, n, :]
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            outputs = self.model(inputs, tokens, coords)
-                            loss = self.criterion(outputs, target)
-                        test_loss += loss.item() / (targets.shape[2] * len(self.test_loader[key]))
-                        inputs = torch.cat((inputs[:, :, 1:, :], outputs.unsqueeze(2)), dim=2)
-        return test_loss
-
-    ## ============================ Spatial attention (tr_spatial) ===============================
-
-    def _train_epoch_spatial(self, epoch: int, max_norm: float) -> float:
-        """Spatial-attention training epoch: attention over elements, multi-step next-snapshot loss."""
-        self.model.train()
-        coords = self._elem_geometry()['coords']
-        epoch_loss = 0.0
-        for key in self.train_loader:
-            if self.config['distributed']:
-                self.sampler[key].set_epoch(epoch)
-            for inputs, targets, _, _ in self.train_loader[key]:
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
-                self.optimizer.zero_grad()
-                total_loss = 0.0
-                for n in range(targets.shape[2]):
-                    target = targets[:, :, n, :]
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        outputs = self.model(inputs, coords)
-                        loss = self.criterion(outputs, target)
-                    total_loss += loss
-                    self.scaler.scale(loss).backward()
-                    inputs = torch.cat((inputs[:, :, 1:, :], outputs.detach().unsqueeze(2)), dim=2)
-                epoch_loss += total_loss.item() / (targets.shape[2] * len(self.train_loader[key]))
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-        return epoch_loss
-
-    def _validate_epoch_spatial(self) -> float:
-        """Spatial-attention validation epoch."""
-        self.model.eval()
-        coords = self._elem_geometry()['coords']
-        test_loss = 0.0
-        with torch.no_grad():
-            for key in self.test_loader:
-                for inputs, targets, _, _ in self.test_loader[key]:
-                    inputs = inputs.to(self.device)
-                    targets = targets.to(self.device)
-                    for n in range(targets.shape[2]):
-                        target = targets[:, :, n, :]
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            outputs = self.model(inputs, coords)
-                            loss = self.criterion(outputs, target)
-                        test_loss += loss.item() / (targets.shape[2] * len(self.test_loader[key]))
-                        inputs = torch.cat((inputs[:, :, 1:, :], outputs.unsqueeze(2)), dim=2)
-        return test_loss
+    def _epoch_row(self, epoch, train_loss, test_loss, best_flag, patience,
+                   ckpt_flag, lr, terms, minutes):
+        """One row of the compact training table (see _epoch_header)."""
+        n_ep = self.config['model_params']['num_epochs']
+        cols = [f"{epoch+1:>4}/{n_ep:<5}", f"{train_loss:>9.3e}", f"{test_loss:>9.3e}",
+                best_flag,
+                f"{patience:>3}/{self.config['model_params']['patience']:<3}", ckpt_flag,
+                f"{lr:>7.1e}", f"{self.last_grad_norm:>7.1e}",
+                f"{self.last_skipped:>3}" if self.last_skipped else '  -']
+        if terms:
+            cols += [f"{v:>8.2e}" for v in terms.values()]
+        cols.append(f"{minutes:>5.1f}m")
+        return '| ' + ' | '.join(cols) + ' |'
 
     def _model_fit(self):
         if self.model is not None:
@@ -1068,9 +1260,21 @@ class runner(nn.Module):
             # ReduceLROnPlateau.get_last_lr only exists from torch ~2.2; read the optimizer directly
             new_lr = self.optimizer.param_groups[0]['lr']
 
-            for epoch in range(len(losses), self.config['model_params']['num_epochs']):
-                epoch_loss = self._train_epoch(epoch, GRAD_CLIP_MAX_NORM)
+            mp = self.config['model_params']
+            max_norm = mp.get('grad_clip', GRAD_CLIP_MAX_NORM)
+            min_delta = mp.get('es_min_delta', ES_MIN_DELTA)
+            lr_floor_patience = mp.get('lr_floor_patience', LR_FLOOR_PATIENCE)
+            lr_min = mp.get('lr_min', 1e-6)
+            patience_ref = best_test_loss
+            logger.info(f"Gradient clip max norm: {max_norm}")
+            logger.info(f"Early stopping: patience={mp['patience']}, min_delta={min_delta:.2%}"
+                        f", lr_floor_patience={lr_floor_patience}")
+
+            first_epoch = len(losses)
+            for epoch in range(first_epoch, self.config['model_params']['num_epochs']):
+                epoch_loss = self._train_epoch(epoch, max_norm)
                 losses.append(epoch_loss)
+                train_terms = self.last_terms
 
                 test_loss = self._validate_epoch()
                 test_losses.append(test_loss)
@@ -1079,21 +1283,38 @@ class runner(nn.Module):
                 new_lr = self.optimizer.param_groups[0]['lr']
 
                 if epoch > 1:
-                    if np.isnan(test_losses[-1]) or np.isnan(losses[-1]):
-                        logger.info(f'NaN loss at epoch {epoch+1}. Stopping training.')
+                    if not (np.isfinite(test_losses[-1]) and np.isfinite(losses[-1])):
+                        logger.info(f'Non-finite loss at epoch {epoch+1} '
+                                    f'(train {losses[-1]}, test {test_losses[-1]}). Stopping training.')
                         self.model.load_state_dict(best_model)
                         break
-                    elif test_loss < best_test_loss:
+
+                    # Always keep the genuinely best weights...
+                    if test_loss < best_test_loss:
                         best_test_loss = test_loss
                         best_model = copy.deepcopy(self.model.state_dict())
                         best_epoch = epoch + 1
+
+                    # ...but only a materially better loss resets patience. On a
+                    # noisy plateau the run-to-run spread can exceed the total
+                    # remaining improvement, so bare `<` keeps finding new minima
+                    # and early stopping never fires.
+                    if test_loss < patience_ref * (1.0 - min_delta):
+                        patience_ref = test_loss
                         early_stop_counter = 0
                     else:
                         early_stop_counter += 1
-                        if early_stop_counter >= self.config['model_params']['patience']:
-                            logger.info(f'Early stopping at epoch {epoch+1}')
+                        # once the scheduler has bottomed out there is nothing
+                        # left to wait for, so allow a shorter fuse there
+                        at_lr_floor = new_lr <= lr_min * 1.001
+                        eff_patience = (lr_floor_patience
+                                        if (at_lr_floor and lr_floor_patience is not None)
+                                        else self.config['model_params']['patience'])
+                        if early_stop_counter >= eff_patience:
+                            reason = 'at LR floor' if (at_lr_floor and lr_floor_patience is not None) else ''
+                            logger.info(f'Early stopping at epoch {epoch+1} {reason}'.rstrip())
                             self.model.load_state_dict(best_model)
-                            logger.info(f'Best model loaded from epoch {best_epoch}, with test loss: {best_test_loss:.4f}')
+                            logger.info(f'Best model loaded from epoch {best_epoch}, with test loss: {best_test_loss:.6e}')
                             break
 
                     if (epoch + 1) % CHECKPOINT_INTERVAL == 0:
@@ -1110,7 +1331,14 @@ class runner(nn.Module):
 
                 best_flag = 'X' if (epoch + 1) == best_epoch else ' '
                 checkpoint_flag = 'X' if (epoch + 1) % CHECKPOINT_INTERVAL == 0 else ' '
-                logger.info(f"| Epoch: {epoch+1:<4}/{self.config['model_params']['num_epochs']:<4} | Train Loss: {losses[-1]:7.4f} | Test Loss: {test_losses[-1]:7.4f} | Best: {best_flag:<1} | Patience: {early_stop_counter:<3}/{self.config['model_params']['patience']} | Checkpoint: {checkpoint_flag:<1} | LR: {new_lr:.2e} | Time: {(time.time() - start_time)/60:10.2f} min |")
+                # pre-clip gradient norm: if this sits far above max_norm the clip is
+                # setting the step size, and loss changes cannot be compared meaningfully
+                if (epoch - first_epoch) % EPOCH_HEADER_INTERVAL == 0:
+                    for line in self._epoch_header(train_terms):
+                        logger.info(line)
+                logger.info(self._epoch_row(
+                    epoch, losses[-1], test_losses[-1], best_flag, early_stop_counter,
+                    checkpoint_flag, new_lr, train_terms, (time.time() - start_time) / 60))
 
             end_time = time.time()
             logger.info('\n\nTime taken for training: %s minutes', (end_time - start_time) / 60)
@@ -1521,6 +1749,76 @@ class runner(nn.Module):
                         batch_size=self.config['latent_params'].get('batch_size', 100)
                     )
 
+    def _codec_reference(self, name, source_group, ids):
+        """Reconstruct the TRUE latent coefficients over `ids`, cached to disk.
+
+        Comparing a predicted field's spectrum against raw ground truth is
+        dominated by the latent codec, not the model: the DLS round trip alone
+        injects broadband high-k energy at the element boundaries (measured at
+        ~4e5x the true high-k energy on the LDC config, with zero model error).
+        Scoring against this round trip instead isolates the model's own
+        contribution. Returns the path to a Q_rec-format file, or None if it
+        could not be built.
+        """
+        ref_path = os.path.join(
+            self.paths_bib.pred_dir, f"{name}_{source_group}_codec_ref_rec.h5")
+        if os.path.exists(ref_path):
+            return ref_path
+        try:
+            idx = np.asarray(ids)
+            with h5py.File(self.paths_bib.latent_path, 'r') as f:
+                dof_u = f[name]['dof_u'][idx, :]
+                dof_v = f[name]['dof_v'][idx, :]
+                dof_w = f[name]['dof_w'][idx, :] if self.dim == 3 else None
+            batch = self.config['latent_params'].get('batch_size', 100)
+            if self.config['latent_params']['type'] == 'pod':
+                pod.pod_recon(rec_target=ref_path, config=self.l_config, dof_u=dof_u,
+                              dof_v=dof_v, dof_w=dof_w, batch_size=batch)
+            elif self.dim == 3:
+                self.dls.gfem_recon_flexible(rec_target=ref_path, config=self.l_config,
+                                             dof_u=dof_u, dof_v=dof_v, dof_w=dof_w,
+                                             batch_size=batch)
+            else:
+                self.dls.gfem_recon_flexible(rec_target=ref_path, config=self.l_config,
+                                             dof_u=dof_u, dof_v=dof_v, batch_size=batch)
+            logger.info(f"Codec reference reconstruction written to {ref_path}")
+            return ref_path
+        except Exception:
+            logger.exception("Could not build codec reference for %s %s", name, source_group)
+            return None
+
+    def _save_metrics(self, name, source_group, scalars, arrays=None):
+        """Persist one evaluation's scalars and time series to metrics_dir.
+
+        eval() previously emitted numbers only through logger.info, so runs
+        could not be compared after the fact. The loss and rollout config are
+        stamped in so a metrics file identifies the run that produced it.
+        """
+        import json
+        os.makedirs(self.paths_bib.metrics_dir, exist_ok=True)
+        stem = os.path.join(self.paths_bib.metrics_dir, f"{name}_{source_group}")
+        mp = self.config['model_params']
+        record = {
+            'name': self.config.get('name'),
+            'latent_id': self.paths_bib.latent_id,
+            'model_type': mp.get('model_type'),
+            'train_ahead': mp.get('train_ahead'),
+            'loss': mp.get('loss', 'mse'),
+            'rollout': mp.get('rollout', {'mode': 'detached'}),
+            'grad_clip': mp.get('grad_clip', GRAD_CLIP_MAX_NORM),
+            'metrics': {k: (None if v is None else float(v)) for k, v in scalars.items()},
+        }
+        with open(stem + '.json', 'w') as f:
+            json.dump(record, f, indent=2)
+        if arrays:
+            with h5py.File(stem + '.h5', 'w') as f:
+                for key, val in arrays.items():
+                    f.create_dataset(key, data=np.asarray(val))
+        logger.info(f"{'#'*20} Metrics for {name} {source_group} {'#'*20}")
+        for key, val in scalars.items():
+            logger.info(f"  {key:<28} {val:.6g}" if val is not None else f"  {key:<28} n/a")
+        logger.info(f"Metrics saved to {stem}.json")
+
     def eval(self) -> None:
         """Evaluate predictions against ground truth for all sets in config['eval_data'], save metrics and plots."""
         
@@ -1586,6 +1884,21 @@ class runner(nn.Module):
                 pl.plot_slice_compare(self, rec_path, gt_path, name, ids, 99)
 
             pl.plot_horizon_errors(self, rec_path, gt_path, name, source_group)
+
+            # rollout statistics: whether the prediction still behaves like the
+            # right flow after its trajectory has decorrelated
+            scalars = {}
+            try:
+                scalars.update(pl.plot_energy_retention(self, rec_path, gt_path, name, source_group, ids))
+                scalars.update(pl.plot_field_error_vs_time(self, rec_path, gt_path, name, source_group, ids))
+                ref_path = self._codec_reference(name, source_group, ids)
+                scalars.update(pl.plot_energy_spectrum(self, rec_path, gt_path, name, source_group, ids,
+                                                       ref_path=ref_path))
+                scalars.update(pl.plot_velocity_pdf(self, rec_path, gt_path, name, source_group, ids))
+                scalars.update(pl.plot_autocorrelation(self, rec_path, gt_path, name, source_group, ids))
+            except Exception:
+                logger.exception("Rollout statistics failed for %s %s", name, source_group)
+            self._save_metrics(name, source_group, scalars)
 
 
 
