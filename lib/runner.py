@@ -7,7 +7,6 @@ import copy
 
 import numpy as np
 import torch
-from torchinfo import summary
 from torch import nn
 from tqdm import tqdm
 import time
@@ -18,6 +17,7 @@ import lib.models as models
 import lib.datas as datas
 import lib.decode as decode
 import lib.losses as losses
+import lib.multistart as multistart
 import lib.plotting as pl
 from lib.metrics import l2_err_norm
 
@@ -32,7 +32,7 @@ LR_FLOOR_PATIENCE = 20
 CHECKPOINT_INTERVAL = 5
 # Reprint the training-table header every N epochs so a long log stays readable.
 EPOCH_HEADER_INTERVAL = 25
-MAX_ERROR_HORIZONS = 30
+MAX_ERROR_HORIZONS = 100
 
 
 class _RolloutAdapter:
@@ -335,7 +335,8 @@ class runner(nn.Module):
                         if data_name not in snaps[data_source]:
                             snaps[data_source][data_name] = {}
                         
-                        snaps[data_source][data_name]['total'] = f[data_name]['dof_u'].shape[0]
+                        snaps[data_source][data_name]['total'] = self._limit_snapshots(
+                            f[data_name]['dof_u'].shape[0], source, data_name)
                         logger.info(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]['total']}")
 
                         if data_source == 'train_data':
@@ -369,6 +370,28 @@ class runner(nn.Module):
         self.config['model_params']['input_dim'] = input_dim
         self.indices = snaps
             
+
+    def _limit_snapshots(self, total, source, name):
+        """Cap how much of a record is used, per data source.
+
+        ``max_snapshots`` (a count) and ``snapshot_frac`` (a fraction) both take
+        the LEADING snapshots, so the series stays contiguous and the temporal
+        train/test/prediction splits below keep their meaning. For a record far
+        larger than the dynamics need, this bounds training volume without
+        re-generating the latent space. The limit applies to the splits, not to
+        latent compression, which still processes the file it is handed.
+        """
+        limit = total
+        frac = source.get('snapshot_frac')
+        if frac is not None:
+            limit = min(limit, max(1, int(round(total * float(frac)))))
+        cap = source.get('max_snapshots')
+        if cap is not None:
+            limit = min(limit, int(cap))
+        if limit < total:
+            logger.info("Limiting '%s' to %d of %d snapshots (%.1f%%)",
+                        name, limit, total, limit / total * 100)
+        return limit
 
     def _split_indices(self, total_snaps, train_split=0.8, test_split=0.1, sample_train=0, sample_test=0):
         # find indices for train, test, and validation sets
@@ -461,6 +484,9 @@ class runner(nn.Module):
                         context_window=mp.get('context_window', 1),
                         num_context_tokens=mp.get('num_context_tokens', 0),
                         causal=mp.get('causal', True),
+                        context_dim=(None if self._pod_context() is None
+                                     else self._pod_context().shape[1]),
+                        residual=mp.get('residual', False),
                         )
         elif self.config['model_params']['model_type'] == 'tr_spatial':
             mp = self.config['model_params']
@@ -499,6 +525,7 @@ class runner(nn.Module):
                 input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim'])
 
             if self.config['model_params']['model_type'] not in ('tr_encdec', 'tr_spatial'):
+                from torchinfo import summary
                 model_summary = summary(self.model, input_size=input_size, verbose=0)
                 logger.info("Model summary:\n%s", model_summary)
 
@@ -524,6 +551,20 @@ class runner(nn.Module):
             mp_ = self.config['model_params']
             self.criterion = losses.build_loss(mp_.get('loss', 'mse'))
             self.rollout_cfg = self._rollout_config()
+            self.loss_plan = losses.plan(self.criterion)
+            if self.loss_plan.needs_trajectory:
+                ta = mp_.get('train_ahead', 1)
+                if ta < self.loss_plan.min_train_ahead:
+                    raise ValueError(
+                        f"the loss needs train_ahead >= {self.loss_plan.min_train_ahead}, "
+                        f"config has {ta}")
+                if self.rollout_cfg['mode'] != 'bptt':
+                    raise ValueError(
+                        "trajectory loss terms need rollout.mode = 'bptt'; under "
+                        "'detached' the rollout graph is cut and they would "
+                        "contribute no gradient")
+                logger.info("Trajectory loss terms: %d (scored once per rollout)",
+                            len(self.loss_plan.traj_terms))
             self.last_grad_norm = float('nan')
             self.last_skipped = 0
             self.last_steps = 0
@@ -644,6 +685,7 @@ class runner(nn.Module):
                            "falling back to the latent metric.")
             return
         self.criterion = losses.MetricLoss(self.criterion, metric).to(self.device)
+        self.loss_plan = losses.plan(self.criterion)
         logger.info(f"Loss re-expressed in field-energy coordinates: {self.criterion}")
 
 
@@ -816,6 +858,38 @@ class runner(nn.Module):
                         pickle.dump((self.dof_mean, self.dof_std), pkl_f)
 
 
+    def _pod_context(self):
+        """Global POD coefficients used as the encoder context, or None.
+
+        ``latent_params.pod_context`` names the companion file from
+        scripts/pod_decompose.py; ``pod_context_coeffs`` picks 'coeffs' (true)
+        or 'coeffs_pred' (forecast). The same K numbers are shown to every
+        element, so the encoder reads a genuinely global state at a fraction of
+        the width of the reassembled DOF tokens it would otherwise build -- and
+        one an isolated element cannot infer for itself.
+        """
+        if getattr(self, '_pod_ctx_cache', None) is not None:
+            return self._pod_ctx_cache
+        stem = self.config['latent_params'].get('pod_context')
+        if not stem:
+            return None
+        path = self.paths_bib.data_dir + stem + '.h5'
+        if not os.path.exists(path):
+            logger.warning("pod_context file %s not found; using DOF tokens", path)
+            return None
+        key = self.config['latent_params'].get('pod_context_coeffs', 'coeffs')
+        with h5py.File(path, 'r') as f:
+            if key not in f:
+                logger.warning("pod_context_coeffs '%s' missing; using 'coeffs'", key)
+                key = 'coeffs'
+            arr = f[key][:].astype(np.float32)
+        mu, sd = arr.mean(0), arr.std(0)
+        sd = np.clip(sd, sd.mean() * 1e-6, None)
+        self._pod_ctx_cache = (arr - mu) / sd
+        logger.info("Encoder context: POD '%s' from %s, %d modes",
+                    key, os.path.basename(path), arr.shape[1])
+        return self._pod_ctx_cache
+
     def _rollout_config(self) -> dict:
         """Normalize model_params.rollout. Absent means today's detached behavior.
 
@@ -825,12 +899,16 @@ class runner(nn.Module):
         checkpoint  gradient-checkpoint each model call: ~+33% forward cost for
                     O(1) activation memory in the rollout depth
         ramp_epochs grow backprop depth 1 -> train_ahead over this many epochs
+        noise_std   stddev of Gaussian noise added to the fed-back state during
+                    training only; 0 (default) is the historical behavior. In
+                    normalized DOF units, so ~0.01-0.05 is a small perturbation.
         """
         ro = dict(self.config['model_params'].get('rollout', {}))
         ro.setdefault('mode', 'detached')
         ro.setdefault('chunk', 0)
         ro.setdefault('checkpoint', False)
         ro.setdefault('ramp_epochs', 0)
+        ro.setdefault('noise_std', 0.0)
         if ro['mode'] not in ('detached', 'bptt'):
             raise ValueError(
                 f"rollout.mode '{ro['mode']}' not recognized. Use 'detached' or 'bptt'.")
@@ -844,7 +922,10 @@ class runner(nn.Module):
             geom = self._elem_geometry()
             coords = geom['coords']
             # scheduled sampling perturbs the encoder context only while training
-            ss_p = self._ss_prob(epoch) if train else 0.0
+            # scheduled sampling refreshes the context from the model's own
+            # reassembled DOFs; with a POD context there is nothing to refresh
+            ss_p = (self._ss_prob(epoch)
+                    if (train and self._pod_context() is None) else 0.0)
 
             def unpack(batch):
                 inputs, targets, tokens, _ = batch
@@ -916,6 +997,8 @@ class runner(nn.Module):
 
         total = 0.0
         chunk_loss = None
+        collect = train and self.loss_plan.needs_trajectory
+        traj_p, traj_t = [], []
         for n in range(steps):
             target = targets.select(t_ax, n)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -927,13 +1010,18 @@ class runner(nn.Module):
                 loss = self.criterion(outputs, target)
             # accumulate as a float: holding the tensor would pin its autograd graph
             total += float(loss.detach())
+            if collect:
+                traj_p.append(outputs)
+                traj_t.append(target)
             self._accumulate_terms()
 
             did_backward = False
             if train:
                 if bptt:
                     chunk_loss = loss if chunk_loss is None else chunk_loss + loss
-                    if (n + 1) % chunk == 0 or (n + 1) == steps:
+                    # with trajectory terms the graph must survive to the end of
+                    # the rollout, so the single backward is deferred past the loop
+                    if not collect and ((n + 1) % chunk == 0 or (n + 1) == steps):
                         self.scaler.scale(chunk_loss).backward()
                         chunk_loss = None
                         did_backward = True
@@ -944,12 +1032,34 @@ class runner(nn.Module):
             # carry the graph forward only while it is still alive; backward()
             # frees it, so the window must be detached at every chunk boundary
             carry = outputs if (not train or (bptt and not did_backward)) else outputs.detach()
+            # optional noise on the fed-back state only -- never on the output
+            # the loss scores. The spatial rollout is already free-running, so
+            # this is not teacher forcing; it teaches the map to contract its
+            # own perturbations, which is what extends the stable horizon. The
+            # noise carries no gradient, so a live BPTT graph through `carry`
+            # is unaffected.
+            if train and ro['noise_std'] > 0.0:
+                carry = carry + torch.randn_like(carry) * ro['noise_std']
             inputs = torch.cat(
                 (inputs.narrow(t_ax, 1, window - 1), carry.unsqueeze(t_ax)), dim=t_ax)
             if bptt and did_backward:
                 inputs = inputs.detach()
             if adapter.after_step is not None:
                 adapter.after_step(outputs, state)
+
+        if collect and traj_p:
+            # (B, ta, F) or (B, E, ta, F) -> always (B, S, ta, F)
+            tp = torch.stack(traj_p, dim=t_ax)
+            tt = torch.stack(traj_t, dim=t_ax)
+            if t_ax == 1:
+                tp, tt = tp.unsqueeze(1), tt.unsqueeze(1)
+            with torch.autocast(device_type="cuda", enabled=False):
+                extra = losses.deferred_loss(self.criterion, tp.float(), tt.float())
+            if extra is not None:
+                total += float(extra.detach()) * steps
+                chunk_loss = extra if chunk_loss is None else chunk_loss + extra
+        if train and chunk_loss is not None:
+            self.scaler.scale(chunk_loss).backward()
 
         grad_norm = None
         if train:
@@ -1193,12 +1303,15 @@ class runner(nn.Module):
                 if self.dim == 3:
                     dof_comps.append(torch.from_numpy(dof_w[:]).float())
 
+                pod_ctx = self._pod_context()
                 train_set = datas.LocalGlobalDataset(
                     dof_comps, lltogl_cpu, train_indices, tl, ta,
-                    self.dof_mean[name], self.dof_std[name], cw, ct)
+                    self.dof_mean[name], self.dof_std[name], cw, ct,
+                    pod_context=pod_ctx)
                 test_set = datas.LocalGlobalDataset(
                     dof_comps, lltogl_cpu, test_indices, tl, ta,
-                    self.dof_mean[name], self.dof_std[name], cw, ct)
+                    self.dof_mean[name], self.dof_std[name], cw, ct,
+                    pod_context=pod_ctx)
 
                 if self.config['distributed']:
                     self.train_loader[name], self.sampler[name] = datas.make_group_dataloader(
@@ -1382,14 +1495,16 @@ class runner(nn.Module):
         # logger.info(f"Precomputed lltogl_mat shape: {lltogl_mat.shape}")
         return lltogl_mat
 
-    def _predict_dofs_forward(self, name, dof_u, dof_v, dof_w=None, total_steps=None):
+    def _predict_dofs_forward(self, name, dof_u, dof_v, dof_w=None, total_steps=None,
+                              ids=None):
         """
         Predict dof_u/dof_v(/dof_w) forward in time from initial conditions.
         Inputs dof_u/dof_v(/dof_w) are expected to contain at least `time_lag` snapshots.
         Returns full predicted trajectories with shape (total_steps, num_dofs).
         """
         if self.config['model_params']['model_type'] == 'tr_encdec':
-            return self._predict_dofs_forward_encdec(name, dof_u, dof_v, dof_w, total_steps)
+            return self._predict_dofs_forward_encdec(name, dof_u, dof_v, dof_w,
+                                                     total_steps, ids)
         if self.config['model_params']['model_type'] == 'tr_spatial':
             return self._predict_dofs_forward_spatial(name, dof_u, dof_v, dof_w, total_steps)
         time_lag = self.config['model_params']['time_lag']
@@ -1475,7 +1590,8 @@ class runner(nn.Module):
 
         return dof_u_pred, dof_v_pred, dof_w_pred
 
-    def _predict_dofs_forward_encdec(self, name, dof_u, dof_v, dof_w=None, total_steps=None):
+    def _predict_dofs_forward_encdec(self, name, dof_u, dof_v, dof_w=None,
+                                     total_steps=None, ids=None):
         """Two-timescale autoregressive rollout for the encdec model.
 
         Local dynamics advance every step; the global context is re-encoded from the
@@ -1509,6 +1625,18 @@ class runner(nn.Module):
         init = (np.concatenate(comps, axis=2) - mean_np) / std_np  # (tl, E, F)
         dof_input = torch.from_numpy(init).float().permute(1, 0, 2).unsqueeze(0).to(self.device)  # (1, E, tl, F)
 
+        pod_ctx = self._pod_context()
+        if pod_ctx is not None and ids is None:
+            raise ValueError("a POD encoder context needs the absolute snapshot ids "
+                             "of the prediction window")
+
+        def pod_tokens(step):
+            """Context tokens at rollout position `step` (0 = first seeded frame)."""
+            end = step + (time_lag if ct == 'window_end' else cw)
+            rows = np.asarray(ids)[max(0, end - cw):end]
+            ctx = torch.from_numpy(pod_ctx[rows].reshape(-1)).float().to(self.device)
+            return ctx.view(1, 1, -1).expand(1, num_elems, ctx.numel())
+
         def window_tokens(window):
             frames = window[:, :, -cw:, :] if ct == 'window_end' else window[:, :, :cw, :]
             return frames.reshape(1, num_elems, cw * frames.shape[-1])
@@ -1520,17 +1648,23 @@ class runner(nn.Module):
         predictions[:, :time_lag, :] = dof_input[0].cpu().numpy()
 
         with torch.no_grad():
-            context = model.encode(window_tokens(dof_input), coords)
+            context = model.encode(
+                pod_tokens(0) if pod_ctx is not None else window_tokens(dof_input), coords)
             for t in range(total_steps - time_lag):
                 output = model.decode(dof_input, context)  # (1, E, F)
                 predictions[:, t + time_lag, :] = output[0].cpu().numpy()
                 dof_input = torch.cat((dof_input[:, :, 1:, :], output.unsqueeze(2)), dim=2)
                 if (t + 1) % global_K == 0 and (t + 1) < total_steps - time_lag:
-                    frames = dof_input[:, :, -cw:, :] if ct == 'window_end' else dof_input[:, :, :cw, :]
-                    re = torch.stack(
-                        [self._reassemble_tokens(frames[:, :, i, :], name, geom) for i in range(cw)],
-                        dim=2)
-                    context = model.encode(re.reshape(1, num_elems, cw * F_dim), coords)
+                    if pod_ctx is not None:
+                        # the global branch supplies its own forecast; nothing is
+                        # reassembled from the local predictions
+                        context = model.encode(pod_tokens(t + 1), coords)
+                    else:
+                        frames = dof_input[:, :, -cw:, :] if ct == 'window_end' else dof_input[:, :, :cw, :]
+                        re = torch.stack(
+                            [self._reassemble_tokens(frames[:, :, i, :], name, geom) for i in range(cw)],
+                            dim=2)
+                        context = model.encode(re.reshape(1, num_elems, cw * F_dim), coords)
 
         predictions = predictions * std_np + mean_np
         return self._assemble_dof_preds(predictions, geom)
@@ -1636,6 +1770,7 @@ class runner(nn.Module):
 
             # long forward prediction of dofs
             dof_u_pred, dof_v_pred, dof_w_pred = self._predict_dofs_forward(
+                ids=val_id,
                 name=name,
                 dof_u=dof_u,
                 dof_v=dof_v,
@@ -1652,7 +1787,7 @@ class runner(nn.Module):
             logger.info(f"Predictions saved to {pred_path}")
             
             # Many short horizon predictions for error growth analysis
-            horizon = self.config['model_params'].get('horizon', 10)
+            horizon = self.config['model_params'].get('horizon', 30)
             max_horizons = MAX_ERROR_HORIZONS
             num_horizons = len(val_id) - time_lag - horizon + 1
             num_horizons = min(num_horizons, max_horizons)
@@ -1669,6 +1804,7 @@ class runner(nn.Module):
 
                     dof_u_pred_horizon, dof_v_pred_horizon, dof_w_pred_horizon = self._predict_dofs_forward(
                         name=name,
+                        ids=val_id[i:i + time_lag + horizon],
                         dof_u=dof_u_init,
                         dof_v=dof_v_init,
                         dof_w=dof_w_init,
@@ -1716,6 +1852,7 @@ class runner(nn.Module):
             name = source.get('name')
             source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
             pred_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred.h5'
+            ids = self.indices[source_group][name][split_key]
             logger.info(f"Reconstructing for {name} from {pred_path}...")
             with h5py.File(pred_path, 'r') as f:
                 dof_u_pred = f['dof_u'][:]
@@ -1748,6 +1885,58 @@ class runner(nn.Module):
                         dof_v=dof_v_pred,
                         batch_size=self.config['latent_params'].get('batch_size', 100)
                     )
+            self._add_global_pod(pred_path.replace('.h5', '_rec.h5'),
+                                 name, source_group, ids)
+
+    def _add_global_pod(self, rec_path, name, source_group, ids):
+        """Add the global POD field back onto a reconstructed DLS residual.
+
+        When the DLS source is a POD residual (scripts/pod_decompose.py) the
+        reconstruction holds only the fine-scale part, while evaluation scores
+        against the original field, so the global part must be restored:
+
+            u = mean + sum_i a_i(t) phi_i(x) + r(x,t)
+
+        ``latent_params.global_pod`` names the companion file with the modes and
+        coefficients. The mean stays subtracted, matching the convention that
+        Q_rec is a fluctuation field everywhere else.
+
+        The coefficients used are the *true* ones, so this scores the local
+        branch against a perfect global branch -- an upper bound on the hybrid,
+        which is what a first feasibility test wants.
+        """
+        stem = self.config['latent_params'].get('global_pod')
+        if not stem:
+            return
+        pod_path = self.paths_bib.data_dir + stem + '.h5'
+        if not os.path.exists(pod_path):
+            logger.warning("global_pod file %s not found; leaving the residual "
+                           "reconstruction unmodified.", pod_path)
+            return
+
+        # 'coeffs' are the true coefficients (an upper bound on the hybrid, since
+        # the global branch is then free); 'coeffs_pred' are a forecast from
+        # scripts/pod_forecast.py, which is the honest end-to-end configuration
+        key = self.config['latent_params'].get('global_pod_coeffs', 'coeffs')
+        with h5py.File(pod_path, 'r') as f:
+            if key not in f:
+                logger.warning("global_pod_coeffs '%s' not in %s; falling back to 'coeffs'",
+                               key, os.path.basename(pod_path))
+                key = 'coeffs'
+            modes = f['modes'][:]                    # (nx, ny[, nz], nv, K)
+            coeffs = f[key][:]                       # (num_snaps, K)
+        logger.info("Global POD branch: using '%s'", key)
+
+        with h5py.File(rec_path, 'r+') as f:
+            n_rec = f['Q_rec'].shape[0]
+            idx = np.asarray(ids)[:n_rec]
+            # rec row i is snapshot ids[i] (the seeded window included), so the
+            # same rows index the coefficient record
+            field = np.tensordot(coeffs[idx], modes, axes=([1], [modes.ndim - 1]))
+            crop = tuple(slice(0, n) for n in f['Q_rec'].shape[1:])
+            f['Q_rec'][:] = f['Q_rec'][:] + field[(slice(None),) + crop]
+        logger.info("Restored POD-%d global field onto %s",
+                    coeffs.shape[1], os.path.basename(rec_path))
 
     def _codec_reference(self, name, source_group, ids):
         """Reconstruct the TRUE latent coefficients over `ids`, cached to disk.
@@ -1846,7 +2035,10 @@ class runner(nn.Module):
             
             os.makedirs(self.paths_bib.pred_fig_dir, exist_ok=True)
             rec_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred_rec.h5'
-            gt_path = self.paths_bib.data_dir + source.get('path') + '.h5'
+            # with a POD-residual source the model trains on the residual
+            # but is scored against the original field
+            gt_stem = self.config['latent_params'].get('full_source', source.get('path'))
+            gt_path = self.paths_bib.data_dir + gt_stem + '.h5'
             logger.info(f"Evaluating for {name} between {rec_path} and {gt_path}...")
             
             # Compute metrics
@@ -1888,9 +2080,12 @@ class runner(nn.Module):
             # rollout statistics: whether the prediction still behaves like the
             # right flow after its trajectory has decorrelated
             scalars = {}
+            arrays = {}
             try:
-                scalars.update(pl.plot_energy_retention(self, rec_path, gt_path, name, source_group, ids))
-                scalars.update(pl.plot_field_error_vs_time(self, rec_path, gt_path, name, source_group, ids))
+                s, a = pl.plot_energy_retention(self, rec_path, gt_path, name, source_group, ids)
+                scalars.update(s); arrays.update(a)
+                s, a = pl.plot_field_error_vs_time(self, rec_path, gt_path, name, source_group, ids)
+                scalars.update(s); arrays.update(a)
                 ref_path = self._codec_reference(name, source_group, ids)
                 scalars.update(pl.plot_energy_spectrum(self, rec_path, gt_path, name, source_group, ids,
                                                        ref_path=ref_path))
@@ -1898,7 +2093,18 @@ class runner(nn.Module):
                 scalars.update(pl.plot_autocorrelation(self, rec_path, gt_path, name, source_group, ids))
             except Exception:
                 logger.exception("Rollout statistics failed for %s %s", name, source_group)
-            self._save_metrics(name, source_group, scalars)
+
+            # many short forecasts launched across the split: the across-forecast
+            # error and the persistence baseline a short-horizon task is judged on
+            if self.model is not None:
+                try:
+                    s, a = multistart.evaluate(self, name, ids)
+                    scalars.update(s); arrays.update(a)
+                    if a:
+                        pl.plot_multistart_errors(self, a['ms_err'], a['ms_persist'])
+                except Exception:
+                    logger.exception("Multi-start evaluation failed for %s %s", name, source_group)
+            self._save_metrics(name, source_group, scalars, arrays=arrays or None)
 
 
 

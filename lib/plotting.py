@@ -43,7 +43,20 @@ plt.rcParams['figure.constrained_layout.use'] = True
 
 
 def plot_loss(runner) -> None:
-    with open(runner.paths_bib.model_dir + 'losses.pkl', 'rb') as f:
+    # losses.pkl is only written when training finishes; fall back to the
+    # checkpoint so an interrupted run can still be evaluated
+    loss_path = runner.paths_bib.model_dir + 'losses.pkl'
+    if not os.path.exists(loss_path):
+        ckpt = runner.paths_bib.checkpoint_path
+        if not os.path.exists(ckpt):
+            logger.warning("No losses.pkl or checkpoint found; skipping loss plot.")
+            return
+        rec = torch.load(ckpt, map_location='cpu', weights_only=False)
+        with open(loss_path, 'wb') as f:
+            pickle.dump({'train_losses': rec['losses'],
+                         'test_losses': rec['test_losses']}, f)
+        logger.info("Recovered losses.pkl from the training checkpoint.")
+    with open(loss_path, 'rb') as f:
         results = pickle.load(f)
     size = 0.6
     plt.figure(figsize=(size*width,size*height))
@@ -608,12 +621,53 @@ def plot_horizon_errors(runner, rec_path: str, gt_path: str, name: str, source: 
     plt.savefig(os.path.join(runner.paths_bib.pred_fig_dir, 'horizon_errors.png'), dpi=300)
     plt.close()
 
+
+def plot_multistart_errors(runner, model_err: np.ndarray, persist_err: np.ndarray) -> None:
+    """Field error of many short forecasts launched across the split (lib/multistart).
+
+    Faint lines are individual forecasts; the band is one standard deviation
+    across forecasts at each step. Persistence (holding the last seed frame) is
+    the floor a useful forecast has to beat.
+    """
+    S, H = model_err.shape
+    t = np.arange(1, H + 1)
+    m_mean, m_std = model_err.mean(axis=0), model_err.std(axis=0)
+    p_mean = persist_err.mean(axis=0)
+    c_model = plt.get_cmap("tab10").colors[1]
+
+    size = 0.8
+    plt.figure(figsize=(size * width, size * height))
+    plt.plot(t, model_err.T, color=c_model, alpha=0.12, linewidth=0.6)
+    plt.fill_between(t, m_mean - m_std, m_mean + m_std, color=c_model, alpha=0.15,
+                     edgecolor='none', label=r'model $\pm 1\sigma$')
+    plt.plot(t, m_mean, color=c_model, linewidth=2, label='model mean')
+    plt.plot(t, p_mean, color='0.45', linewidth=1.5, linestyle='--', label='persistence')
+    # direct labels at the line ends, in text ink so identity is not color-alone
+    plt.text(t[-1], m_mean[-1], ' model', va='center', fontsize=8, color='0.15')
+    plt.text(t[-1], p_mean[-1], ' persistence', va='center', fontsize=8, color='0.15')
+    plt.xlim(1, H * 1.22)
+    plt.ylim(bottom=0)
+    # the margin past H only holds the end labels; keep ticks to the forecast range
+    ax = plt.gca()
+    ax.set_xticks([x for x in ax.get_xticks() if 1 <= x <= H])
+    plt.xlabel('forecast step')
+    plt.ylabel(r'$\|u-\hat u\|/\|u\|$')
+    plt.title(f'Multi-start forecast error ({S} starts)', pad=10)
+    plt.legend(frameon=False, fontsize=8, loc='upper left')
+    plt.grid(visible=True, linestyle='--', linewidth=0.5)
+    _save(runner, 'multistart_errors.png')
+
 ## ============================ Rollout statistics diagnostics ===============================
 # Pointwise error says how far the prediction drifted from the reference
 # trajectory; these say whether it still behaves like the right flow after it
 # has. That distinction is the whole point of scoring a chaotic rollout.
 
 _STAT_MAX_SNAPS = 128
+
+# Rollout steps at which per-horizon field/energy errors are reported, so a run
+# is scored inside the 30-snapshot challenge window and not only on the full
+# 500-step aggregates. The per-step series are dumped in full alongside these.
+_HORIZON_STEPS = (10, 30)
 
 
 def _pred_index(runner, rec_path, ids):
@@ -762,10 +816,18 @@ def plot_energy_retention(runner, rec_path, gt_path, name, source, ids):
     _save(runner, 'energy_retention.png')
 
     tail = max(1, len(rec) // 10)
-    return {
+    scalars = {
         'energy_retention_final': float(rec[-tail:].mean() / max(gt[-tail:].mean(), 1e-30)),
         'energy_retention_mean': float(rec.mean() / max(ref, 1e-30)),
     }
+    # instantaneous energy ratio at the challenge horizons (ideal 1.0)
+    for h in _HORIZON_STEPS:
+        if h < len(rec):
+            scalars[f'energy_retention_at{h}'] = float(rec[h] / max(gt[h], 1e-30))
+    # the two plotted curves, both normalized by the true mean energy, so the
+    # retention trace can be replotted or compared across runs after the fact
+    arrays = {'tke_rec_t': rec / ref, 'tke_gt_t': gt / ref}
+    return scalars, arrays
 
 
 def plot_field_error_vs_time(runner, rec_path, gt_path, name, source, ids):
@@ -792,9 +854,20 @@ def plot_field_error_vs_time(runner, rec_path, gt_path, name, source, ids):
     _save(runner, 'field_error_vs_time.png')
 
     tail = max(1, len(err) // 10)
-    return {'field_l2_mean': float(err.mean()),
-            'field_l2_final': float(err[-tail:].mean()),
-            'field_l2_first': float(err[0])}
+    scalars = {'field_l2_mean': float(err.mean()),
+               'field_l2_final': float(err[-tail:].mean()),
+               'field_l2_first': float(err[0])}
+    # per-horizon values at the challenge window, so a run is scored where it
+    # is actually used rather than only over the full 500-step rollout, whose
+    # aggregates are dominated by late-time blow-up
+    for h in _HORIZON_STEPS:
+        if h < len(err):
+            scalars[f'field_l2_at{h}'] = float(err[h])
+    # first step the prediction fully decorrelates (crosses sqrt(2)); -1 if it
+    # never does over the measured rollout
+    crossed = np.argmax(err > np.sqrt(2))
+    scalars['field_l2_decorr_step'] = int(crossed) if err[crossed] > np.sqrt(2) else -1
+    return scalars, {'field_l2_t': err}
 
 
 def plot_velocity_pdf(runner, rec_path, gt_path, name, source, ids):

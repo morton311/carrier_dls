@@ -1,0 +1,61 @@
+{
+    "model_params": {
+        "model_name": "challenge",
+        "model_type": "tr_enc",
+        "time_lag": 24,
+        "train_ahead": 8,
+        "num_layers": 4,
+        "nhead": 4,
+        "d_model": 128,
+        "ff_dim": 384,
+        "lr": 0.0005,
+        "lr_factor": 0.5,
+        "lr_min": 1e-06,
+        "lr_patience": 5,
+        "grad_clip": 1.0,
+        "loss": "mse",
+        "batch_size": 32,
+        "num_epochs": 120,
+        "patience": 50,
+        "activation": "swiglu",
+        "prenorm": true,
+        "rollout": {
+            "mode": "bptt",
+            "chunk": 0,
+            "checkpoint": false,
+            "ramp_epochs": 5
+        },
+        "es_min_delta": 0.01,
+        "lr_floor_patience": 20,
+        "loss_metric": "gram",
+        "norm": "per_dof",
+        "amp_growth_interval": 10000
+    },
+    "latent_params": {
+        "type": "dls",
+        "patch_size": 13,
+        "num_modes": 5,
+        "localized": false,
+        "source_name": "cavity_res25",
+        "source_path": "Challenge2_1_train_pod25_residual",
+        "batch_size": 1000,
+        "global_pod": "Challenge2_1_train_pod25_global",
+        "full_source": "Challenge2_1_train",
+        "global_pod_coeffs": "coeffs_pred"
+    },
+    "train_data": [
+        {
+            "name": "cavity_res25",
+            "path": "Challenge2_1_train_pod25_residual",
+            "train_split": 0.9,
+            "test_split": 0.1
+        }
+    ],
+    "eval_data": [
+        {
+            "name": "cavity_res25",
+            "path": "Challenge2_1_train_pod25_residual",
+            "pred_split": 0.1
+        }
+    ]
+}

@@ -422,7 +422,8 @@ def gfem_compress_flexible(
     dls_config: Optional[dls_long_Config_Flexible] = None
 ):
     """
-    Flexible variant of gfem_3d_long.
+    Flexible variant of dls compression function prior.
+    Accepts either a HDF5 file or a dictionary of in-memory arrays as input, and can return the compressed degrees of freedom (dof) either in-memory or written to an HDF5 file.
 
     data_source:
       - str path to an HDF5 file

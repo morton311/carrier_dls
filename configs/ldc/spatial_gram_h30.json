@@ -1,0 +1,70 @@
+{
+    "model_params": {
+        "model_name": "spatial_tr",
+        "model_type": "tr_spatial",
+        "time_lag": 4,
+        "train_ahead": 30,
+        "num_layers": 4,
+        "nhead": 4,
+        "d_model": 256,
+        "ff_dim": 768,
+        "coord_freqs": 6,
+        "residual": true,
+        "reassemble": true,
+        "lr": 1e-03,
+        "lr_factor": 0.5,
+        "lr_min": 1e-06,
+        "lr_patience": 10,
+        "grad_clip": 1.0,
+        "batch_size": 64,
+        "num_epochs": 5000,
+        "patience": 30,
+        "activation": "swiglu",
+        "prenorm": true,
+        "rollout": {
+            "mode": "bptt",
+            "chunk": 10,
+            "checkpoint": true,
+            "ramp_epochs": 40,
+            "noise_std": 0.02
+        },
+        "es_min_delta": 0.005,
+        "lr_floor_patience": 40,
+        "loss_metric": "gram",
+        "loss": {"type": "combo", "terms": [
+            {"type": "mse"},
+            {"type": "traj_energy", "weight": 0.1},
+            {"type": "traj_var",    "weight": 0.1},
+            {"type": "traj_dt",     "weight": 0.1}
+        ]},
+        "norm": "per_dof",
+        "amp_growth_interval": 10000
+    },
+    "latent_params": {
+        "type": "dls",
+        "patch_size": 99,
+        "num_modes": 10,
+        "localized": true,
+        "source_name": "ldc_15k",
+        "source_path": "ldc_15k",
+        "batch_size": 250,
+        "skipx": 1,
+        "skipy": 1,
+        "skipz": 1
+    },
+    "train_data": [
+        {
+            "name": "ldc_15k",
+            "path": "ldc_15k",
+            "train_split": 0.8,
+            "test_split": 0.1
+        }
+    ],
+    "eval_data": [
+        {
+            "name": "ldc_15k",
+            "path": "ldc_15k",
+            "pred_split": 0.2
+        }
+    ]
+}

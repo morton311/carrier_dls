@@ -127,6 +127,7 @@ class LocalGlobalDataset(torch.utils.data.Dataset):
         std: torch.Tensor,
         context_window: int = 1,
         context_time: str = 'window_start',
+        pod_context=None,
     ):
         if context_window > time_lag:
             raise ValueError("context_window must be <= time_lag")
@@ -141,6 +142,10 @@ class LocalGlobalDataset(torch.utils.data.Dataset):
         self.std = std
         self.context_window = context_window
         self.context_time = context_time
+        # (num_snaps, K) global coefficients; when given, the encoder sees these
+        # broadcast to every element instead of the element's own DOFs
+        self.pod_context = (None if pod_context is None
+                            else torch.as_tensor(pod_context, dtype=torch.float32))
 
     def __len__(self) -> int:
         return len(self.t0_list)
@@ -156,7 +161,14 @@ class LocalGlobalDataset(torch.utils.data.Dataset):
         X = block[:tl].permute(1, 0, 2)
         Y = block[tl:tl + ta].permute(1, 0, 2)
         c0 = 0 if self.context_time == 'window_start' else tl - cw
-        tok = block[c0:c0 + cw].permute(1, 0, 2).reshape(block.shape[1], -1)
+        n_elem = block.shape[1]
+        if self.pod_context is None:
+            tok = block[c0:c0 + cw].permute(1, 0, 2).reshape(n_elem, -1)
+        else:
+            # the same global state at every element; the encoder's coordinate
+            # embedding is what distinguishes one element position from another
+            ctx = self.pod_context[t0 + c0:t0 + c0 + cw].reshape(-1)
+            tok = ctx.unsqueeze(0).expand(n_elem, -1).contiguous()
         return X, Y, tok, t0
 
 

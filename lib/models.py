@@ -421,14 +421,23 @@ class GlobalLocalTransformer(nn.Module):
     encode: element tokens (G, E, context_window*input_dim) + coords (E, spatial_dim)
             -> context (G, S, d_model), refreshed on the slow global timescale.
     decode: local windows (G, E, time_lag, input_dim) + context -> next step (G, E, input_dim).
+
+    With `residual` the head predicts the increment on the last frame instead of
+    the whole next state. On the LDC cavity the field moves ~2% of its norm per
+    step, so a direct head spends its error budget re-synthesizing a frame it
+    was handed (one-step floor ~9%); an increment head only has to get the 2%.
     """
     def __init__(self, time_lag, input_dim, d_model=256, ff_dim=1024, nhead=4, num_layers=4,
                  enc_num_layers=2, enc_nhead=4, enc_ff_dim=1024, activation='swiglu',
                  pre_norm=True, spatial_dim=2, num_freqs=6, context_window=1,
-                 num_context_tokens=0, causal=True):
+                 num_context_tokens=0, causal=True, context_dim=None, residual=False):
         super().__init__()
+        # context_dim lets the encoder read something other than the local DOFs
+        # -- e.g. global POD coefficients broadcast to every element, which is a
+        # genuinely global state at a fraction of the width
+        self.context_dim = context_dim if context_dim is not None else input_dim
         self.encoder = SpatialEncoder(
-            token_dim=input_dim * context_window, d_model=d_model, nhead=enc_nhead,
+            token_dim=self.context_dim * context_window, d_model=d_model, nhead=enc_nhead,
             num_layers=enc_num_layers, ff_dim=enc_ff_dim, activation=activation,
             pre_norm=pre_norm, spatial_dim=spatial_dim, num_freqs=num_freqs,
             num_context_tokens=num_context_tokens,
@@ -440,6 +449,12 @@ class GlobalLocalTransformer(nn.Module):
             for _ in range(num_layers)
         ])
         self.fc = nn.Linear(d_model, input_dim)
+        self.residual = residual
+        if residual:
+            # start as exact persistence and learn corrections from there; the
+            # gradient into fc is nonzero, so this only fixes the starting point
+            nn.init.zeros_(self.fc.weight)
+            nn.init.zeros_(self.fc.bias)
         if causal:
             mask = torch.triu(torch.ones(time_lag, time_lag, dtype=torch.bool), diagonal=1)
             self.register_buffer('causal_mask', mask)
@@ -455,7 +470,10 @@ class GlobalLocalTransformer(nn.Module):
         h = self.positional_encoding(h.reshape(G * E, tl, -1)).reshape(G, E, tl, -1)
         for layer in self.decoder_layers:
             h = layer(h, context, attn_mask=self.causal_mask)
-        return self.fc(h[:, :, -1, :])
+        out = self.fc(h[:, :, -1, :])
+        if self.residual:
+            out = out + x[:, :, -1, :]
+        return out
 
     def forward(self, x, tokens, coords):
         return self.decode(x, self.encode(tokens, coords))

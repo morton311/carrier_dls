@@ -40,11 +40,16 @@ class dls_long_Config_Flexible:
     modemat_local_v: np.ndarray
 
     def __post_init__(self) -> None:
-        self.nskip = (self.patch_size - 1) // 2
-        self.nskip_sample = self.patch_size - 1
+        self.patch_x, self.patch_y = patch_dims(self.patch_size)
+        self.nskip_x = (self.patch_x - 1) // 2
+        self.nskip_y = (self.patch_y - 1) // 2
+        self.nskip = self.nskip_x            # legacy alias (square patches)
+        self.nskip_sample = self.patch_x - 1
         self.mid_pt = 1 + self.nskip_sample // 2
-        self.sample_x = range(0, self.nx, self.nskip)
-        self.sample_y = range(0, self.ny, self.nskip)
+        self.mid_pt_x = self.nskip_x + 1
+        self.mid_pt_y = self.nskip_y + 1
+        self.sample_x = range(0, self.nx, self.nskip_x)
+        self.sample_y = range(0, self.ny, self.nskip_y)
         self.nx_t = max(self.sample_x) + 1
         self.ny_t = max(self.sample_y) + 1
         self.nx_g = len(self.sample_x)
@@ -57,7 +62,7 @@ class dls_long_Config_Flexible:
             self.num_vars * self.num_snaps * self.nx * self.ny
             / (
                 self.num_vars * self.num_snaps * self.dof_node
-                + self.num_vars * self.num_modes * self.patch_size**2
+                + self.num_vars * self.num_modes * self.patch_x * self.patch_y
             )
         )
 
@@ -68,8 +73,32 @@ def node_map(opp=False) -> np.ndarray:
     return IJK
 
 
-def _build_wt_vec(nskip: int) -> np.ndarray:
-    Wt = np.ones((nskip+1, nskip+1))
+def patch_dims(patch_size):
+    """Normalize ``patch_size`` to (nx, ny).
+
+    An int keeps the historical square patch; a pair gives a rectangular one,
+    which lets the element aspect follow the structures being resolved (an
+    elongated shear layer wants patches elongated the same way) instead of
+    spending local modes resolving a homogeneous direction.
+    """
+    if np.isscalar(patch_size):
+        return int(patch_size), int(patch_size)
+    px, py = patch_size
+    return int(px), int(py)
+
+
+def config_nskip(config):
+    """(nskip_x, nskip_y) for a config, tolerating pickles from before
+    rectangular patches existed."""
+    return (getattr(config, 'nskip_x', config.nskip),
+            getattr(config, 'nskip_y', config.nskip))
+
+
+def _build_wt_vec(nskip, nskip_y=None) -> np.ndarray:
+    nskip_x = nskip
+    if nskip_y is None:
+        nskip_y = nskip_x
+    Wt = np.ones((nskip_x+1, nskip_y+1))
     Wt[1:-1,0] = 1/2
     Wt[1:-1,-1] = 1/2
     Wt[0,1:-1] = 1/2
@@ -79,7 +108,7 @@ def _build_wt_vec(nskip: int) -> np.ndarray:
     Wt[-1,0] = 1/4
     Wt[-1,-1] = 1/4
 
-    Wt_vec = Wt.reshape((nskip+1)**2, order='F')
+    Wt_vec = Wt.reshape((nskip_x+1)*(nskip_y+1), order='F')
     return Wt_vec
 
 def build_lltogl(
@@ -230,13 +259,12 @@ def _read_batch(data_source: DataInput, field_name: str, snap_start: int, snap_e
 def random_patch_sampling(data, patch_size):
     num_patches = 10000
     num_images = 1
-    ndim = data.ndim 
     nx = data.shape[0]
     ny = data.shape[1]
-    sz = patch_size
+    sz_x, sz_y = patch_dims(patch_size)
     BUFF = 0
     totalsamples = 0
-    X = np.zeros((sz ** ndim, num_patches))
+    X = np.zeros((sz_x * sz_y, num_patches))
     
     for i in range(num_images):
         this_image = data
@@ -248,11 +276,11 @@ def random_patch_sampling(data, patch_size):
 
         # Extract patches at random from this image to make data vector X
         for j in range(getsample):
-            d1 = BUFF + np.random.randint(0, nx - sz - 2 * BUFF)
-            d2 = BUFF + np.random.randint(0, ny - sz - 2 * BUFF)
-            
+            d1 = BUFF + np.random.randint(0, nx - sz_x - 2 * BUFF)
+            d2 = BUFF + np.random.randint(0, ny - sz_y - 2 * BUFF)
+
             totalsamples += 1
-            temp = this_image[d1:d1 + sz, d2:d2 + sz].reshape(sz ** ndim, order='F')
+            temp = this_image[d1:d1 + sz_x, d2:d2 + sz_y].reshape(sz_x * sz_y, order='F')
             X[:, totalsamples - 1] = temp - np.mean(temp)
 
     
@@ -297,16 +325,18 @@ def FEM_shape_calculator_ortho_gfemlr(zeta_coord, eta_coord, zeta_pts, eta_pts):
 
 def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_size):
 
-    nskip = (patch_size - 1) // 2
-    nskip_sample = patch_size - 1
-    mid_pt = 1 + nskip_sample // 2
+    patch_x, patch_y = patch_dims(patch_size)
+    nskip_x = (patch_x - 1) // 2
+    nskip_y = (patch_y - 1) // 2
+    mid_pt_x = nskip_x + 1
+    mid_pt_y = nskip_y + 1
 
     dof_node = num_modes + 1
     dof_elem = 4 * dof_node
 
-    modes_grid = np.zeros((patch_size, patch_size, num_modes))
+    modes_grid = np.zeros((patch_x, patch_y, num_modes))
     for i in range(num_modes):
-        modes_grid[:,:, i] = modes_vec[:, i].reshape(patch_size, patch_size, order='F')
+        modes_grid[:,:, i] = modes_vec[:, i].reshape(patch_x, patch_y, order='F')
 
     # adopted nodal order
     gfem_nodal_order = [1, 2, 3, 4]
@@ -314,10 +344,10 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
 
     # Mode grid components for the four quadrants
     F_indx = [1, 2, 3, 4]  # faces order, F1:x-ve, F2:x+ve, F3:y-ve, F4:y+ve
-    F1 = list(range(0, mid_pt))
-    F2 = list(range(mid_pt - 1, patch_size))
-    F3 = list(range(0, mid_pt))
-    F4 = list(range(mid_pt - 1, patch_size))
+    F1 = list(range(0, mid_pt_x))
+    F2 = list(range(mid_pt_x - 1, patch_x))
+    F3 = list(range(0, mid_pt_y))
+    F4 = list(range(mid_pt_y - 1, patch_y))
 
     indices = [
         (F1, F4), # 1
@@ -326,10 +356,10 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
         (F1, F3), # 4
     ]
 
-    modes_grid_1_comp = np.zeros((mid_pt, mid_pt, num_modes))
-    modes_grid_2_comp = np.zeros((mid_pt, mid_pt, num_modes))
-    modes_grid_3_comp = np.zeros((mid_pt, mid_pt, num_modes))
-    modes_grid_4_comp = np.zeros((mid_pt, mid_pt, num_modes))
+    modes_grid_1_comp = np.zeros((mid_pt_x, mid_pt_y, num_modes))
+    modes_grid_2_comp = np.zeros((mid_pt_x, mid_pt_y, num_modes))
+    modes_grid_3_comp = np.zeros((mid_pt_x, mid_pt_y, num_modes))
+    modes_grid_4_comp = np.zeros((mid_pt_x, mid_pt_y, num_modes))
 
     comp1_x, comp1_y = np.meshgrid(F1, F4, indexing='ij')
     comp2_x, comp2_y = np.meshgrid(F2, F4, indexing='ij')
@@ -343,10 +373,11 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
         modes_grid_4_comp[:,:, i] = modes_grid[comp4_x, comp4_y, i]
 
 
-    modes_vec_comp1 = modes_grid_1_comp.reshape(mid_pt**2, num_modes, order='F')
-    modes_vec_comp2 = modes_grid_2_comp.reshape(mid_pt**2, num_modes, order='F')
-    modes_vec_comp3 = modes_grid_3_comp.reshape(mid_pt**2, num_modes, order='F')
-    modes_vec_comp4 = modes_grid_4_comp.reshape(mid_pt**2, num_modes, order='F')
+    npatch = mid_pt_x * mid_pt_y
+    modes_vec_comp1 = modes_grid_1_comp.reshape(npatch, num_modes, order='F')
+    modes_vec_comp2 = modes_grid_2_comp.reshape(npatch, num_modes, order='F')
+    modes_vec_comp3 = modes_grid_3_comp.reshape(npatch, num_modes, order='F')
+    modes_vec_comp4 = modes_grid_4_comp.reshape(npatch, num_modes, order='F')
 
 
     # local modal matrix for single element
@@ -355,31 +386,31 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
     # Corners of the reference element, in the adopted nodal order.  The index
     # pairs are (axis 0, axis 1) = (x, y) under this module's [x, y] layout, so
     # the element's zeta direction (axis 1) carries y and eta (axis 0) carries x.
-    x1 = x_grid[ i   *nskip,  (j-1)*nskip]
-    x2 = x_grid[ i   *nskip,   j   *nskip]
-    x3 = x_grid[(i-1)*nskip,   j   *nskip]
-    x4 = x_grid[(i-1)*nskip,  (j-1)*nskip]
+    x1 = x_grid[ i   *nskip_x,  (j-1)*nskip_y]
+    x2 = x_grid[ i   *nskip_x,   j   *nskip_y]
+    x3 = x_grid[(i-1)*nskip_x,   j   *nskip_y]
+    x4 = x_grid[(i-1)*nskip_x,  (j-1)*nskip_y]
 
-    y1 = y_grid[ i   *nskip,  (j-1)*nskip]
-    y2 = y_grid[ i   *nskip,   j   *nskip]
-    y3 = y_grid[(i-1)*nskip,   j   *nskip]
-    y4 = y_grid[(i-1)*nskip,  (j-1)*nskip]
+    y1 = y_grid[ i   *nskip_x,  (j-1)*nskip_y]
+    y2 = y_grid[ i   *nskip_x,   j   *nskip_y]
+    y3 = y_grid[(i-1)*nskip_x,   j   *nskip_y]
+    y4 = y_grid[(i-1)*nskip_x,  (j-1)*nskip_y]
 
     xpt = [x1, x2, x3, x4]
     ypt = [y1, y2, y3, y4]
 
-    N1 = np.zeros(((nskip+1)**2))
-    N2 = np.zeros(((nskip+1)**2))
-    N3 = np.zeros(((nskip+1)**2))
-    N4 = np.zeros(((nskip+1)**2))
+    N1 = np.zeros((mid_pt_x * mid_pt_y))
+    N2 = np.zeros((mid_pt_x * mid_pt_y))
+    N3 = np.zeros((mid_pt_x * mid_pt_y))
+    N4 = np.zeros((mid_pt_x * mid_pt_y))
 
-    for iy in range((nskip+1)):
+    for iy in range(mid_pt_y):
 
-        for ix in range((nskip+1)):
+        for ix in range(mid_pt_x):
 
             x_val = x_grid[ix, iy]
             y_val = y_grid[ix, iy]
-            iind = ix*(nskip+1) + iy
+            iind = ix*mid_pt_y + iy
             N = FEM_shape_calculator_ortho_gfemlr(y_val, x_val, ypt, xpt)
             N1[iind] = N[0][0]
             N2[iind] = N[1][0]
@@ -397,7 +428,7 @@ def local_modemat_over_elem(x_grid, y_grid, nskip, modes_vec, num_modes, patch_s
         N4[:, np.newaxis] * modes_vec_comp2
     ])
 
-    Wt_vec = _build_wt_vec(nskip)
+    Wt_vec = _build_wt_vec(nskip_x, nskip_y)
 
     modemat_local_wt = modemat_local.copy()
     for kk in range(dof_elem):
@@ -436,9 +467,11 @@ def gfem_compress_flexible(
     num_snaps, nx, ny, _ = _source_metadata(data_source, field_name)
     mode_data, grid_x, grid_y = _read_static(data_source, field_name)
 
-    nskip = (patch_size - 1) // 2
-    sample_x = range(0, nx, nskip)
-    sample_y = range(0, ny, nskip)
+    patch_x, patch_y = patch_dims(patch_size)
+    nskip_x = (patch_x - 1) // 2
+    nskip_y = (patch_y - 1) // 2
+    sample_x = range(0, nx, nskip_x)
+    sample_y = range(0, ny, nskip_y)
 
     nx_g = len(sample_x)
     ny_g = len(sample_y)
@@ -446,6 +479,22 @@ def gfem_compress_flexible(
     num_gfem_nodes = nx_g * ny_g
     dof_node = num_modes + 1
     dof_elem = 4 * dof_node
+
+    patch_points = (nskip_x + 1) * (nskip_y + 1)
+    if dof_elem > patch_points:
+        logger.warning(
+            "Over-complete element: %d DOFs describe only %d sample points "
+            "(patch %dx%d, num_modes=%d). The local basis is rank deficient, so "
+            "%d coefficient directions produce no field change; they are fixed "
+            "only by node sharing in the global assembly, carry the largest "
+            "coefficients, and are temporally incoherent. Reduce num_modes to "
+            "<= %d or enlarge the patch.",
+            dof_elem, patch_points, patch_x, patch_y, num_modes,
+            dof_elem - patch_points, patch_points // 4 - 1)
+    elif dof_elem > patch_points // 2:
+        logger.info("Element uses %d DOFs for %d sample points (patch %dx%d); "
+                    "the local basis is getting close to over-complete.",
+                    dof_elem, patch_points, patch_x, patch_y)
 
     logger.info(f"shape of mode data: {mode_data.shape}")
     logger.info(f"number of snapshots: {num_snaps}")
@@ -463,10 +512,10 @@ def gfem_compress_flexible(
 
         logger.info("Constructing local modal matrices")
         modemat_local_u, modemat_local_wt_u = local_modemat_over_elem(
-            grid_x, grid_y, nskip, local_modes_u, num_modes, patch_size
+            grid_x, grid_y, nskip_x, local_modes_u, num_modes, patch_size
         )
         modemat_local_v, modemat_local_wt_v = local_modemat_over_elem(
-            grid_x, grid_y, nskip, local_modes_v, num_modes, patch_size
+            grid_x, grid_y, nskip_x, local_modes_v, num_modes, patch_size
         )
 
         logger.info("Local modal matrices constructed")
@@ -476,7 +525,7 @@ def gfem_compress_flexible(
 
         logger.info("Using provided local modal matrices from dls_config")
 
-        Wt_vec = _build_wt_vec(nskip)
+        Wt_vec = _build_wt_vec(nskip_x, nskip_y)
         modemat_local_wt_u = modemat_local_u.copy()
         modemat_local_wt_v = modemat_local_v.copy()
 
@@ -531,28 +580,28 @@ def gfem_compress_flexible(
             for j in range(ny_g - 1):
                     lltogl = build_lltogl(i, j, ny_g, dof_node, IJK)
 
-                    indx_cell = i * nskip
-                    indy_cell = j * nskip
+                    indx_cell = i * nskip_x
+                    indy_cell = j * nskip_y
 
                     Q_local_u = Q_grid_u[
-                        indx_cell : indx_cell + nskip + 1,
-                        indy_cell : indy_cell + nskip + 1,
+                        indx_cell : indx_cell + nskip_x + 1,
+                        indy_cell : indy_cell + nskip_y + 1,
                         :,
                     ]
                     Q_local_v = Q_grid_v[
-                        indx_cell : indx_cell + nskip + 1,
-                        indy_cell : indy_cell + nskip + 1,
+                        indx_cell : indx_cell + nskip_x + 1,
+                        indy_cell : indy_cell + nskip_y + 1,
                         :,
                     ]
 
-                    q_rows = (nskip + 1) ** 2
+                    q_rows = (nskip_x + 1) * (nskip_y + 1)
                     q_cols = snap_end - snap_start
                     Q_local_u_vec = np.zeros((q_rows, q_cols))
                     Q_local_v_vec = np.zeros((q_rows, q_cols))
 
-                    for ix in range(nskip + 1):
-                        for iy in range(nskip + 1):
-                            iind = iy * (nskip + 1) + ix
+                    for ix in range(nskip_x + 1):
+                        for iy in range(nskip_y + 1):
+                            iind = iy * (nskip_x + 1) + ix
                             Q_local_u_vec[iind, :] = Q_local_u[ix, iy, :]
                             Q_local_v_vec[iind, :] = Q_local_v[ix, iy, :]
 
@@ -622,7 +671,7 @@ def gfem_recon_flexible(
     num_batches = num_snaps // batch_size + (1 if num_snaps % batch_size else 0)
 
     IJK = node_map()
-    nskip = config.nskip
+    nskip_x, nskip_y = config_nskip(config)
     dof_node = config.dof_node
     dof_elem = config.dof_elem
 
@@ -646,8 +695,8 @@ def gfem_recon_flexible(
         for i in range(config.nx_g - 1):
             for j in range(config.ny_g - 1):
                 lltogl = build_lltogl(i, j, config.ny_g, dof_node, IJK)
-                indx_cell = i * nskip
-                indy_cell = j * nskip
+                indx_cell = i * nskip_x
+                indy_cell = j * nskip_y
 
                 dof_local_u = dof_u_arr[snap_start:snap_end, :][:, lltogl].T
                 dof_local_v = dof_v_arr[snap_start:snap_end, :][:, lltogl].T
@@ -655,11 +704,11 @@ def gfem_recon_flexible(
                 Q_local_u_vec = config.modemat_local_u @ dof_local_u
                 Q_local_v_vec = config.modemat_local_v @ dof_local_v
 
-                Q_local_u = Q_local_u_vec.reshape((nskip + 1, nskip + 1, snap_end - snap_start), order="F")
-                Q_local_v = Q_local_v_vec.reshape((nskip + 1, nskip + 1, snap_end - snap_start), order="F")
+                Q_local_u = Q_local_u_vec.reshape((nskip_x + 1, nskip_y + 1, snap_end - snap_start), order="F")
+                Q_local_v = Q_local_v_vec.reshape((nskip_x + 1, nskip_y + 1, snap_end - snap_start), order="F")
 
-                Q_rec_u[indx_cell:indx_cell + nskip + 1, indy_cell:indy_cell + nskip + 1, :] = Q_local_u
-                Q_rec_v[indx_cell:indx_cell + nskip + 1, indy_cell:indy_cell + nskip + 1, :] = Q_local_v
+                Q_rec_u[indx_cell:indx_cell + nskip_x + 1, indy_cell:indy_cell + nskip_y + 1, :] = Q_local_u
+                Q_rec_v[indx_cell:indx_cell + nskip_x + 1, indy_cell:indy_cell + nskip_y + 1, :] = Q_local_v
                 compute_time = time.time() 
                 t_time += compute_time - start_time
 

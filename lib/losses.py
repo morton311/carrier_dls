@@ -14,6 +14,7 @@ training loops can call it exactly like ``nn.MSELoss``.
 """
 
 import logging
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -126,6 +127,61 @@ class VarianceMatchLoss(nn.Module):
         return f"eps={self.eps}, unbiased={self.unbiased}"
 
 
+class TrajectoryLoss(nn.Module):
+    """Marker base for losses that need the whole rollout, not one step.
+
+    Called once per batch with (B, S, ta, F): batch, spatial tokens (1 for
+    non-element models), rollout step, feature. The driver detects the marker
+    and collects the trajectory instead of scoring step by step.
+    """
+
+    min_train_ahead = 2
+    # scored once on the stacked rollout, so CombinedLoss skips it per step
+    deferred = True
+
+    def forward(self, pred, target):
+        raise NotImplementedError
+
+
+class IncrementMatchLoss(TrajectoryLoss):
+    """Match step-to-step increments along the rollout.
+
+    First differencing is a temporal high-pass: an error component at angular
+    frequency w is weighted by 4 sin^2(w/2), so a period-2 error counts four
+    times what it does under MSE while a constant offset counts nothing. That
+    makes it the term that sees how fast a prediction *changes*, which no
+    pointwise, energy or variance term constrains.
+
+    Both failure modes are penalized. A prediction collapsing to the
+    conditional mean has increments tending to zero; an over-persistent one
+    (measured on the cavity residual: true rho(1) = 0.40 against a predicted
+    0.92) has increments that are too small for its amplitude. Increments that
+    are too large -- uncorrelated noise at the right variance -- are penalized
+    just as hard, so it also guards the statistical terms it is paired with.
+    """
+
+    def __init__(self, base='mse', eps: float = 1e-8, relative: bool = True):
+        super(IncrementMatchLoss, self).__init__()
+        self.base = _build_simple(str(base).lower(), {})
+        self.relative = relative
+        self.eps = eps
+
+    def forward(self, pred, target):
+        pred = pred.float()
+        target = target.float()
+        d_pred = pred[..., 1:, :] - pred[..., :-1, :]
+        d_true = target[..., 1:, :] - target[..., :-1, :]
+        loss = self.base(d_pred, d_true)
+        if self.relative:
+            # scale out the increment magnitude so the term keeps its footing
+            # whatever the latent units are
+            loss = loss / (d_true.pow(2).mean() + self.eps)
+        return loss
+
+    def extra_repr(self):
+        return f"base={type(self.base).__name__}, relative={self.relative}"
+
+
 class CombinedLoss(nn.Module):
     """Weighted sum of several losses, e.g. MSE regularized by a relative L2 term.
 
@@ -142,11 +198,35 @@ class CombinedLoss(nn.Module):
         self.last_terms = None
 
     def forward(self, pred, target):
-        values = [w * term(pred, target) for w, term in zip(self.weights, self.terms)]
-        self.last_terms = [v.detach() for v in values]
-        total = values[0]
-        for value in values[1:]:
-            total = total + value
+        """Per-step score. Deferred (trajectory) terms contribute nothing here."""
+        if self.last_terms is None or len(self.last_terms) != len(self.terms):
+            self.last_terms = [torch.zeros((), device=pred.device)] * len(self.terms)
+        else:
+            self.last_terms = list(self.last_terms)
+        total = None
+        for i, (w, term) in enumerate(zip(self.weights, self.terms)):
+            if getattr(term, 'deferred', False):
+                continue
+            value = w * term(pred, target)
+            self.last_terms[i] = value.detach()
+            total = value if total is None else total + value
+        if total is None:
+            total = torch.zeros((), device=pred.device, dtype=torch.float32)
+        return total
+
+    def forward_deferred(self, pred, target):
+        """Score only the trajectory terms, on (B, S, ta, F). None if there are none."""
+        if self.last_terms is None or len(self.last_terms) != len(self.terms):
+            self.last_terms = [torch.zeros((), device=pred.device)] * len(self.terms)
+        else:
+            self.last_terms = list(self.last_terms)
+        total = None
+        for i, (w, term) in enumerate(zip(self.weights, self.terms)):
+            if not getattr(term, 'deferred', False):
+                continue
+            value = w * term(pred, target)
+            self.last_terms[i] = value.detach()
+            total = value if total is None else total + value
         return total
 
     def extra_repr(self):
@@ -170,6 +250,13 @@ class MetricLoss(nn.Module):
     def forward(self, pred, target):
         return self.base(self.metric(pred), self.metric(target))
 
+    def forward_deferred(self, pred, target):
+        """Trajectory terms, scored in the same metric as the per-step terms."""
+        fn = getattr(self.base, 'forward_deferred', None)
+        if fn is None:
+            return None
+        return fn(self.metric(pred), self.metric(target))
+
     @property
     def last_terms(self):
         return getattr(self.base, 'last_terms', None)
@@ -187,7 +274,7 @@ class MetricLoss(nn.Module):
 TERM_ABBREV = {
     'mse': 'mse', 'l2': 'mse', 'mae': 'mae', 'l1': 'mae', 'huber': 'hub',
     'smooth_l1': 'sl1', 'logcosh': 'lch', 'rel_l2': 'rl2',
-    'traj_energy': 'nrg', 'traj_var': 'var',
+    'traj_energy': 'nrg', 'traj_var': 'var', 'traj_dt': 'dt',
 }
 
 
@@ -212,6 +299,10 @@ def _build_simple(loss_type: str, params: dict) -> nn.Module:
         return RelativeL2Loss(eps=params.get('eps', 1e-8))
     elif loss_type == 'traj_energy':
         return EnergyMatchLoss(eps=params.get('eps', 1e-8))
+    elif loss_type == 'traj_dt':
+        return IncrementMatchLoss(base=params.get('base', 'mse'),
+                                  eps=params.get('eps', 1e-8),
+                                  relative=params.get('relative', True))
     elif loss_type == 'traj_var':
         return VarianceMatchLoss(eps=params.get('eps', 1e-8),
                                  unbiased=params.get('unbiased', False))
@@ -219,7 +310,7 @@ def _build_simple(loss_type: str, params: dict) -> nn.Module:
         raise ValueError(
             f"Loss '{loss_type}' not recognized. Use 'mse', 'mae', 'huber', "
             "'smooth_l1', 'logcosh', 'rel_l2', 'traj_energy', 'traj_var', "
-            "or 'combo'."
+            "'traj_dt', or 'combo'."
         )
 
 
@@ -260,3 +351,42 @@ def build_loss(loss_config=None) -> nn.Module:
         return CombinedLoss(terms, weights, names)
 
     return _build_simple(loss_type, params)
+
+@dataclass
+class LossPlan:
+    """How a criterion splits between per-step and whole-rollout scoring."""
+    criterion: nn.Module
+    traj_terms: list
+    needs_trajectory: bool
+    min_train_ahead: int
+
+
+def deferred_loss(criterion, pred, target):
+    """Score a criterion's trajectory terms on a stacked rollout, or None."""
+    fn = getattr(criterion, 'forward_deferred', None)
+    if fn is not None:
+        return fn(pred, target)
+    if isinstance(criterion, TrajectoryLoss):
+        return criterion(pred, target)
+    return None
+
+
+def plan(criterion) -> LossPlan:
+    """Find any TrajectoryLoss inside a criterion, however it is wrapped.
+
+    Trajectory terms are scored once on the stacked rollout; everything else
+    stays per-step, so an all-pointwise criterion keeps its exact behaviour.
+    """
+    found = []
+
+    def walk(mod):
+        if isinstance(mod, TrajectoryLoss):
+            found.append(mod)
+            return
+        for child in mod.children():
+            walk(child)
+
+    walk(criterion)
+    need = max((t.min_train_ahead for t in found), default=1)
+    return LossPlan(criterion=criterion, traj_terms=found,
+                    needs_trajectory=bool(found), min_train_ahead=need)
