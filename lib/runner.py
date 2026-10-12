@@ -600,6 +600,9 @@ class runner(nn.Module):
 
             logger.info(f"Loss function: {self.criterion}")
             logger.info(f"Rollout: {self.rollout_cfg}")
+            lam = mp_.get('reassemble_lambda')
+            logger.info("Reassembly projection: " + ("average of shared nodal copies" if lam is None
+                                                      else f"regularized Galerkin, lambda={lam:g}"))
             logger.info(f"Optimizer: {self.optimizer}")
             logger.info(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)})")
             logger.info(f"Using mixed precision training with GradScaler: {self.scaler}")
@@ -907,16 +910,29 @@ class runner(nn.Module):
         noise_std   stddev of Gaussian noise added to the fed-back state during
                     training only; 0 (default) is the historical behavior. In
                     normalized DOF units, so ~0.01-0.05 is a small perturbation.
+        reassemble  tr_spatial only: apply the inference-time reassembly
+                    (_reassemble_tokens) to every predicted frame in the training
+                    and validation rollouts, so the loss scores the assembled
+                    output and the model is fed the consistent states it sees
+                    at inference. False (default) trains on raw element outputs.
         """
-        ro = dict(self.config['model_params'].get('rollout', {}))
+        mp = self.config['model_params']
+        ro = dict(mp.get('rollout', {}))
         ro.setdefault('mode', 'detached')
         ro.setdefault('chunk', 0)
         ro.setdefault('checkpoint', False)
         ro.setdefault('ramp_epochs', 0)
         ro.setdefault('noise_std', 0.0)
+        ro.setdefault('reassemble', False)
         if ro['mode'] not in ('detached', 'bptt'):
             raise ValueError(
                 f"rollout.mode '{ro['mode']}' not recognized. Use 'detached' or 'bptt'.")
+        if ro['reassemble']:
+            if mp['model_type'] != 'tr_spatial':
+                raise ValueError("rollout.reassemble is only supported for model_type 'tr_spatial'")
+            if not mp.get('reassemble', True):
+                raise ValueError("rollout.reassemble trains on assembled states, but "
+                                 "model_params.reassemble=false would not assemble them at inference")
         return ro
 
     def _rollout_adapter(self, epoch: int, train: bool) -> _RolloutAdapter:
@@ -948,13 +964,19 @@ class runner(nn.Module):
             return _RolloutAdapter(2, unpack, call, after_step)
 
         if model_type == 'tr_spatial':
-            coords = self._elem_geometry()['coords']
+            geom = self._elem_geometry()
+            coords = geom['coords']
+            reassemble = self.rollout_cfg['reassemble']
 
             def unpack(batch):
                 inputs, targets, _, _ = batch
                 return inputs.to(self.device), targets.to(self.device), {}
 
-            return _RolloutAdapter(2, unpack, lambda inputs, state: self.model(inputs, coords))
+            def call(inputs, state):
+                out = self.model(inputs, coords)
+                return self._reassemble_tokens(out, state['key'], geom) if reassemble else out
+
+            return _RolloutAdapter(2, unpack, call)
 
         def unpack(batch):
             inputs, targets = batch
@@ -1225,26 +1247,91 @@ class runner(nn.Module):
         cmin, cmax = coords.min(axis=0), coords.max(axis=0)
         return (coords - cmin) / np.where(cmax > cmin, cmax - cmin, 1.0)
 
+    # dense assembled inverse up to this many nodal DOFs per component
+    MAX_DENSE_ASSEMBLY = 10000
+
+    def _assembly_ops(self, geom):
+        """Regularized Galerkin assembly operators for `geom`, built once.
+
+        Per velocity component, M = B^T diag(Wt) B is the element mass matrix (Wt
+        splits shared boundary points so element energies sum to the field
+        energy) and Mr = M + lam * tr(M)/n * I. Assembly solves
+
+            (sum_e G_e^T Mr G_e) d = sum_e G_e^T Mr d_hat_e,
+
+        so Mr and the inverse of the assembled matrix are all a step needs. Kept
+        in float64 (numpy, final assembly) and float32 (torch, rollout steps).
+        """
+        if 'assembly' in geom:
+            return geom['assembly']
+        lam = float(self.config['model_params']['reassemble_lambda'])
+        cfg = self.l_config
+        if self.dim == 3:
+            Wt = self.dls._build_wt_vec(cfg.nskip)
+            mats = [cfg.modemat_local_u, cfg.modemat_local_v, cfg.modemat_local_w]
+        else:
+            Wt = self.dls._build_wt_vec(*self.dls.config_nskip(cfg))
+            mats = [cfg.modemat_local_u, cfg.modemat_local_v]
+        L = geom['lltogl_np']
+        E, n = L.shape
+        N = geom['num_dofs']
+        if N > self.MAX_DENSE_ASSEMBLY:
+            raise NotImplementedError(
+                f"reassemble_lambda needs a dense {N}x{N} inverse; too large, use the default average")
+        ops = []
+        for B in mats:
+            B = np.asarray(B, dtype=np.float64)
+            M = (B * Wt[:, None]).T @ B
+            Mr = M + lam * np.trace(M) / n * np.eye(n)
+            A = np.zeros((N, N))
+            for e in range(E):
+                A[np.ix_(L[e], L[e])] += Mr
+            # DOFs no element covers (skipped elements) are never gathered; pin them
+            free = np.diag(A) == 0
+            A[free, free] = 1.0
+            Ainv = np.linalg.pinv(A, hermitian=True) if lam == 0 else np.linalg.inv(A)
+            ops.append({'Mr': Mr, 'Ainv': Ainv,
+                        'Mr_t': torch.from_numpy(Mr).float().to(self.device),
+                        'Ainv_t': torch.from_numpy(Ainv).float().to(self.device)})
+        logger.info(f"Regularized Galerkin assembly: lambda={lam:g}, {E} elements, {N} nodal DOFs "
+                    f"per component, cond(A)={np.linalg.cond(A):.2e}")
+        geom['assembly'] = ops
+        return ops
+
     def _reassemble_tokens(self, pred_norm, name, geom):
         """Project normalized element predictions to a consistent global field and back.
 
-        (G, E, F) -> scatter-mean shared nodal DOFs -> regather -> (G, E, F).
-        Runs in fp32; keep outside autocast.
+        (G, E, F) -> assemble the shared nodal DOFs -> regather -> (G, E, F).
+        `model_params.reassemble_lambda` picks the projection. None (default)
+        averages each node's copies: least squares in raw coefficients. A value
+        lam solves the regularized Galerkin system (_assembly_ops): least squares
+        in field energy, with a ridge against the codec's near-null space.
+        lam -> inf recovers the average; lam = 0 is the pure Galerkin (L2)
+        projection, which injects near-null coefficients and destabilizes
+        rollouts on these ill-conditioned bases. fp32, differentiable.
         """
         G = pred_norm.shape[0]
         mean = self.dof_mean[name].to(pred_norm.device)
         std = self.dof_std[name].to(pred_norm.device)
-        pred = pred_norm.float() * std + mean
+        lam = self.config['model_params'].get('reassemble_lambda')
+        ops = None if lam is None else self._assembly_ops(geom)
         ndof = self.l_config.dof_elem
         comps = []
-        for c in range(self.dim):
-            flat = torch.zeros(G, geom['num_dofs'], device=pred.device)
-            flat.index_add_(1, geom['scatter_index'],
-                            pred[:, :, c * ndof:(c + 1) * ndof].reshape(G, -1))
-            flat = flat / geom['counts']
-            comps.append(flat[:, geom['lltogl']])
-        out = torch.cat(comps, dim=2)
-        return (out - mean) / std
+        # the Galerkin solve must not drop to fp16 inside the training autocast
+        with torch.autocast(device_type=pred_norm.device.type, enabled=False):
+            pred = pred_norm.float() * std + mean
+            for c in range(self.dim):
+                local = pred[:, :, c * ndof:(c + 1) * ndof]
+                flat = torch.zeros(G, geom['num_dofs'], device=pred.device)
+                if ops is None:
+                    flat = flat.index_add(1, geom['scatter_index'], local.reshape(G, -1))
+                    flat = flat / geom['counts']
+                else:
+                    flat = flat.index_add(1, geom['scatter_index'], (local @ ops[c]['Mr_t']).reshape(G, -1))
+                    flat = flat @ ops[c]['Ainv_t']
+                comps.append(flat[:, geom['lltogl']])
+            out = torch.cat(comps, dim=2)
+            return (out - mean) / std
 
     def _ss_prob(self, epoch: int) -> float:
         """Scheduled-sampling probability of refreshing context from model predictions."""
@@ -1675,22 +1762,28 @@ class runner(nn.Module):
         return self._assemble_dof_preds(predictions, geom)
 
     def _assemble_dof_preds(self, predictions, geom):
-        """Scatter-mean element-local predictions (E, T, dim*dof_elem) onto the shared nodal DOFs.
+        """Assemble element-local predictions (E, T, dim*dof_elem) onto the shared nodal DOFs.
 
-        Interior nodes belong to multiple elements, so their duplicate slots are averaged.
+        Interior nodes belong to multiple elements; their duplicate slots are
+        combined with the same projection as _reassemble_tokens (averaged by
+        default, regularized Galerkin with model_params.reassemble_lambda).
         Returns (dof_u, dof_v, dof_w) each of shape (T, num_dofs); dof_w is None in 2D.
         """
         total_steps = predictions.shape[1]
         num_dofs = geom['num_dofs']
         ndof = self.l_config.dof_elem
         counts = geom['counts_cpu'].numpy()
+        ops = (None if self.config['model_params'].get('reassemble_lambda') is None
+               else self._assembly_ops(geom))
         out = []
         for c in range(self.dim):
             acc = torch.zeros(total_steps, num_dofs, dtype=torch.float64)
-            vals = torch.from_numpy(
-                predictions[:, :, c * ndof:(c + 1) * ndof].transpose(1, 0, 2).reshape(total_steps, -1))
+            local = predictions[:, :, c * ndof:(c + 1) * ndof]
+            if ops is not None:
+                local = local @ ops[c]['Mr']
+            vals = torch.from_numpy(np.ascontiguousarray(local.transpose(1, 0, 2)).reshape(total_steps, -1))
             acc.index_add_(1, geom['scatter_index_cpu'], vals)
-            out.append((acc.numpy() / counts))
+            out.append(acc.numpy() / counts if ops is None else acc.numpy() @ ops[c]['Ainv'])
         dof_w_pred = out[2] if self.dim == 3 else None
         return out[0], out[1], dof_w_pred
 
