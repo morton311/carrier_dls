@@ -525,9 +525,12 @@ class runner(nn.Module):
                 input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim'])
 
             if self.config['model_params']['model_type'] not in ('tr_encdec', 'tr_spatial'):
-                from torchinfo import summary
-                model_summary = summary(self.model, input_size=input_size, verbose=0)
-                logger.info("Model summary:\n%s", model_summary)
+                try:
+                    from torchinfo import summary
+                except ImportError:
+                    logger.info("torchinfo not installed; skipping the model summary")
+                else:
+                    logger.info("Model summary:\n%s", summary(self.model, input_size=input_size, verbose=0))
 
         if self.config['distributed']:
             from torch.nn.parallel import DistributedDataParallel as DDP

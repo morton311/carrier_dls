@@ -102,6 +102,18 @@ class SwiGLU(nn.Module):
         return swiglu
     
 
+def _use_swiglu(layer, ff_dim):
+    """Swap a TransformerEncoderLayer's activation for SwiGLU.
+
+    The layer was built with ReLU, and its fused inference kernel (taken in eval
+    mode with grad and autocast off) reads `activation_relu_or_gelu` set at
+    construction, not `layer.activation`. Left at 1 it silently applies ReLU at
+    inference while training used SwiGLU; 0 rules the fused path out.
+    """
+    layer.activation = SwiGLU(ff_dim)
+    layer.activation_relu_or_gelu = 0
+
+
 #####################
 # FFN_SwiGLU module #
 #####################
@@ -214,7 +226,7 @@ class TransformerEncoderModel(nn.Module):
                     norm_first=pre_norm,
                 )
                 if activation == 'swiglu':
-                    layer.activation = SwiGLU(ff_dim)
+                    _use_swiglu(layer, ff_dim)
             self.encoder_layers.append(layer)
         self.fc = nn.Linear(d_model, input_dim)
 
@@ -321,7 +333,7 @@ def _make_encoder_layer(d_model, ff_dim, nhead, activation, pre_norm):
         norm_first=pre_norm,
     )
     if activation == 'swiglu':
-        layer.activation = SwiGLU(ff_dim)
+        _use_swiglu(layer, ff_dim)
     return layer
 
 
