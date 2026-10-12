@@ -4,6 +4,7 @@ import sys
 import h5py
 import pickle
 import copy
+import hashlib
 
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 from tqdm import tqdm
 import time
 
+import lib.codec_ref as codec_ref
 import lib.init as init
 import lib.pod as pod
 import lib.models as models
@@ -1949,35 +1951,34 @@ class runner(nn.Module):
         injects broadband high-k energy at the element boundaries (measured at
         ~4e5x the true high-k energy on the LDC config, with zero model error).
         Scoring against this round trip instead isolates the model's own
-        contribution. Returns the path to a Q_rec-format file, or None if it
-        could not be built.
+        contribution. It depends only on the latent space, so it is stored once
+        per latent and dataset (lib/codec_ref) and this run's path is a small
+        link into it. Returns that path, or None if it could not be built.
         """
         ref_path = os.path.join(
             self.paths_bib.pred_dir, f"{name}_{source_group}_codec_ref_rec.h5")
-        if os.path.exists(ref_path):
-            return ref_path
         try:
-            idx = np.asarray(ids)
-            with h5py.File(self.paths_bib.latent_path, 'r') as f:
-                dof_u = f[name]['dof_u'][idx, :]
-                dof_v = f[name]['dof_v'][idx, :]
-                dof_w = f[name]['dof_w'][idx, :] if self.dim == 3 else None
-            batch = self.config['latent_params'].get('batch_size', 100)
-            if self.config['latent_params']['type'] == 'pod':
-                pod.pod_recon(rec_target=ref_path, config=self.l_config, dof_u=dof_u,
-                              dof_v=dof_v, dof_w=dof_w, batch_size=batch)
-            elif self.dim == 3:
-                self.dls.gfem_recon_flexible(rec_target=ref_path, config=self.l_config,
-                                             dof_u=dof_u, dof_v=dof_v, dof_w=dof_w,
-                                             batch_size=batch)
-            else:
-                self.dls.gfem_recon_flexible(rec_target=ref_path, config=self.l_config,
-                                             dof_u=dof_u, dof_v=dof_v, batch_size=batch)
-            logger.info(f"Codec reference reconstruction written to {ref_path}")
-            return ref_path
+            return codec_ref.link(ref_path, codec_ref.shared_path(self.paths_bib.latent_dir, name),
+                                  ids, lambda lo, hi: self._reconstruct_true(name, lo, hi))
         except Exception:
             logger.exception("Could not build codec reference for %s %s", name, source_group)
             return None
+
+    def _reconstruct_true(self, name, lo, hi):
+        """Field reconstruction of the true latent coefficients of snapshots lo..hi-1."""
+        with h5py.File(self.paths_bib.latent_path, 'r') as f:
+            dof_u = f[name]['dof_u'][lo:hi]
+            dof_v = f[name]['dof_v'][lo:hi]
+            dof_w = f[name]['dof_w'][lo:hi] if self.dim == 3 else None
+        batch = self.config['latent_params'].get('batch_size', 100)
+        if self.config['latent_params']['type'] == 'pod':
+            return pod.pod_recon(rec_target=None, config=self.l_config, dof_u=dof_u,
+                                 dof_v=dof_v, dof_w=dof_w, batch_size=batch)
+        if self.dim == 3:
+            return self.dls.gfem_recon_flexible(rec_target=None, config=self.l_config, dof_u=dof_u,
+                                                dof_v=dof_v, dof_w=dof_w, batch_size=batch)
+        return self.dls.gfem_recon_flexible(rec_target=None, config=self.l_config,
+                                            dof_u=dof_u, dof_v=dof_v, batch_size=batch)
 
     def _save_metrics(self, name, source_group, scalars, arrays=None):
         """Persist one evaluation's scalars and time series to metrics_dir.
@@ -2045,8 +2046,8 @@ class runner(nn.Module):
             logger.info(f"Evaluating for {name} between {rec_path} and {gt_path}...")
             
             # Compute metrics
-            self.compute_TKE(rec_path, gt_path, name, source_group, ids)
-            self.compute_RMS(rec_path, gt_path, name, source_group, ids)
+            stat_errors = self.compute_TKE(rec_path, gt_path, name, source_group, ids)
+            stat_errors.update(self.compute_RMS(rec_path, gt_path, name, source_group, ids))
 
             pl.plot_TKE(self, rec_path, gt_path, name, source_group,  ids)
             if self.dim == 3:
@@ -2082,7 +2083,8 @@ class runner(nn.Module):
 
             # rollout statistics: whether the prediction still behaves like the
             # right flow after its trajectory has decorrelated
-            scalars = {}
+            # TKE/RMS errors vs truth: previously only logged, now in the metrics file
+            scalars = dict(stat_errors)
             arrays = {}
             try:
                 s, a = pl.plot_energy_retention(self, rec_path, gt_path, name, source_group, ids)
@@ -2119,9 +2121,34 @@ class runner(nn.Module):
             
 
             
+    def _cached_gt(self, gt_path, key, compute):
+        """Read `key` from the ground-truth file, computing and storing it on first use.
+
+        Opened read-only unless the entry is missing: a write open takes an
+        exclusive lock on the shared data file, which made a second eval running
+        alongside crash. A write that finds the file busy waits and retries.
+        """
+        with h5py.File(gt_path, 'r') as f:
+            if key in f:
+                logger.info(f"{key} found in {gt_path}")
+                return f[key][:]
+            value = compute(f)
+        for attempt in range(60):
+            try:
+                with h5py.File(gt_path, 'r+') as f:
+                    if key not in f:
+                        f.create_dataset(key, data=value)
+                break
+            except OSError:
+                if attempt == 59:
+                    raise
+                time.sleep(10)
+        logger.info(f"{key} computed and saved to {gt_path}")
+        return value
+
     def compute_TKE(self, rec_path, gt_path, name, source, ids):
         """
-        Compute TKE and save to h5s
+        Compute TKE and save to h5s. Returns {'tke_error_pct': ...}.
         """
         import lib.weights as wg
         time_lag = self.config['model_params']['time_lag']
@@ -2130,22 +2157,14 @@ class runner(nn.Module):
         ny = self.l_config.ny_t
         nz = self.l_config.nz_t if self.dim == 3 else 1
 
-        # Check if weights are already computed and saved, if not compute and save them
-        with h5py.File(gt_path, 'r+') as f:
-            if 'weights' in f:
-                logger.info(f"Weights already computed and found in {gt_path}. Loading weights...")
-                weights = f['weights'][:]
-            else:
-                logger.info(f"Weights not found in {gt_path}. Computing weights...")
-                if self.dim == 3:
-                    weights = wg.generate_weights_grid_3d(self.x_grid, self.y_grid, self.z_grid)
-                elif self.source_is_yx:
-                    # stored in the source's own layout, like every other array there
-                    weights = wg.generate_weights_grid_2d(self.x_grid.T, self.y_grid.T)
-                else:
-                    weights = wg.generate_weights_grid_2d(self.x_grid, self.y_grid)
-                f.create_dataset('weights', data=weights)
-                logger.info(f"Weights computed and saved to {gt_path}.")
+        def compute_weights(f):
+            if self.dim == 3:
+                return wg.generate_weights_grid_3d(self.x_grid, self.y_grid, self.z_grid)
+            if self.source_is_yx:
+                # stored in the source's own layout, like every other array there
+                return wg.generate_weights_grid_2d(self.x_grid.T, self.y_grid.T)
+            return wg.generate_weights_grid_2d(self.x_grid, self.y_grid)
+        weights = self._cached_gt(gt_path, 'weights', compute_weights)
 
         weights = self._to_xy(weights, 0)
 
@@ -2171,31 +2190,24 @@ class runner(nn.Module):
             
         
 
-        with h5py.File(gt_path, 'r+') as f:
-
-            if 'TKE_gt_'+self.latent_id + '_' + name + source in f:
-                logger.info(f"TKE for GT already computed and found in {gt_path}. Skipping computation...")
-                TKE_gt = f['TKE_gt_'+self.latent_id + '_' + name + source][:]
+        # per-snapshot over the whole record, indexed by id below, so any run's
+        # window reads it correctly; keyed by latent because the crop is
+        def compute_tke_gt(f):
+            if self.dim == 3:
+                mean_gt = f['mean'][:nx, :ny, :nz, :] # shape: (nx, ny, nz, dim)
+                Q_gt = f['UV'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
             else:
-                logger.info(f"TKE for GT not found in {gt_path}. Computing TKE...")
-                if self.dim == 3:
-                    mean_gt = f['mean'][:nx, :ny, :nz, :] # shape: (nx, ny, nz, dim)
-                    Q_gt = f['UV'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
-                    Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
-                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1, order='F') 
-                    
-                else:
-                    crop = self._xy_crop(nx, ny)
-                    mean_gt = self._to_xy(f['mean'][crop], 0) # shape: (nx, ny, dim)
-                    Q_gt = self._to_xy(f['UV'][(slice(None),) + crop], 1) - mean_gt[np.newaxis]
-                    Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
-                    Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1, order='F')
-
-                TKE_gt = 0.5 * np.sum(Q_gt_weighted**2, axis=-1) # shape: (snaps, ...)
-                f.create_dataset('TKE_gt_'+self.latent_id + '_' + name + source, data=TKE_gt)
+                crop = self._xy_crop(nx, ny)
+                mean_gt = self._to_xy(f['mean'][crop], 0) # shape: (nx, ny, dim)
+                Q_gt = self._to_xy(f['UV'][(slice(None),) + crop], 1) - mean_gt[np.newaxis]
+            Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
+            Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1, order='F')
+            return 0.5 * np.sum(Q_gt_weighted**2, axis=-1) # shape: (snaps, ...)
+        TKE_gt = self._cached_gt(gt_path, 'TKE_gt_' + self.latent_id + '_' + name + source, compute_tke_gt)
 
         TKE_error = pl.l2_err_norm(TKE_gt[val_id[time_lag:]], TKE_rec[time_lag:])
         logger.info(f"TKE error for {name} {source}: {100 * TKE_error:.4f}%")
+        return {'tke_error_pct': 100 * float(TKE_error)}
                 
             
     def compute_RMS(self, rec_path, gt_path, name, source, ids):
@@ -2221,19 +2233,21 @@ class runner(nn.Module):
                 f.create_dataset('RMS_rec', data=RMS_rec)
 
 
-        with h5py.File(gt_path, 'r+') as f:
-            if 'RMS_gt_'+self.latent_id + '_' + name+ source in f:
-                logger.info(f"RMS for GT already computed and found in {gt_path}. Skipping computation...")
-                RMS_gt = f['RMS_gt_'+self.latent_id + '_' + name+ source][:]
-            else:
-                logger.info(f"RMS for GT not found in {gt_path}. Computing RMS...")
-                # kept in the source's own layout, like every other array there
-                mean_gt = f['mean'][:]
-                Q_gt = f['UV'][val_id[time_lag:]] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
-                RMS_gt = np.sqrt(np.mean(Q_gt**2, axis=0))  # shape: (..., dim)
+        # The true RMS must average the same snapshots as RMS_rec, val_id[time_lag:],
+        # so the cache is keyed by that window. Keying it by latent and split (as
+        # before) froze whichever run's window was evaluated first: on the LDC
+        # p99m10 latent every run was scored against val_id[64:]. The uncropped
+        # field does not depend on the latent, so latents share the entry.
+        window = np.asarray(val_id[time_lag:])
+        digest = hashlib.md5(window.astype(np.int64).tobytes()).hexdigest()[:8]
+        key = f"RMS_gt_{name}_{int(window[0])}-{int(window[-1])}_{digest}"
 
-                f.create_dataset('RMS_gt_'+self.latent_id + '_' + name+ source, data=RMS_gt)
-                logger.info(f"RMS computed and saved to {gt_path}.")
+        def compute_rms_gt(f):
+            # kept in the source's own layout, like every other array there
+            mean_gt = f['mean'][:]
+            Q_gt = f['UV'][window] - mean_gt[np.newaxis]  # shape: (snaps, ..., dim)
+            return np.sqrt(np.mean(Q_gt**2, axis=0))  # shape: (..., dim)
+        RMS_gt = self._cached_gt(gt_path, key, compute_rms_gt)
 
         RMS_gt = self._to_xy(RMS_gt, 0)
         RMS_gt = RMS_gt[:nx, :ny, :nz, :] if self.dim == 3 else RMS_gt[:nx, :ny, :]
@@ -2244,7 +2258,11 @@ class runner(nn.Module):
         RMS_v_error = pl.l2_err_norm(RMS_gt[..., 1], RMS_rec[..., 1])
         logger.info(f"RMS_u error for {name} {source}: {100 * RMS_u_error:.4f}%")
         logger.info(f"RMS_v error for {name} {source}: {100 * RMS_v_error:.4f}%")
+        out = {'rms_error_pct': 100 * float(RMS_error), 'rms_u_error_pct': 100 * float(RMS_u_error),
+               'rms_v_error_pct': 100 * float(RMS_v_error)}
         if self.dim == 3:
             RMS_w_error = pl.l2_err_norm(RMS_gt[..., 2], RMS_rec[..., 2])
             logger.info(f"RMS_w error for {name} {source}: {100 * RMS_w_error:.4f}%")
+            out['rms_w_error_pct'] = 100 * float(RMS_w_error)
+        return out
                 
