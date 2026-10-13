@@ -2412,6 +2412,9 @@ class runner(nn.Module):
         window = np.asarray(val_id[time_lag:])
         digest = hashlib.md5(window.astype(np.int64).tobytes()).hexdigest()[:8]
         key = f"RMS_gt_{name}_{int(window[0])}-{int(window[-1])}_{digest}"
+        if not hasattr(self, 'rms_gt_keys'):
+            self.rms_gt_keys = {}
+        self.rms_gt_keys[(name, source)] = key        # plotting.plot_RMS reads the same entry
 
         def compute_rms_gt(f):
             # kept in the source's own layout, like every other array there

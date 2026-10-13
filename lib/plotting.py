@@ -227,7 +227,8 @@ def plot_RMS(runner, rec_path: str, gt_path: str, name: str, source: str,
 
     with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
         RMS_rec = f_rec['RMS_rec'][:]
-        RMS_gt = runner._to_xy(f_gt['RMS_gt_'+runner.latent_id + '_' + name + source][:], 0)
+        # the truth RMS compute_RMS scored against: keyed by snapshot window, not latent
+        RMS_gt = runner._to_xy(f_gt[runner.rms_gt_keys[(name, source)]][:], 0)
 
 
     
@@ -255,7 +256,6 @@ def plot_RMS(runner, rec_path: str, gt_path: str, name: str, source: str,
         y_grid_t = y_grid_t[x_slice, :, :]
         z_grid_t = z_grid_t[x_slice, :, :]
         print(f"RMS for x-slice {x_slice} extracted.")
-        RMS_gt = f_gt['RMS_gt_' + runner.latent_id + '_' + name + source][:]
 
     if slice_axis is not None:
         data_slice_map = {

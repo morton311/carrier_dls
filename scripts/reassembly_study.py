@@ -31,10 +31,12 @@ os.chdir(ROOT)
 
 NAME = 'ldc_15k'
 LATENT = 'ldc_15k_dls_p99m10'
-OUT = f'results/{LATENT}/reassembly_study.json'
+# runs on the held-out split (split_version 2); the version-1 study is kept in
+# reassembly_study.json, from spatial_gram_rollout{,_s1,_s2} and their Galerkin twins
+OUT = f'results/{LATENT}/reassembly_study_heldout.json'
 LAM = 0.01
-RAW_RUNS = ['spatial_gram_rollout', 'spatial_gram_rollout_s1', 'spatial_gram_rollout_s2']
-GAL_RUNS = ['spatial_gram_rollout_galerkin', 'spatial_gram_rollout_galerkin_s1', 'spatial_gram_rollout_galerkin_s2']
+RAW_RUNS = [f'spatial_gram_rollout_heldout_s{s}' for s in (1, 2, 3)]
+GAL_RUNS = [f'spatial_gram_rollout_galerkin_heldout_s{s}' for s in (1, 2, 3)]
 # setting -> (runs, model_params.reassemble, model_params.reassemble_lambda)
 SETTINGS = {
     'none': (RAW_RUNS, False, None),
