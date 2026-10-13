@@ -345,6 +345,13 @@ class runner(nn.Module):
                         # Check if splits already exist for this combination
                         if data_name in snaps[data_source] and 'train_indices' in snaps[data_source][data_name]:
                             logger.info(f"Splits already exist for {data_source} '{data_name}', skipping")
+                            version = snaps[data_source][data_name].get('split_version', 1)
+                            # only the training split's test windows drive early stopping
+                            if data_source == 'train_data' and version < self.SPLIT_VERSION:
+                                logger.warning(
+                                    f"{data_source} '{data_name}' uses split version {version}: its test "
+                                    "windows overlap the training data, so early stopping watched "
+                                    "in-sample loss (validation is unaffected). See _split_indices.")
                             continue
                         
                         # Compute splits for this combination
@@ -367,6 +374,7 @@ class runner(nn.Module):
                         snaps[data_source][data_name]['train_indices'] = indices['train_indices']
                         snaps[data_source][data_name]['test_indices'] = indices['test_indices']
                         snaps[data_source][data_name]['val_indices'] = indices['val_indices']
+                        snaps[data_source][data_name]['split_version'] = indices['split_version']
         
         # Save updated splits
         with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
@@ -434,50 +442,44 @@ class runner(nn.Module):
                            "(if the source has more, recompress with overwrite 'l')", name, int(cap), total)
         return limit
 
+    # recorded with each run's split and metrics; see _split_indices
+    SPLIT_VERSION = 2
+
     def _split_indices(self, total_snaps, train_split=0.8, test_split=0.1, sample_train=0, sample_test=0):
-        # find indices for train, test, and validation sets
-        train_len = int(total_snaps * train_split)
-        test_len = int(train_len * test_split)
+        """Contiguous train / test / validation blocks of a record.
 
-        train_indices = np.arange(0, train_len - test_len)
-        test_indices = np.arange(train_len - test_len, train_len)
-        val_indices = np.arange(train_len, total_snaps)
+        The record [0, total) splits into training [0, a), test [a, b) and
+        validation [b, total), with b = int(total * train_split) and
+        a = b - int(b * test_split). Train and test hold the start index of every
+        (time_lag + train_ahead) window that fits inside their own block, so no
+        test window touches a training snapshot or the reverse; validation holds
+        every snapshot id of its block (eval rolls out from them).
 
-        logger.info(f"{'Set':<12}|{'Total':<10}|{'First Idx':<12}|{'Last Idx':<12}|{'Sampled':<10}")
-        logger.info("-" * 56)
-        logger.info(f"{'Train':<12}|{train_len:<10}|{train_indices[0]:<12}|{train_indices[-1]:<12}|{sample_train:<10}")
-        logger.info(f"{'Test':<12}|{len(test_indices):<10}|{test_indices[0]:<12}|{test_indices[-1]:<12}|{sample_test:<10}")
-        logger.info(f"{'Validation':<12}|{len(val_indices):<10}|{val_indices[0]:<12}|{val_indices[-1]:<12}|{'-':<10}")
+        Version 1 (before 2026-10-13) let the training windows run through the
+        test block and started the test windows at 0, inside the training data,
+        so early stopping and the LR schedule watched in-sample loss. Existing
+        runs keep the split cached in their split_ids.pkl. Pure: _latent_split
+        does the caching (this used to write that file itself, which handed a
+        second data source the first one's split).
+        """
+        mp = self.config['model_params']
+        window = dict(time_lag=mp['time_lag'], train_ahead=mp['train_ahead'], seed=42)
+        b = int(total_snaps * train_split)
+        a = b - int(b * test_split)
+        train = np.sort(datas.sample_series_indices(a, sample_train, **window))
+        test = a + np.sort(datas.sample_series_indices(b - a, sample_test, **window))
+        val = np.arange(b, total_snaps)
+        if test_split > 0 and len(test) == 0:
+            raise ValueError(f"test block of {b - a} snapshots holds no {mp['time_lag'] + mp['train_ahead']}-step "
+                             "window; raise test_split")
 
-        if not os.path.exists(self.paths_bib.model_dir + 'split_ids.pkl'):
-            indices = {}
-
-
-            indices['train_indices'] = np.sort(datas.sample_series_indices(
-                                        train_len, 
-                                        sample_train, 
-                                        time_lag=self.config['model_params']['time_lag'], 
-                                        train_ahead=self.config['model_params']['train_ahead'], 
-                                        seed=42))
-            indices['test_indices'] = np.sort(datas.sample_series_indices(
-                                        len(test_indices), 
-                                        sample_test, 
-                                        time_lag=self.config['model_params']['time_lag'], 
-                                        train_ahead=self.config['model_params']['train_ahead'], 
-                                        seed=42))
-            indices['val_indices'] = val_indices
-
-            # save the train, test, and validation indices
-            with open(self.paths_bib.model_dir + 'split_ids.pkl', 'wb') as f:
-                pickle.dump(indices, f)
-            logger.info(f"Train, test, and validation indices saved to {self.paths_bib.model_dir + 'split_ids.pkl'}")
-
-        else:
-            with open(self.paths_bib.model_dir + 'split_ids.pkl', 'rb') as f:
-                indices = pickle.load(f)
-            logger.info(f"Train, test, and validation indices loaded from {self.paths_bib.model_dir + 'split_ids.pkl'}")
-        
-        return indices
+        logger.info(f"{'Set':<12}|{'Block':<14}|{'Windows / ids':<14}|{'Sampled':<10}")
+        logger.info("-" * 52)
+        logger.info(f"{'Train':<12}|{f'[0, {a})':<14}|{len(train):<14}|{sample_train:<10}")
+        logger.info(f"{'Test':<12}|{f'[{a}, {b})':<14}|{len(test):<14}|{sample_test:<10}")
+        logger.info(f"{'Validation':<12}|{f'[{b}, {total_snaps})':<14}|{len(val):<14}|{'-':<10}")
+        return {'train_indices': train, 'test_indices': test, 'val_indices': val,
+                'split_version': self.SPLIT_VERSION}
     
     def _get_model(self):
         """
@@ -1877,14 +1879,25 @@ class runner(nn.Module):
         return self._assemble_dof_preds(predictions, geom)
 
 
+    def _pred_sources(self):
+        """(source, split_key) pairs that pred() and eval() cover.
+
+        Top-level `eval_train_split: false` skips the in-sample rollout over the
+        training block. On the 512x512 cavity it writes ~4 GB of reconstructed
+        fields per run (~7 GB at Re 30k), most of a run's disk use, for in-sample
+        numbers only; the held-out validation block is always covered.
+        """
+        out = []
+        if self.config.get('train_data') is not None and self.config.get('eval_train_split', True):
+            out.extend((source, 'train_indices') for source in self.config['train_data'])
+        if self.config.get('eval_data') is not None:
+            out.extend((source, 'val_indices') for source in self.config['eval_data'])
+        return out
+
     def pred(self) -> None:
         """Make predictions over the validation data for all sets in config['eval_data']."""
         logger.info(f"{'#'*20}\t{'Predicting...':<20}\t{'#'*20}")
-        pred_sources = []
-        if self.config.get('train_data') is not None:
-            pred_sources.extend((source, 'train_indices') for source in self.config['train_data'])
-        if self.config.get('eval_data') is not None:
-            pred_sources.extend((source, 'val_indices') for source in self.config['eval_data'])
+        pred_sources = self._pred_sources()
             
 
         for id, (source, split_key) in enumerate(pred_sources):
@@ -1980,11 +1993,7 @@ class runner(nn.Module):
         """
         logger.info(f"{'#'*20}\t{'Reconstructing predictions...':<20}\t{'#'*20}")
         # get all files in pred directory and loop through them
-        pred_sources = []
-        if self.config.get('train_data') is not None:
-            pred_sources.extend((source, 'train_indices') for source in self.config['train_data'])
-        if self.config.get('eval_data') is not None:
-            pred_sources.extend((source, 'val_indices') for source in self.config['eval_data'])
+        pred_sources = self._pred_sources()
         for id, (source, split_key) in enumerate(pred_sources):
             name = source.get('name')
             source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
@@ -2132,6 +2141,7 @@ class runner(nn.Module):
             'rollout': mp.get('rollout', {'mode': 'detached'}),
             'grad_clip': mp.get('grad_clip', GRAD_CLIP_MAX_NORM),
             'seed': mp.get('seed'),
+            'split_version': self.indices.get('train_data', {}).get(name, {}).get('split_version', 1),
             'metrics': {k: (None if v is None else float(v)) for k, v in scalars.items()},
         }
         with open(stem + '.json', 'w') as f:
@@ -2153,11 +2163,7 @@ class runner(nn.Module):
         self.latent_id = self.paths_bib.latent_id
         pl.plot_loss(self)
 
-        pred_sources = []
-        if self.config.get('train_data') is not None:
-            pred_sources.extend((source, 'train_indices') for source in self.config['train_data'])
-        if self.config.get('eval_data') is not None:
-            pred_sources.extend((source, 'val_indices') for source in self.config['eval_data'])
+        pred_sources = self._pred_sources()
 
         for id, (source, split_key) in enumerate(pred_sources):
             name = source.get('name')
@@ -2263,7 +2269,15 @@ class runner(nn.Module):
         finds the file busy waits and retries.
         """
         ok = (lambda ds: True) if valid is None else valid
-        with h5py.File(gt_path, 'r') as f:
+        for attempt in range(60):             # another eval may hold the write lock briefly
+            try:
+                f = h5py.File(gt_path, 'r')
+                break
+            except OSError:
+                if attempt == 59:
+                    raise
+                time.sleep(10)
+        with f:
             if key in f and ok(f[key]):
                 logger.info(f"{key} found in {gt_path}")
                 return f[key][:]

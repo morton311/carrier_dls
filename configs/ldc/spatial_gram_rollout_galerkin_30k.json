@@ -34,7 +34,8 @@
         "lr_floor_patience": 20,
         "loss_metric": "gram",
         "norm": "per_dof",
-        "amp_growth_interval": 10000
+        "amp_growth_interval": 10000,
+        "seed": 1
     },
     "latent_params": {
         "type": "dls",
@@ -65,5 +66,6 @@
             "pred_split": 0.2,
             "max_snapshots": 4500
         }
-    ]
+    ],
+    "eval_train_split": false
 }
