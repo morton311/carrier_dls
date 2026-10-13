@@ -438,8 +438,10 @@ class runner(nn.Module):
             logger.info("Limiting '%s' to %d of %d snapshots (%.1f%%)",
                         name, limit, total, limit / total * 100)
         if log and cap is not None and int(cap) > total:
-            logger.warning("'%s': max_snapshots=%d but the latent holds only %d snapshots "
-                           "(if the source has more, recompress with overwrite 'l')", name, int(cap), total)
+            logger.warning("'%s': max_snapshots=%d but the latent holds only %d snapshots. An existing "
+                           "latent group is never recompressed; to use more snapshots give the "
+                           "dataset a new name (a new latent) or delete its group from latent_coeff.h5",
+                           name, int(cap), total)
         return limit
 
     # recorded with each run's split and metrics; see _split_indices
@@ -585,6 +587,29 @@ class runner(nn.Module):
         else:
             self.model = self.model.to(self.device)
 
+    def _build_optimizer(self):
+        """Adam, or AdamW when model_params.weight_decay > 0.
+
+        Decoupled decay (AdamW) shrinks the weights by lr * weight_decay each
+        step, independent of the gradient: an L2 term added to the loss would be
+        rescaled away by Adam's per-parameter normalization. Only weight
+        matrices decay; biases and LayerNorm gains (1-D parameters) are left
+        alone, the usual exclusion. weight_decay 0 (default) is the plain Adam
+        used so far.
+        """
+        mp = self.config['model_params']
+        lr, wd = mp['lr'], float(mp.get('weight_decay', 0.0))
+        if wd <= 0:
+            return torch.optim.Adam(self.model.parameters(), lr=lr)
+        decay, keep = [], []
+        for p in self.model.parameters():
+            if p.requires_grad:
+                (decay if p.ndim >= 2 else keep).append(p)
+        logger.info(f"AdamW weight decay {wd:g} on {sum(p.numel() for p in decay) / 1e6:.2f}M weights; "
+                    f"{sum(p.numel() for p in keep) / 1e3:.1f}k bias / norm parameters undecayed")
+        return torch.optim.AdamW([{'params': decay, 'weight_decay': wd},
+                                  {'params': keep, 'weight_decay': 0.0}], lr=lr)
+
     def _compile_model(self):
         """
         Compile the model
@@ -617,8 +642,8 @@ class runner(nn.Module):
             self.last_terms = None
             self._term_totals = None
             self._term_count = 0
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['model_params']['lr'])
-            
+            self.optimizer = self._build_optimizer()
+
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode='min',
@@ -2141,6 +2166,7 @@ class runner(nn.Module):
             'rollout': mp.get('rollout', {'mode': 'detached'}),
             'grad_clip': mp.get('grad_clip', GRAD_CLIP_MAX_NORM),
             'seed': mp.get('seed'),
+            'weight_decay': mp.get('weight_decay', 0.0),
             'split_version': self.indices.get('train_data', {}).get(name, {}).get('split_version', 1),
             'metrics': {k: (None if v is None else float(v)) for k, v in scalars.items()},
         }
