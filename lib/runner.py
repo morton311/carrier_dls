@@ -5,6 +5,7 @@ import h5py
 import pickle
 import copy
 import hashlib
+import random
 
 import numpy as np
 import torch
@@ -92,6 +93,15 @@ class runner(nn.Module):
 
         # get model info
         self._get_data()
+        # model_params.seed fixes the weight initialization and the training
+        # shuffles; set after the latent is loaded so it never changes how a new
+        # latent space is compressed (the data split is seeded separately)
+        seed = self.config['model_params'].get('seed')
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            logger.info(f"Seed: {seed}")
         self._get_model()
         self._compile_model()
 
@@ -220,7 +230,11 @@ class runner(nn.Module):
         defines the basis.
         """
         lp = self.config['latent_params']
+        max_snaps = self._compress_limit(data_path)
+        if max_snaps is not None and (lp['type'] != 'dls' or self.dim == 3):
+            raise NotImplementedError("latent_params.compress_used_only is implemented for 2D DLS only")
         if lp['type'] == 'dls':
+            extra = {} if max_snaps is None else {'max_snaps': max_snaps}
             return self.dls.gfem_compress_flexible(
                 data_source=data_path,
                 field_name='UV',
@@ -230,6 +244,7 @@ class runner(nn.Module):
                 latent_target=self.paths_bib.latent_path,
                 batch_size=lp['batch_size'],
                 dls_config=latent_config,
+                **extra,
             )
         elif lp['type'] == 'pod':
             if lp.get('localized', False):
@@ -373,7 +388,28 @@ class runner(nn.Module):
         self.indices = snaps
             
 
-    def _limit_snapshots(self, total, source, name):
+    def _compress_limit(self, data_path):
+        """Leading snapshots of `data_path` the configured splits use, or None for all.
+
+        Only with latent_params.compress_used_only. The latent is otherwise
+        built from the whole file even when max_snapshots / snapshot_frac use
+        a fraction of it -- reading all 376 GB of the 60k-snapshot Re 30k
+        record to use 4,500 snapshots. Every train/eval entry that reads the
+        file counts, so the latent covers the largest of them.
+        """
+        if not self.config['latent_params'].get('compress_used_only', False):
+            return None
+        with h5py.File(data_path, 'r') as f:
+            total = f['UV'].shape[0]
+        limits = [self._limit_snapshots(total, src, src.get('name'), log=False)
+                  for group in self.data_sources for src in (self.config.get(group) or [])
+                  if self.paths_bib.data_dir + src.get('path') + '.h5' == data_path]
+        if not limits:
+            return None
+        limit = max(limits)
+        return None if limit >= total else limit
+
+    def _limit_snapshots(self, total, source, name, log=True):
         """Cap how much of a record is used, per data source.
 
         ``max_snapshots`` (a count) and ``snapshot_frac`` (a fraction) both take
@@ -390,9 +426,12 @@ class runner(nn.Module):
         cap = source.get('max_snapshots')
         if cap is not None:
             limit = min(limit, int(cap))
-        if limit < total:
+        if limit < total and log:
             logger.info("Limiting '%s' to %d of %d snapshots (%.1f%%)",
                         name, limit, total, limit / total * 100)
+        if log and cap is not None and int(cap) > total:
+            logger.warning("'%s': max_snapshots=%d but the latent holds only %d snapshots "
+                           "(if the source has more, recompress with overwrite 'l')", name, int(cap), total)
         return limit
 
     def _split_indices(self, total_snaps, train_split=0.8, test_split=0.1, sample_train=0, sample_test=0):
@@ -2092,6 +2131,7 @@ class runner(nn.Module):
             'loss': mp.get('loss', 'mse'),
             'rollout': mp.get('rollout', {'mode': 'detached'}),
             'grad_clip': mp.get('grad_clip', GRAD_CLIP_MAX_NORM),
+            'seed': mp.get('seed'),
             'metrics': {k: (None if v is None else float(v)) for k, v in scalars.items()},
         }
         with open(stem + '.json', 'w') as f:
@@ -2214,21 +2254,25 @@ class runner(nn.Module):
             
 
             
-    def _cached_gt(self, gt_path, key, compute):
+    def _cached_gt(self, gt_path, key, compute, valid=None):
         """Read `key` from the ground-truth file, computing and storing it on first use.
 
-        Opened read-only unless the entry is missing: a write open takes an
-        exclusive lock on the shared data file, which made a second eval running
-        alongside crash. A write that finds the file busy waits and retries.
+        Opened read-only unless the entry is missing (or fails `valid`, which then
+        replaces it): a write open takes an exclusive lock on the shared data
+        file, which made a second eval running alongside crash. A write that
+        finds the file busy waits and retries.
         """
+        ok = (lambda ds: True) if valid is None else valid
         with h5py.File(gt_path, 'r') as f:
-            if key in f:
+            if key in f and ok(f[key]):
                 logger.info(f"{key} found in {gt_path}")
                 return f[key][:]
             value = compute(f)
         for attempt in range(60):
             try:
                 with h5py.File(gt_path, 'r+') as f:
+                    if key in f and not ok(f[key]):
+                        del f[key]
                     if key not in f:
                         f.create_dataset(key, data=value)
                 break
@@ -2238,6 +2282,30 @@ class runner(nn.Module):
                 time.sleep(10)
         logger.info(f"{key} computed and saved to {gt_path}")
         return value
+
+    def _true_tke(self, f, weights, n, batch=250):
+        """Per-snapshot weighted fluctuation energy of snapshots [0, n) of an open truth file.
+
+        Cropped to the latent's grid and read in batches, so memory is bounded
+        whatever the record length.
+        """
+        nx, ny = self.l_config.nx_t, self.l_config.ny_t
+        nz = self.l_config.nz_t if self.dim == 3 else 1
+        if self.dim == 3:
+            mean_gt = f['mean'][:nx, :ny, :nz, :]
+        else:
+            crop = self._xy_crop(nx, ny)
+            mean_gt = self._to_xy(f['mean'][crop], 0)
+        TKE = np.empty(n)
+        for lo in range(0, n, batch):
+            hi = min(lo + batch, n)
+            if self.dim == 3:
+                Q_gt = f['UV'][lo:hi, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
+            else:
+                Q_gt = self._to_xy(f['UV'][(slice(lo, hi),) + crop], 1) - mean_gt[np.newaxis]
+            Q_gt_weighted = (Q_gt * weights[np.newaxis, ..., np.newaxis]).reshape(hi - lo, -1, order='F')
+            TKE[lo:hi] = 0.5 * np.sum(Q_gt_weighted**2, axis=-1)
+        return TKE
 
     def compute_TKE(self, rec_path, gt_path, name, source, ids):
         """
@@ -2283,20 +2351,16 @@ class runner(nn.Module):
             
         
 
-        # per-snapshot over the whole record, indexed by id below, so any run's
-        # window reads it correctly; keyed by latent because the crop is
-        def compute_tke_gt(f):
-            if self.dim == 3:
-                mean_gt = f['mean'][:nx, :ny, :nz, :] # shape: (nx, ny, nz, dim)
-                Q_gt = f['UV'][:, :nx, :ny, :nz, :] - mean_gt[np.newaxis]
-            else:
-                crop = self._xy_crop(nx, ny)
-                mean_gt = self._to_xy(f['mean'][crop], 0) # shape: (nx, ny, dim)
-                Q_gt = self._to_xy(f['UV'][(slice(None),) + crop], 1) - mean_gt[np.newaxis]
-            Q_gt_weighted = Q_gt * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
-            Q_gt_weighted = Q_gt_weighted.reshape(Q_gt_weighted.shape[0], -1, order='F')
-            return 0.5 * np.sum(Q_gt_weighted**2, axis=-1) # shape: (snaps, ...)
-        TKE_gt = self._cached_gt(gt_path, 'TKE_gt_' + self.latent_id + '_' + name + source, compute_tke_gt)
+        # per-snapshot over the snapshots the latent holds, indexed by id below so
+        # any run's window reads it; keyed by latent because the crop is. Read in
+        # batches: a record can be far larger than what is used (the Re 30k file
+        # holds 60k snapshots, 116 GB at this crop, of which 4,500 are used).
+        with h5py.File(self.paths_bib.latent_path, 'r') as f:
+            n_latent = f[name]['dof_u'].shape[0]
+        need = int(np.max(val_id)) + 1
+        TKE_gt = self._cached_gt(gt_path, 'TKE_gt_' + self.latent_id + '_' + name + source,
+                                 lambda f: self._true_tke(f, weights, min(n_latent, f['UV'].shape[0])),
+                                 valid=lambda ds: ds.shape[0] >= need)
 
         TKE_error = pl.l2_err_norm(TKE_gt[val_id[time_lag:]], TKE_rec[time_lag:])
         logger.info(f"TKE error for {name} {source}: {100 * TKE_error:.4f}%")

@@ -445,10 +445,14 @@ def gfem_compress_flexible(
     group_name: Optional[str] = None,
     latent_target: Optional[Union[str, Dict[str, np.ndarray]]] = None,
     batch_size: int = 2500,
-    dls_config: Optional[dls_long_Config_Flexible] = None
+    dls_config: Optional[dls_long_Config_Flexible] = None,
+    max_snaps: Optional[int] = None,
 ):
     """
     Flexible variant of gfem_3d_long.
+
+    max_snaps: compress only the leading max_snaps snapshots (None: all). The
+      local modes come from snapshot 0 either way, so the basis is unchanged.
 
     data_source:
       - str path to an HDF5 file
@@ -465,6 +469,9 @@ def gfem_compress_flexible(
     """
     ndim = 2
     num_snaps, nx, ny, _ = _source_metadata(data_source, field_name)
+    if max_snaps is not None and max_snaps < num_snaps:
+        logger.info(f"Compressing the leading {max_snaps} of {num_snaps} snapshots")
+        num_snaps = int(max_snaps)
     mode_data, grid_x, grid_y = _read_static(data_source, field_name)
 
     patch_x, patch_y = patch_dims(patch_size)
