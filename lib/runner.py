@@ -364,9 +364,13 @@ class runner(nn.Module):
                         logger.info(f"Total snapshots for {data_source} '{data_name}': {snaps[data_source][data_name]['total']}")
 
                         if data_source == 'train_data':
-                            indices = self._split_indices(snaps[data_source][data_name]['total'], 
-                                                        train_split=source['train_split'], 
-                                                        test_split=source['test_split'])
+                            # sample_train / sample_test: number of windows drawn at random
+                            # (with replacement) from each block; 0 or absent keeps every window
+                            indices = self._split_indices(snaps[data_source][data_name]['total'],
+                                                        train_split=source['train_split'],
+                                                        test_split=source['test_split'],
+                                                        sample_train=source.get('sample_train', 0),
+                                                        sample_test=source.get('sample_test', 0))
                         elif data_source == 'eval_data':
                             indices = self._split_indices(snaps[data_source][data_name]['total'], 
                                                         train_split=1-source['pred_split'])
