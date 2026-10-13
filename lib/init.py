@@ -34,6 +34,9 @@ class pathsBib:
 
         if config['latent_params']['type'] == 'dls':
             self.latent_id = source_name + '_dls_p'  + str(config['latent_params']['patch_size']) + 'm' + str(config['latent_params']['num_modes'])
+            if config['latent_params'].get('full_cover', False):
+                # the mesh covers the whole grid: a different latent space
+                self.latent_id += '_fc'
         elif config['latent_params']['type'] == 'bvae':
             filters_str = '_'.join(str(f) for f in config['latent_params']['filters'])
             lins_str = '_'.join(str(l) for l in config['latent_params']['linear'])

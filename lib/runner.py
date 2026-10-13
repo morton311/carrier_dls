@@ -55,6 +55,18 @@ class _RolloutAdapter:
         self.after_step = after_step
 
 
+def _extrapolate_grid(g, nx, ny):
+    """Extend a 2D coordinate grid to at least (nx, ny) along its last spacing."""
+    for axis, n in ((0, nx), (1, ny)):
+        extra = n - g.shape[axis]
+        if extra > 0:
+            last = np.take(g, [-1], axis=axis)
+            step = last - np.take(g, [-2], axis=axis)
+            k = np.arange(1, extra + 1).reshape((-1, 1) if axis == 0 else (1, -1))
+            g = np.concatenate([g, last + k * step], axis=axis)
+    return g
+
+
 class runner(nn.Module):
     def __init__(self, config):
         super(runner, self).__init__()
@@ -235,6 +247,10 @@ class runner(nn.Module):
             raise NotImplementedError("latent_params.compress_used_only is implemented for 2D DLS only")
         if lp['type'] == 'dls':
             extra = {} if max_snaps is None else {'max_snaps': max_snaps}
+            if lp.get('full_cover', False):
+                if self.dim == 3:
+                    raise NotImplementedError("latent_params.full_cover is implemented for 2D DLS only")
+                extra['full_cover'] = True
             return self.dls.gfem_compress_flexible(
                 data_source=data_path,
                 field_name='UV',
@@ -1277,6 +1293,7 @@ class runner(nn.Module):
             'counts': torch.from_numpy(counts).float().to(self.device),
             'counts_cpu': torch.from_numpy(counts).float(),
             'num_dofs': num_dofs,
+            'skip': key,
         }
         self._geom_cache[key] = geom
         logger.info(f"element geometry (skip={key}): {lltogl_mat.shape[0]} elements, {num_dofs} nodal DOFs")
@@ -1305,13 +1322,18 @@ class runner(nn.Module):
                             0.5 * (self.z_grid[lo] + self.z_grid[hi]),
                         ])
         else:
+            nkx, nky = self.dls.config_nskip(self.l_config)
+            # a mesh that overhangs the grid (full_cover) has nodes past its edge:
+            # extend the coordinates there along the last grid spacing
+            ext = (getattr(self.l_config, 'nx_e', 0), getattr(self.l_config, 'ny_e', 0))
+            xg, yg = (_extrapolate_grid(g, *ext) for g in (self.x_grid, self.y_grid))
             for kx in range(0, nx - 1, skipx):
                 for ky in range(0, ny - 1, skipy):
-                    lo = (kx * nskip, ky * nskip)
-                    hi = ((kx + 1) * nskip, (ky + 1) * nskip)
+                    lo = (kx * nkx, ky * nky)
+                    hi = ((kx + 1) * nkx, (ky + 1) * nky)
                     coords.append([
-                        0.5 * (self.x_grid[lo] + self.x_grid[hi]),
-                        0.5 * (self.y_grid[lo] + self.y_grid[hi]),
+                        0.5 * (xg[lo] + xg[hi]),
+                        0.5 * (yg[lo] + yg[hi]),
                     ])
         coords = np.asarray(coords, dtype=np.float64)
         cmin, cmax = coords.min(axis=0), coords.max(axis=0)
@@ -1348,18 +1370,37 @@ class runner(nn.Module):
         if N > self.MAX_DENSE_ASSEMBLY:
             raise NotImplementedError(
                 f"reassemble_lambda needs a dense {N}x{N} inverse; too large, use the default average")
+        # a mesh that overhangs the grid (latent_params.full_cover) gives its cut
+        # elements their own mass matrix over the points inside the domain
+        masks = None
+        if self.dim == 2 and self.dls.is_cut(cfg):
+            masks = self.dls.element_masks(cfg, *geom.get('skip', (1, 1, 1))[:2])
         ops = []
         for B in mats:
             B = np.asarray(B, dtype=np.float64)
             M = (B * Wt[:, None]).T @ B
-            Mr = M + lam * np.trace(M) / n * np.eye(n)
+            # every element's ridge is scaled by the full element's trace, so a cut
+            # element's weakly observed DOFs are held as firmly as interior ones
+            ridge = lam * np.trace(M) / n * np.eye(n)
+            Mr = M + ridge
+            Mr_e = None
+            if masks is not None:
+                cache = {}
+                Mr_e = np.empty((E, n, n))
+                for e, m in enumerate(masks):
+                    k = m.tobytes()
+                    if k not in cache:
+                        cache[k] = (B * (Wt * m)[:, None]).T @ B + ridge
+                    Mr_e[e] = cache[k]
             A = np.zeros((N, N))
             for e in range(E):
-                A[np.ix_(L[e], L[e])] += Mr
+                A[np.ix_(L[e], L[e])] += Mr if Mr_e is None else Mr_e[e]
             # DOFs no element covers (skipped elements) are never gathered; pin them
             free = np.diag(A) == 0
             A[free, free] = 1.0
             Ainv = np.linalg.pinv(A, hermitian=True) if lam == 0 else np.linalg.inv(A)
+            if Mr_e is not None:
+                Mr = Mr_e            # (E, n, n): applied per element below
             ops.append({'Mr': Mr, 'Ainv': Ainv,
                         'Mr_t': torch.from_numpy(Mr).float().to(self.device),
                         'Ainv_t': torch.from_numpy(Ainv).float().to(self.device)})
@@ -1397,7 +1438,10 @@ class runner(nn.Module):
                     flat = flat.index_add(1, geom['scatter_index'], local.reshape(G, -1))
                     flat = flat / geom['counts']
                 else:
-                    flat = flat.index_add(1, geom['scatter_index'], (local @ ops[c]['Mr_t']).reshape(G, -1))
+                    Mr_t = ops[c]['Mr_t']
+                    weighted = (torch.einsum('gei,eij->gej', local, Mr_t) if Mr_t.dim() == 3
+                                else local @ Mr_t)
+                    flat = flat.index_add(1, geom['scatter_index'], weighted.reshape(G, -1))
                     flat = flat @ ops[c]['Ainv_t']
                 comps.append(flat[:, geom['lltogl']])
             out = torch.cat(comps, dim=2)
@@ -1850,7 +1894,8 @@ class runner(nn.Module):
             acc = torch.zeros(total_steps, num_dofs, dtype=torch.float64)
             local = predictions[:, :, c * ndof:(c + 1) * ndof]
             if ops is not None:
-                local = local @ ops[c]['Mr']
+                Mr = ops[c]['Mr']
+                local = np.einsum('eti,eij->etj', local, Mr) if Mr.ndim == 3 else local @ Mr
             vals = torch.from_numpy(np.ascontiguousarray(local.transpose(1, 0, 2)).reshape(total_steps, -1))
             acc.index_add_(1, geom['scatter_index_cpu'], vals)
             out.append(acc.numpy() / counts if ops is None else acc.numpy() @ ops[c]['Ainv'])

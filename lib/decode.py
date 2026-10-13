@@ -33,6 +33,31 @@ logger = logging.getLogger(__name__)
 GRAM_LAMBDA = 1e-2
 
 
+def element_gram_roots(modemat: np.ndarray, masks: np.ndarray, lam: float = 0.0) -> np.ndarray:
+    """(E, n, n) Gram roots, one per element, from that element's in-domain points.
+
+    masks is dls_2d.element_masks: 1 where an element's grid point lies inside the
+    domain. Interior elements share one root; elements that overhang the grid
+    (full_cover) count only their points inside it.
+    """
+    cache = {}
+    out = np.empty((masks.shape[0], modemat.shape[1], modemat.shape[1]))
+    for e, m in enumerate(masks):
+        key = m.tobytes()
+        if key not in cache:
+            cache[key] = element_gram_sqrt(modemat[m > 0], lam)
+        out[e] = cache[key]
+    return out
+
+
+def element_masks_for(runner):
+    """dls_2d.element_masks for the runner's latent when its mesh overhangs the grid, else None."""
+    dls = runner.dls
+    if runner.dim != 2 or not hasattr(dls, 'is_cut') or not dls.is_cut(runner.l_config):
+        return None
+    return dls.element_masks(runner.l_config)
+
+
 def element_gram_sqrt(modemat: np.ndarray, lam: float = 0.0) -> np.ndarray:
     """Symmetric square root W of the regularized Gram matrix.
 
@@ -72,10 +97,17 @@ class ElementGramMetric(nn.Module):
     DOFs the training loop works in and still reports physical energy.
     """
 
-    def __init__(self, weights, std, lltogl=None, dof_elem=None):
+    def __init__(self, weights, std, lltogl=None, dof_elem=None, elem_weights=None):
         super(ElementGramMetric, self).__init__()
         # (dim, dof_elem, dof_elem), scaled by the normalization factor only
         self.register_buffer('weights', weights)
+        # (dim, E, dof_elem, dof_elem) when the mesh overhangs the grid: cut
+        # elements count only their points inside the domain. Applied whenever the
+        # input carries the full element axis; inputs without one (element-local
+        # models that batch elements independently) fall back to `weights`.
+        self.per_element = elem_weights is not None
+        if self.per_element:
+            self.register_buffer('elem_weights', elem_weights)
         # de-normalization is applied to the vector BEFORE gathering, so it works
         # whether dof_std is a scalar or one value per global DOF; folding it
         # into `weights` would only be valid when std indexes the element slot
@@ -103,13 +135,17 @@ class ElementGramMetric(nn.Module):
             num_dofs = z.shape[-1] // self.dim
             comps = [z[..., c * num_dofs:(c + 1) * num_dofs][..., self.lltogl]
                      for c in range(self.dim)]
-        out = [torch.einsum('ij,...j->...i', self.weights[c], comp)
-               for c, comp in enumerate(comps)]
+        if self.per_element and comps[0].dim() >= 2 and comps[0].shape[-2] == self.elem_weights.shape[1]:
+            out = [torch.einsum('eij,...ej->...ei', self.elem_weights[c], comp)
+                   for c, comp in enumerate(comps)]
+        else:
+            out = [torch.einsum('ij,...j->...i', self.weights[c], comp)
+                   for c, comp in enumerate(comps)]
         return torch.cat(out, dim=-1)
 
     def extra_repr(self):
         return (f"dim={self.dim}, dof_elem={self.dof_elem}, "
-                f"localized={self.localized}")
+                f"localized={self.localized}, per_element={self.per_element}")
 
 
 def build_gram_metric(runner, name: str):
@@ -131,6 +167,8 @@ def build_gram_metric(runner, name: str):
 
     lam = float(runner.config['model_params'].get('gram_lambda', GRAM_LAMBDA))
     W = np.stack([element_gram_sqrt(m, lam) for m in mats])  # (dim, dof_elem, dof_elem)
+    masks = element_masks_for(runner)
+    We = None if masks is None else np.stack([element_gram_roots(m, masks, lam) for m in mats])
 
     std = runner.dof_std[name].double()
     dof_elem = l_config.dof_elem
@@ -161,9 +199,12 @@ def build_gram_metric(runner, name: str):
         n_terms = W.shape[0] * lltogl.shape[0] * dof_elem
     scale = np.sqrt(n_terms / max(energy, 1e-30))
     W = W * scale
+    # the interior scale for every element: cut elements then weigh exactly their
+    # share of the field energy relative to full ones
+    We = None if We is None else torch.from_numpy(We * scale).float()
 
     metric = ElementGramMetric(torch.from_numpy(W).float(), std.float(),
-                               lltogl, dof_elem)
+                               lltogl, dof_elem, elem_weights=We)
     logger.info("Field-energy (Gram) loss metric built: %s, lambda %g, "
                 "normalization scale %.4g", metric, lam, scale)
     return metric.to(runner.device)

@@ -17,7 +17,12 @@ Methods scored on the same sequences:
     <latent>/<run>  trained runs given on the command line, seeded with the last
                   time_lag of the 70 given frames
 
-The DLS bases cover 151x49 of the 154x51 grid, so every method is scored on that region.
+Scores are on the full 154x51 grid, as a submission is. A latent whose mesh stops
+short of the grid edge (the historical DLS mesh covers 151x49) cannot represent the
+last rows and columns; its forecasts there are the mean flow (zero fluctuation),
+which is what such a submission would have to send. Latents built with
+latent_params.full_cover represent the whole grid. Each method is also scored on the
+151x49 region alone ('inner'), where every latent is defined.
 
     python scripts/challenge_eval.py cavity_dls_p13m5/spatial_gram_rollout_galerkin ...
     python scripts/challenge_eval.py --check-dmd dmd_matlab.h5   # port vs MATLAB (scripts/challenge/dmd_check.m)
@@ -42,10 +47,11 @@ BLOCK = (11520, 12800)          # held out by every cavity run (pred_split 0.1)
 N_IN, N_OUT, STRIDE = 70, 30, 40
 OUT = 'results/cavity_challenge_eval.json'
 REPORT = (1, 2, 5, 10, 20, 30)
+INNER = (151, 49)               # region the historical (truncated) DLS mesh covers
 PLOT_KEYS = ['persistence', 'mean', 'DMD-25', 'cavity_dls_p13m5/local_gram',
-             'cavity_dls_p13m5/spatial_gram_rollout_galerkin', 'DLS floor (cavity_dls_p13m5)']
+             'cavity_dls_p13m5_fc/spatial_gram_rollout_galerkin_fc_all', 'DLS floor (cavity_dls_p13m5_fc)']
 PLOT_LABELS = ['persistence', 'mean flow', 'DMD, 25 modes', 'element-local temporal transformer',
-               'spatial transformer, Galerkin', 'DLS floor (p13m5)']
+               'spatial transformer, Galerkin', 'DLS floor (p13m5, full grid)']
 
 
 def dmd_forecast(Q, n_modes=25, n_fore=N_OUT):
@@ -118,8 +124,14 @@ def plot(keys, labels, out='figures/challenge_heldout'):
     print(f"wrote {out}.pdf/.png")
 
 
-def model_forecasts(spec, starts, nx, ny):
-    """(n_seq, 30, nx, ny, 2) decoded forecasts of a trained run, seeded from the given frames."""
+def _to_grid(Q, shape):
+    """Zero-pad (..., nx_t, ny_t, 2) fluctuations to the full grid: mean flow where a latent is undefined."""
+    pad = [(0, 0)] * (Q.ndim - 3) + [(0, shape[0] - Q.shape[-3]), (0, shape[1] - Q.shape[-2]), (0, 0)]
+    return np.pad(Q, pad)
+
+
+def model_forecasts(spec, starts, shape):
+    """(n_seq, 30, nx, ny, 2) decoded forecasts of a trained run on the full grid, seeded from the given frames."""
     import torch  # noqa: F401  (runner needs CUDA)
     from lib.runner import runner
     latent, run = spec.split('/')
@@ -137,7 +149,7 @@ def model_forecasts(spec, starts, nx, ny):
                                                 dof_u=du, dof_v=dv, total_steps=tl + N_OUT)
             Q = r.dls.gfem_recon_flexible(config=r.l_config, dof_u=pu[tl:].astype(np.float32),
                                           dof_v=pv[tl:].astype(np.float32), rec_target=None)
-            out.append(Q[:, :nx, :ny])
+            out.append(_to_grid(Q, shape))
     return np.stack(out), c['model_params']['model_type'], tl
 
 
@@ -158,41 +170,47 @@ def main(specs):
         UV = f['UV'][a:b].astype(np.float64)
         mean = f['mean'][:].astype(np.float64)
     q = UV - mean                                            # mean-removed truth
-    nx, ny = 151, 49                                         # region every DLS basis covers
-    true = np.stack([q[s - a + N_IN:s - a + N_IN + N_OUT, :nx, :ny] for s in starts])
+    shape = q.shape[1:3]                                     # full 154x51 grid
+    nx, ny = INNER                                           # region every DLS mesh covers
+    true = np.stack([q[s - a + N_IN:s - a + N_IN + N_OUT] for s in starts])
 
     res = json.load(open(OUT)) if os.path.exists(OUT) else {}
     res['_protocol'] = dict(block=list(BLOCK), starts=starts.tolist(), n_in=N_IN, n_out=N_OUT,
-                            region=[nx, ny], metric='official NMSE of mean-removed fields')
-    E = {}
-    E['persistence'] = np.stack([nmse(np.repeat(q[s - a + N_IN - 1][None, :nx, :ny], N_OUT, 0), t)
-                                 for s, t in zip(starts, true)])
-    E['mean'] = np.ones((len(starts), N_OUT))
+                            region=list(shape), inner=[nx, ny],
+                            metric='official NMSE of mean-removed fields, full grid')
+    F = {}                                                   # method -> (n_seq, 30, nx, ny, 2) on the full grid
+    F['persistence'] = np.stack([np.repeat(q[s - a + N_IN - 1][None], N_OUT, 0) for s in starts])
+    F['mean'] = np.zeros_like(true)
     dmd = []
-    for s, t in zip(starts, true):
-        hist = q[s - a:s - a + N_IN]                          # full 154x51 grid, as the baseline
+    for s in starts:
+        hist = q[s - a:s - a + N_IN]
         Q = hist.transpose(0, 3, 1, 2).reshape(N_IN, -1).T
-        F = dmd_forecast(Q).T.reshape(N_OUT, 2, *hist.shape[1:3]).transpose(0, 2, 3, 1)
-        dmd.append(nmse(F[:, :nx, :ny], t))
-    E['DMD-25'] = np.stack(dmd)
+        dmd.append(dmd_forecast(Q).T.reshape(N_OUT, 2, *shape).transpose(0, 2, 3, 1))
+    F['DMD-25'] = np.stack(dmd)
     for latent in sorted({sp.split('/')[0] for sp in specs}):
         with h5py.File(f'results/{latent}/{NAME}_codec_ref_rec.h5', 'r') as f:
-            E[f'DLS floor ({latent})'] = np.stack([nmse(f['Q_rec'][s + N_IN:s + N_IN + N_OUT].astype(np.float64), t)
-                                                   for s, t in zip(starts, true)])
+            F[f'DLS floor ({latent})'] = np.stack([_to_grid(f['Q_rec'][s + N_IN:s + N_IN + N_OUT].astype(np.float64), shape)
+                                                   for s in starts])
     for sp in specs:
-        F, mtype, tl = model_forecasts(sp, starts, nx, ny)
-        E[sp] = np.stack([nmse(p.astype(np.float64), t) for p, t in zip(F, true)])
+        F[sp], mtype, tl = model_forecasts(sp, starts, shape)
         res.setdefault('_runs', {})[sp] = dict(model_type=mtype, time_lag=tl)
-    for k, e in E.items():
-        res[k] = summarize(e)
+    E, Ei = {}, {}
+    for k, f in F.items():
+        E[k] = np.stack([nmse(p.astype(np.float64), t) for p, t in zip(f, true)])
+        Ei[k] = np.stack([nmse(p[:, :nx, :ny].astype(np.float64), t[:, :nx, :ny]) for p, t in zip(f, true)])
+        res[k] = summarize(E[k])
+        res[k]['inner'] = summarize(Ei[k])
     json.dump(res, open(OUT, 'w'), indent=1)
 
     print(f"{len(starts)} held-out sequences in snapshots {a}-{b - 1}; NMSE mean (std across sequences)")
-    print(f"{'method':44}" + ''.join(f"{'step ' + str(k):>15}" for k in REPORT) + f"{'1-30':>9}{'>1 at':>7}")
-    for k in E:
-        s = res[k]
-        print(f"{k:44}" + ''.join(f"{s['mean'][j - 1]:>8.3f} ({s['std'][j - 1]:.2f})" for j in REPORT)
-              + f"{s['window_mean']:>9.3f}{s['first_step_above_1']:>7}")
+    for title, sel in ((f'full {shape[0]}x{shape[1]} grid (official)', lambda k: res[k]),
+                       (f'{nx}x{ny} region only', lambda k: res[k]['inner'])):
+        print(f"--- {title}")
+        print(f"{'method':48}" + ''.join(f"{'step ' + str(k):>15}" for k in REPORT) + f"{'1-30':>9}{'>1 at':>7}")
+        for k in E:
+            s_ = sel(k)
+            print(f"{k:48}" + ''.join(f"{s_['mean'][j - 1]:>8.3f} ({s_['std'][j - 1]:.2f})" for j in REPORT)
+                  + f"{s_['window_mean']:>9.3f}{s_['first_step_above_1']:>7}")
     print(f"wrote {OUT}")
 
 

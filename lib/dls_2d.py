@@ -38,6 +38,11 @@ class dls_long_Config_Flexible:
     num_modes: int
     modemat_local_u: np.ndarray
     modemat_local_v: np.ndarray
+    # Extend the element mesh past the last full element so it covers the whole
+    # grid; grid points outside the domain carry zero weight (see element_masks).
+    # False keeps the historical mesh, which stops at the last full element and
+    # truncates the grid to (nx_t, ny_t).
+    full_cover: bool = False
 
     def __post_init__(self) -> None:
         self.patch_x, self.patch_y = patch_dims(self.patch_size)
@@ -48,10 +53,13 @@ class dls_long_Config_Flexible:
         self.mid_pt = 1 + self.nskip_sample // 2
         self.mid_pt_x = self.nskip_x + 1
         self.mid_pt_y = self.nskip_y + 1
-        self.sample_x = range(0, self.nx, self.nskip_x)
-        self.sample_y = range(0, self.ny, self.nskip_y)
-        self.nx_t = max(self.sample_x) + 1
-        self.ny_t = max(self.sample_y) + 1
+        # nx_e, ny_e: extent of the element mesh. nx_t, ny_t: extent of the
+        # reconstruction, which is the whole grid when the mesh covers it.
+        self.nx_e, self.ny_e = mesh_extent(self.nx, self.ny, self.nskip_x, self.nskip_y, self.full_cover)
+        self.sample_x = range(0, self.nx_e, self.nskip_x)
+        self.sample_y = range(0, self.ny_e, self.nskip_y)
+        self.nx_t = self.nx if self.full_cover else self.nx_e
+        self.ny_t = self.ny if self.full_cover else self.ny_e
         self.nx_g = len(self.sample_x)
         self.ny_g = len(self.sample_y)
         self.num_gfem_nodes = self.nx_g * self.ny_g 
@@ -92,6 +100,48 @@ def config_nskip(config):
     rectangular patches existed."""
     return (getattr(config, 'nskip_x', config.nskip),
             getattr(config, 'nskip_y', config.nskip))
+
+
+def mesh_extent(nx, ny, nskip_x, nskip_y, full_cover=False):
+    """Grid extent (nx_e, ny_e) spanned by the element mesh.
+
+    Nodes sit every nskip points from 0. Without full_cover the mesh stops at the
+    last node inside the grid, dropping up to nskip-1 trailing rows and columns;
+    with it, one more node is added past the edge wherever the grid would be
+    truncated, so the last elements overhang the domain.
+    """
+    def ext(n, k):
+        last = ((n - 1) // k) * k
+        return n if full_cover and last == n - 1 else (last + k + 1 if full_cover else last + 1)
+    return ext(nx, nskip_x), ext(ny, nskip_y)
+
+
+def element_masks(config, skipx=1, skipy=1):
+    """(E, P) 0/1 weights of each element's grid points: 1 inside the domain.
+
+    Rows follow the element loop of compression, reconstruction and
+    runner._compute_lltogl_mat (x index outer, y inner); columns follow the
+    element's local point order (x fastest, as _build_wt_vec). All ones unless
+    the mesh overhangs the grid (full_cover). Cut elements get their own mass
+    matrix B^T diag(Wt * mask) B, so the points outside the domain, which hold
+    no data, carry no weight in compression, the loss, or assembly.
+    """
+    nkx, nky = config_nskip(config)
+    nx, ny = config.nx, config.ny
+    ix = np.arange(nkx + 1)
+    iy = np.arange(nky + 1)
+    rows = []
+    for i in range(0, config.nx_g - 1, skipx):
+        for j in range(0, config.ny_g - 1, skipy):
+            inside = ((i * nkx + ix)[:, None] < nx) & ((j * nky + iy)[None, :] < ny)
+            rows.append(inside.reshape(-1, order='F'))
+    return np.asarray(rows, dtype=np.float64)
+
+
+def is_cut(config) -> bool:
+    """True when some element overhangs the grid (full_cover with a remainder)."""
+    return bool(getattr(config, 'full_cover', False)) and (
+        getattr(config, 'nx_e', config.nx_t) > config.nx or getattr(config, 'ny_e', config.ny_t) > config.ny)
 
 
 def _build_wt_vec(nskip, nskip_y=None) -> np.ndarray:
@@ -447,9 +497,14 @@ def gfem_compress_flexible(
     batch_size: int = 2500,
     dls_config: Optional[dls_long_Config_Flexible] = None,
     max_snaps: Optional[int] = None,
+    full_cover: bool = False,
 ):
     """
     Flexible variant of gfem_3d_long.
+
+    full_cover: extend the mesh past the grid edge so the whole grid is
+      represented (see dls_long_Config_Flexible.full_cover). A provided
+      dls_config keeps its own setting.
 
     max_snaps: compress only the leading max_snaps snapshots (None: all). The
       local modes come from snapshot 0 either way, so the basis is unchanged.
@@ -477,8 +532,14 @@ def gfem_compress_flexible(
     patch_x, patch_y = patch_dims(patch_size)
     nskip_x = (patch_x - 1) // 2
     nskip_y = (patch_y - 1) // 2
-    sample_x = range(0, nx, nskip_x)
-    sample_y = range(0, ny, nskip_y)
+    if dls_config is not None:
+        full_cover = bool(getattr(dls_config, 'full_cover', False))
+    nx_e, ny_e = mesh_extent(nx, ny, nskip_x, nskip_y, full_cover)
+    sample_x = range(0, nx_e, nskip_x)
+    sample_y = range(0, ny_e, nskip_y)
+    if full_cover and (nx_e > nx or ny_e > ny):
+        logger.info(f"Mesh extended to {nx_e}x{ny_e} to cover the {nx}x{ny} grid; "
+                    "points outside the domain carry zero weight")
 
     nx_g = len(sample_x)
     ny_g = len(sample_y)
@@ -543,10 +604,31 @@ def gfem_compress_flexible(
         logger.info("Constructed weighted local modal matrices from provided local modal matrices")
 
 
-    # With a uniform/structured mesh in this formulation, one local mass matrix is reused.
-    M_local_u = modemat_local_wt_u.T @ modemat_local_u
-    M_local_v = modemat_local_wt_v.T @ modemat_local_v
+    # With a uniform/structured mesh in this formulation, one local mass matrix is
+    # reused; elements that overhang the grid (full_cover) weight only their points
+    # inside it, so they get their own (one per distinct mask).
+    config = dls_long_Config_Flexible(
+        num_snaps=num_snaps,
+        nx=nx,
+        ny=ny,
+        num_vars=ndim,
+        patch_size=patch_size,
+        num_modes=num_modes,
+        modemat_local_u=modemat_local_u,
+        modemat_local_v=modemat_local_v,
+        full_cover=full_cover,
+    )
+    masks = element_masks(config)
+    Wt_vec = _build_wt_vec(nskip_x, nskip_y)
+    M_cache = {}
 
+    def local_mass(mask):
+        key = mask.tobytes()
+        if key not in M_cache:
+            w = Wt_vec * mask
+            M_cache[key] = ((modemat_local_u * w[:, None]).T @ modemat_local_u,
+                            (modemat_local_v * w[:, None]).T @ modemat_local_v)
+        return M_cache[key]
 
     M_u = lil_matrix((num_gfem_nodes * dof_node, num_gfem_nodes * dof_node))
     M_v = lil_matrix((num_gfem_nodes * dof_node, num_gfem_nodes * dof_node))
@@ -554,11 +636,22 @@ def gfem_compress_flexible(
     IJK = node_map()
 
     logger.info("Constructing global M GFEM matrices")
+    e = 0
     for i in range(nx_g - 1):
         for j in range(ny_g - 1):
             lltogl = build_lltogl(i, j, ny_g, dof_node, IJK)
+            M_local_u, M_local_v = local_mass(masks[e])
             M_u[np.ix_(lltogl, lltogl)] += M_local_u
             M_v[np.ix_(lltogl, lltogl)] += M_local_v
+            e += 1
+    if is_cut(config):
+        # Nodes past the edge see only the few grid points their support shares
+        # with the domain, so some of their DOFs are nearly unconstrained. A ridge
+        # far below every resolved direction keeps the solve well posed.
+        ridge = 1e-8 * np.mean(M_u.diagonal()), 1e-8 * np.mean(M_v.diagonal())
+        M_u.setdiag(M_u.diagonal() + ridge[0])
+        M_v.setdiag(M_v.diagonal() + ridge[1])
+        logger.info(f"{len(M_cache)} distinct element mass matrices; ridge 1e-8 x mean diagonal")
 
     logger.info("Prefactorizing M")
     solve_M_u = factorized(M_u.tocsc())
@@ -579,6 +672,10 @@ def gfem_compress_flexible(
         snap_end = min((ib + 1) * batch_size, num_snaps)
 
         Q_grid_u, Q_grid_v = _read_batch(data_source, field_name, snap_start, snap_end)
+        if nx_e > nx or ny_e > ny:
+            # zero data outside the domain; the masked weights already ignore it
+            pad = ((0, nx_e - nx), (0, ny_e - ny), (0, 0))
+            Q_grid_u, Q_grid_v = np.pad(Q_grid_u, pad), np.pad(Q_grid_v, pad)
 
         L_u = np.zeros((num_gfem_nodes * dof_node, snap_end - snap_start))
         L_v = np.zeros((num_gfem_nodes * dof_node, snap_end - snap_start))
@@ -621,17 +718,6 @@ def gfem_compress_flexible(
         total_time += time.time() - t0
 
     logger.info(f"Solved for dofs in {total_time:.2f} seconds")
-
-    config = dls_long_Config_Flexible(
-        num_snaps=num_snaps,
-        nx=nx,
-        ny=ny,
-        num_vars=ndim,
-        patch_size=patch_size,
-        num_modes=num_modes,
-        modemat_local_u=modemat_local_u,
-        modemat_local_v=modemat_local_v
-    )
 
     if latent_target is None:
         return config, dof_u_all, dof_v_all
@@ -696,8 +782,10 @@ def gfem_recon_flexible(
         start_time = time.time()
         logger.info(f"Processing batch {bid+1}/{num_batches}, batch size: {batch_size}")
 
-        Q_rec_u = np.zeros((config.nx_t, config.ny_t, snap_end - snap_start))
-        Q_rec_v = np.zeros((config.nx_t, config.ny_t, snap_end - snap_start))
+        nx_e = getattr(config, 'nx_e', config.nx_t)
+        ny_e = getattr(config, 'ny_e', config.ny_t)
+        Q_rec_u = np.zeros((nx_e, ny_e, snap_end - snap_start))
+        Q_rec_v = np.zeros((nx_e, ny_e, snap_end - snap_start))
 
         for i in range(config.nx_g - 1):
             for j in range(config.ny_g - 1):
@@ -719,8 +807,9 @@ def gfem_recon_flexible(
                 compute_time = time.time() 
                 t_time += compute_time - start_time
 
-        q_rec[snap_start:snap_end, :, :, 0] = Q_rec_u.transpose(2, 0, 1)
-        q_rec[snap_start:snap_end, :, :, 1] = Q_rec_v.transpose(2, 0, 1)
+        # an overhanging mesh reconstructs past the grid edge; keep the grid
+        q_rec[snap_start:snap_end, :, :, 0] = Q_rec_u[:config.nx_t, :config.ny_t].transpose(2, 0, 1)
+        q_rec[snap_start:snap_end, :, :, 1] = Q_rec_v[:config.nx_t, :config.ny_t].transpose(2, 0, 1)
 
         end_time = time.time()
         batch_time = end_time - start_time

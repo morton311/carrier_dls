@@ -67,12 +67,21 @@ def field_energy_fn(runner):
         mats.append(lc.modemat_local_w)
     # lam = 0: exact field energy. The regularized metric used for training
     # deliberately departs from it, which is right for a loss but not a score.
-    W = [decode.element_gram_sqrt(m, 0.0) for m in mats]
     lltogl = runner._compute_lltogl_mat()
+    masks = decode.element_masks_for(runner)
+    if masks is None:
+        W = [decode.element_gram_sqrt(m, 0.0) for m in mats]
+
+        def energy(comps):
+            return sum(((c[..., lltogl] @ Wc.T) ** 2).sum(axis=(-1, -2))
+                       for c, Wc in zip(comps, W))
+        return energy
+    # the mesh overhangs the grid: cut elements count only their points inside it
+    W = [decode.element_gram_roots(m, masks, 0.0) for m in mats]
 
     def energy(comps):
-        return sum(((c[..., lltogl] @ Wc.T) ** 2).sum(axis=(-1, -2))
-                   for c, Wc in zip(comps, W))
+        return sum((np.einsum('eij,...ej->...ei', We, c[..., lltogl]) ** 2).sum(axis=(-1, -2))
+                   for c, We in zip(comps, W))
     return energy
 
 
