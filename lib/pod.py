@@ -116,8 +116,11 @@ def _load_fluctuations(
     data_source: DataInput,
     field_name: str,
     batch_size: int,
+    max_snaps: Optional[int] = None,
 ) -> Tuple[List[np.ndarray], Tuple[int, ...], int]:
     """Load mean-subtracted snapshot matrices, one per velocity component.
+
+    ``max_snaps`` reads only the first snapshots of the record.
 
     Returns ``(X_list, spatial, num_vars)`` where each ``X_list[c]`` has shape
     ``(P, T)`` (spatial points by snapshots) in float64. The spatial axes are
@@ -127,6 +130,8 @@ def _load_fluctuations(
     and reconstructions come back [x, y], as in lib/dls_2d.
     """
     num_snaps, spatial, num_vars = _field_layout(data_source, field_name)
+    if max_snaps is not None:
+        num_snaps = min(num_snaps, int(max_snaps))
     to_xy = _is_yx_source(data_source, spatial)
     if to_xy:
         logger.info("POD: source is stored [y, x]; transposing spatial axes to [x, y].")
@@ -165,6 +170,63 @@ def _load_fluctuations(
     return X_list, spatial, num_vars
 
 
+def _snapshot_gram(Xf: np.ndarray, rows: int = 16384) -> np.ndarray:
+    """``Xf^T Xf`` in float64, accumulated over row blocks on the GPU when there is one.
+
+    NumPy's BLAS runs this product single-threaded here (hours for 262k x 7,200);
+    float32 blocks on the GPU take seconds, and the float64 sum keeps the leading
+    eigenvalues accurate.
+    """
+    import torch
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    G = np.zeros((Xf.shape[1], Xf.shape[1]))
+    for r in range(0, Xf.shape[0], rows):
+        b = torch.from_numpy(np.ascontiguousarray(Xf[r:r + rows], dtype=np.float32)).to(dev)
+        G += (b.T @ b).double().cpu().numpy()
+    return G
+
+
+def _project(X: np.ndarray, W: np.ndarray, rows: int = 16384) -> np.ndarray:
+    """``X^T W`` for a tall ``X`` (P, T) and ``W`` (P, k), in row blocks on the GPU."""
+    import torch
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    out = torch.zeros(X.shape[1], W.shape[1], dtype=torch.float64, device=dev)
+    for r in range(0, X.shape[0], rows):
+        b = torch.from_numpy(np.ascontiguousarray(X[r:r + rows], dtype=np.float32)).to(dev)
+        w = torch.from_numpy(np.ascontiguousarray(W[r:r + rows], dtype=np.float32)).to(dev)
+        out += (b.T @ w).double()
+    return out.cpu().numpy()
+
+
+def _component_pod_snapshots(X: np.ndarray, num_modes: int, fit: int) -> Tuple[np.ndarray, np.ndarray]:
+    """POD fit to the first ``fit`` columns of ``X`` by the method of snapshots.
+
+    Returns ``(modes, coeffs)`` like :func:`_component_pod`, with ``coeffs`` the
+    projection of every column of ``X`` onto the modes, so snapshots after
+    ``fit`` (validation) never shape the basis. Solves the ``fit x fit``
+    eigenproblem of ``X_fit^T X_fit``, which is far cheaper than a sparse SVD
+    when many modes are wanted and ``fit << P``.
+    """
+    import torch
+    Xf = X[:, :fit]
+    k = min(num_modes, fit - 1)
+    if k < num_modes:
+        logger.warning("Requested %d POD modes but only %d fit snapshots; truncating to %d.",
+                       num_modes, fit, k)
+    lam, V = torch.linalg.eigh(torch.from_numpy(_snapshot_gram(Xf)))
+    lam, V = lam.numpy()[::-1][:k], V.numpy()[:, ::-1][:, :k]
+    # modes = Xf V / sqrt(lam), built row block by row block
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    scale = torch.from_numpy(np.ascontiguousarray(V / np.sqrt(np.maximum(lam, 1e-300))[None, :],
+                                                  dtype=np.float32)).to(dev)
+    modes = np.empty((X.shape[0], k), dtype=np.float32)
+    for r in range(0, X.shape[0], 16384):
+        b = torch.from_numpy(np.ascontiguousarray(Xf[r:r + 16384], dtype=np.float32)).to(dev)
+        modes[r:r + 16384] = (b @ scale).cpu().numpy()
+    coeffs = _project(X, modes).astype(np.float32)                     # (T, k)
+    return modes, coeffs
+
+
 def _component_pod(X: np.ndarray, num_modes: int) -> Tuple[np.ndarray, np.ndarray]:
     """Truncated POD of a single component snapshot matrix.
 
@@ -201,8 +263,14 @@ def pod_compress(
     latent_target: Optional[Union[str, Dict[str, np.ndarray]]] = None,
     batch_size: int = 2500,
     pod_config: Optional[pod_Config] = None,
+    max_snaps: Optional[int] = None,
+    fit_snaps: Optional[int] = None,
 ):
     """Compute global POD temporal coefficients for ``data_source``.
+
+    ``max_snaps`` compresses only the first snapshots of the record;
+    ``fit_snaps`` fits the basis to the first ``fit_snaps`` of them (the
+    training block) and projects the rest, so held-out data never enters it.
 
     When ``pod_config`` is ``None`` the POD basis is computed from this data
     (used for the "source" dataset that defines the latent space). When a
@@ -216,17 +284,21 @@ def pod_compress(
       - dict: stores the dof arrays in the provided dict
     """
     t0 = time.time()
-    X_list, spatial, num_vars = _load_fluctuations(data_source, field_name, batch_size)
+    X_list, spatial, num_vars = _load_fluctuations(data_source, field_name, batch_size, max_snaps)
     num_snaps = X_list[0].shape[1]
     logger.info(f"POD: loaded fluctuations, spatial={spatial}, num_vars={num_vars}, "
                 f"num_snaps={num_snaps}")
 
     if pod_config is None:
-        logger.info(f"Computing global POD basis ({num_modes} modes per component)")
+        fit = f" on the first {fit_snaps} snapshots" if fit_snaps else ""
+        logger.info(f"Computing global POD basis ({num_modes} modes per component{fit})")
         modes: List[np.ndarray] = []
         coeffs: List[np.ndarray] = []
         for c in range(num_vars):
-            m, a = _component_pod(X_list[c], num_modes)
+            if fit_snaps:
+                m, a = _component_pod_snapshots(X_list[c], num_modes, int(fit_snaps))
+            else:
+                m, a = _component_pod(X_list[c], num_modes)
             modes.append(m)
             coeffs.append(a)
             logger.info(f"  component {c}: modes {m.shape}, coeffs {a.shape}")

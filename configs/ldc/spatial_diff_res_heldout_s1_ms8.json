@@ -1,0 +1,74 @@
+{
+    "model_params": {
+        "model_name": "spatial_diff",
+        "model_type": "tr_spatial_diff",
+        "time_lag": 4,
+        "train_ahead": 8,
+        "num_layers": 4,
+        "nhead": 4,
+        "d_model": 256,
+        "ff_dim": 768,
+        "coord_freqs": 6,
+        "dropout": 0.1,
+        "reassemble_lambda": 0.01,
+        "lr": 0.0001,
+        "lr_factor": 0.5,
+        "lr_min": 1e-06,
+        "lr_patience": 10,
+        "grad_clip": 1.0,
+        "loss": "mse",
+        "batch_size": 64,
+        "num_epochs": 300,
+        "patience": 30,
+        "es_min_delta": 0.002,
+        "lr_floor_patience": 20,
+        "activation": "swiglu",
+        "norm": "per_dof",
+        "amp_growth_interval": 10000,
+        "seed": 1,
+        "diffusion": {
+            "space": "dof",
+            "weighting": "snr1_trunc",
+            "gamma": 5.0,
+            "sample_steps": 4,
+            "eta": 0.0,
+            "members": 8,
+            "ema_decay": 0.999,
+            "mean_model": "results/ldc_15k_dls_p99m10/spatial_gram_rollout_galerkin_heldout_s1",
+            "ms_steps": 8,
+            "ms_members": 2,
+            "ms_sampler_steps": 4,
+            "ms_dsm_weight": 1.0
+        },
+        "lr_threshold": 0.005,
+        "init_from": "results/ldc_15k_dls_p99m10/spatial_diff_res_heldout_s1/model.pth"
+    },
+    "latent_params": {
+        "type": "dls",
+        "patch_size": 99,
+        "num_modes": 10,
+        "localized": true,
+        "source_name": "ldc_15k",
+        "source_path": "ldc_15k",
+        "batch_size": 250,
+        "skipx": 1,
+        "skipy": 1,
+        "skipz": 1
+    },
+    "train_data": [
+        {
+            "name": "ldc_15k",
+            "path": "ldc_15k",
+            "train_split": 0.8,
+            "test_split": 0.1
+        }
+    ],
+    "eval_data": [
+        {
+            "name": "ldc_15k",
+            "path": "ldc_15k",
+            "pred_split": 0.2
+        }
+    ],
+    "eval_train_split": false
+}

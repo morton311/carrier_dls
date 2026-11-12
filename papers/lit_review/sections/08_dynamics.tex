@@ -1,0 +1,178 @@
+% ======================================================================
+\section{Coupling reduced coordinates to learned dynamics}
+\label{sec:dynamics}
+% ======================================================================
+
+A reduced representation is rarely an end in itself; in most ML applications it
+is the state space of a forecasting or surrogate model. This section surveys
+how latent dynamics are learned and, more importantly for the choice of DR,
+which properties of the latent space make them learnable.
+
+\subsection{Sequential versus joint training}
+
+In \emph{sequential} training the encoder and decoder are fitted first, by POD,
+DLS, or an AE trained on reconstruction alone, and the dynamics model is then
+trained on the fixed latent trajectories
+\parencite{hasegawa2020bluff,nakamura2021channel,solera2024betavae,morton2026scitech}.
+This is modular and cheap, and a single representation can serve several
+dynamics models. Reconstruction-optimal coordinates, however, are not
+necessarily forecasting-friendly. In \emph{joint} training the dynamics loss is
+back-propagated into the encoder, shaping the latent space so that its
+evolution is simple: linear \parencite{lusch2018koopman,otto2019linearly},
+sparse in a function library \parencite{champion2019sindyae}, or accurately
+integrable over several steps \parencite{fresca2021dlrom}. Joint training
+couples the design choices and is harder to optimize, but it addresses property
+(P3) directly. Intermediate strategies fine-tune a pretrained autoencoder with
+a small dynamics loss or add temporal-smoothness regularization to the latent
+trajectories.
+
+\subsection{Structured regression: operator inference and sparse identification}
+
+When the latent space is linear (POD), physics suggests the structure of the
+reduced model. For the incompressible Navier--Stokes equations Galerkin
+projection yields a quadratic system
+$\dot{\z}=\bm{c}+\bm{A}\z+\bm{H}(\z\otimes\z)$, and operator inference learns
+$\bm{c},\bm{A},\bm{H}$ by least squares from projected trajectories
+\parencite{peherstorfer2016opinf,kramer2024opinf}. Lifting transformations
+extend this to non-polynomial systems \parencite{qian2020liftlearn}, and
+quadratic manifolds extend it to curved trial manifolds
+\parencite{geelen2023quadratic}. Sparse identification of nonlinear dynamics
+(SINDy) \parencite{brunton2016sindy} instead selects a few terms from a library
+of candidate functions by sparse regression, yielding interpretable latent
+equations. \textcite{loiseau2018sparse} applied it to sensor-derived features.
+\textcite{champion2019sindyae} trained an autoencoder jointly with a SINDy model
+so that the discovered coordinates admit a parsimonious governing equation.
+The LaSDI family extends this to parametric problems: latent ODE coefficients
+are identified for each training parameter and interpolated to new ones
+\parencite{fries2022lasdi}, with greedy, physics-informed sampling of training
+parameters \parencite{he2023glasdi} and Gaussian-process interpolation with
+uncertainty quantification \parencite{bonneville2024gplasdi}.
+
+\subsection{Koopman embeddings}
+\label{sec:koopman}
+
+Koopman operator theory seeks observables in which a nonlinear system evolves
+linearly \parencite{mezic2013,brunton2022koopman}. Deep Koopman methods learn
+these observables with an autoencoder and impose linear latent dynamics
+$\z_{k+1}=\bm{K}\z_k$ through a multi-step prediction loss
+\parencite{takeishi2017koopman,lusch2018koopman,otto2019linearly}.
+\textcite{lusch2018koopman} used an auxiliary network to parametrize eigenvalues
+as functions of the state, capturing systems with continuous spectra.
+\textcite{morton2018deep} learned such models of cylinder-wake dynamics and
+used them for model-predictive control, and \textcite{pan2020physics}
+introduced a probabilistic formulation with guaranteed stability. For a
+low-order model of near-wall turbulence, \textcite{eivazi2021koopman} found that
+a Koopman framework with nonlinear forcing reproduced the long-term statistics
+as accurately as an LSTM at lower cost, and gave better short-term
+predictions. Koopman embeddings also serve as tokenizers for transformers
+\parencite{geneva2022transformers}.
+
+\subsection{Recurrent networks, reservoir computing, and neural ODEs}
+
+Recurrent networks, especially LSTMs \parencite{hochreiter1997lstm}, were the
+first widely used black-box latent dynamics models.
+\textcite{vlachas2018lstm} forecast high-dimensional chaotic systems with LSTMs
+in a reduced-order space. For the nine-equation model of turbulent shear flow,
+\textcite{srinivasan2019} reproduced turbulence statistics with sub-percent
+errors using LSTMs. The LSTM-on-POD and LSTM-on-CAE combinations of
+\cref{sec:pod,sec:autoencoders} follow the same pattern
+\parencite{wang2018model,mohan2018lstm,eivazi2020deep,hasegawa2020bluff,maulik2021advection,borrelli2022channels}.
+Reservoir computing trains only a linear readout of a large random recurrent
+network. It forecasts spatiotemporal chaos well when combined with spatial
+localization \parencite{pathak2018reservoir} or with a CAE latent space
+\parencite{racca2023caesn}, and \textcite{vlachas2020backprop} compared it
+systematically with back-propagated RNNs. Neural ODEs \parencite{chen2018node}
+learn a continuous-time vector field $\dot{\z}=\bm{f}_{\theta}(\z)$, which
+suits irregularly sampled data and connects naturally with dynamical-systems
+analysis. In autoencoder coordinates of the Kuramoto--Sivashinsky equation,
+\textcite{linot2022node} found that dimension reduction improves performance
+relative to learning in the ambient space, and identified a ``sweet spot''
+in latent dimension. Stabilized variants add a learned linear damping term for
+long-time forecasting \parencite{linot2023stabilized}, and the approach has been
+applied to minimal-flow-unit Couette turbulence \parencite{linot2023couette}.
+Learning the effective dynamics (LED) \parencite{vlachas2022led} couples an AE
+and a recurrent latent propagator with intermittent fine-scale simulation in
+an equation-free framework, reducing computational effort by up to two orders
+of magnitude while maintaining accuracy.
+
+\subsection{Attention-based sequence models}
+
+Transformers \parencite{vaswani2017attention} replace recurrence with
+self-attention over a context window of past latent states, which captures
+long-range temporal dependencies and trains in parallel.
+\textcite{wu2022transformer} combined a transformer with POD for flows past a
+cylinder and a group of buildings, and \textcite{geneva2022transformers} with
+Koopman embeddings for several physical systems. \textcite{hemmasian2023transformers}
+used a CAE latent space and reported competitive results even for turbulent
+datasets. \textcite{solera2024betavae} and \textcite{wang2024optimal} used
+$\beta$-VAE latent spaces. Transformers have also been used without a
+separate autoencoder, on subsampled or pre-processed fields:
+\textcite{yousif2023transformer} generated turbulent inflow planes for
+spatially developing boundary layers by combining a transformer with a
+super-resolution GAN, and \textcite{sarma2024tbl} predicted actuated turbulent
+boundary-layer fields after a dimensionality-reducing pre-processing step.
+\textcite{morton2026scitech} paired transformers with DLS latent spaces for
+cavity flows at $\mathrm{Re}=15{,}000$ and $30{,}000$
+(\cref{sec:dls}). Attention can also operate over \emph{space}: when the latent
+state is a set of spatially anchored tokens, as in DLS, AROMA, or universal
+physics transformers
+\parencite{deshmukh2020dls,serrano2024aroma,alkin2024upt}, the sequence model can
+attend across tokens as well as time, and forecasting itself can be posed
+locally.
+
+\subsection{Latent generative models}
+
+Deterministic models trained with a mean-squared loss converge to the
+conditional mean of future states. For chaotic flows this is smoother and less
+energetic than any single realization, and the resulting under-dispersion
+often drives rollout drift. Generative models address this by learning the
+distribution of future states. Latent diffusion models, developed for images
+\parencite{rombach2022ldm}, have been adapted to turbulence generation with
+conditional-neural-field latents \parencite{du2024cnf} and to Bayesian
+conditional generation \parencite{gao2024bayesian}. \textcite{kohl2023acdm}
+benchmarked autoregressive conditional diffusion models for turbulent flow
+prediction. Even simple diffusion approaches matched or outperformed
+established methods in accuracy and temporal stability, at a higher inference
+cost, while providing samples consistent with the flow statistics. PDE-Refiner
+\parencite{lippe2023pderefiner} achieves accurate long rollouts through an
+iterative refinement that attends to low-amplitude frequency components. The
+compression provided by DR is especially valuable for diffusion models, whose
+cost scales with the dimension of the space in which they denoise.
+
+\subsection{What makes a latent space good for dynamics?}
+\label{sec:goodlatent}
+
+Across these studies, several latent-space properties recur as predictors of
+successful forecasting, beyond reconstruction accuracy.
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+  \item \emph{Sufficiency and Markovianity.} The latent state must retain
+  enough information to determine its own future. Aggressive truncation removes
+  small scales that feed back on large ones, so the latent dynamics become
+  non-Markovian. This is the origin of the closure problem in POD--Galerkin
+  models \parencite{wang2012closure,ahmed2021closures}, and it appears in
+  learned models as the need for long input histories or memory terms
+  \parencite{maulik2020timeseries}.
+  \item \emph{Smoothness and low temporal complexity.} Latent coordinates that
+  vary smoothly and with few dominant frequencies are easier to forecast.
+  Near-orthogonal, disentangled coordinates
+  \parencite{eivazi2022betavae,solera2024betavae} and ordered coordinates
+  \parencite{fukami2020hierarchical} were motivated partly by this. Localized
+  coordinates may reduce temporal complexity in a different way: each local
+  coefficient reflects only nearby structures, so its time series can carry a
+  narrower range of scales than a global mode that mixes contributions from
+  the whole domain. This is one motivation for the localized latent spaces of
+  \textcite{morton2026scitech}.
+  \item \emph{Appropriate dimension.} Too small a latent space discards
+  dynamics, and too large a space adds noisy, weakly constrained directions in
+  which errors grow; \textcite{linot2022node} found an intermediate optimum.
+  \item \emph{Stability.} Latent spaces or dynamics models with built-in
+  stability \parencite{pan2020physics,linot2023stabilized}, and training on
+  multi-step rollouts instead of single steps
+  \parencite{lusch2018koopman,kohl2023acdm}, reduce error accumulation.
+  \item \emph{Statistical fidelity.} For turbulence, matching second-order
+  statistics and spectra matters as much as pointwise accuracy, which favours
+  representations that retain small-scale energy
+  \parencite{deshmukh2018energy,glaws2020insitu} and training objectives or
+  generative models that do not collapse to the conditional mean
+  \parencite{kohl2023acdm,du2024cnf}.
+\end{itemize}

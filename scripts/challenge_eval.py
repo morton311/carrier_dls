@@ -15,7 +15,9 @@ Methods scored on the same sequences:
     DMD-25        port of the official baseline (papers/challenge_2.1/DMD), fit to the 70 inputs
     DLS floor     the latent's projection of the true future frames (compression floor)
     <latent>/<run>  trained runs given on the command line, seeded with the last
-                  time_lag of the 70 given frames
+                  time_lag of the 70 given frames. A diffusion run (tr_spatial_diff)
+                  is scored on the mean of diffusion.members sampled forecasts, and
+                  one of its samples alone as '<latent>/<run> [one sample]'
 
 Scores are on the full 154x51 grid, as a submission is. A latent whose mesh stops
 short of the grid edge (the historical DLS mesh covers 151x49) cannot represent the
@@ -27,6 +29,7 @@ latent_params.full_cover represent the whole grid. Each method is also scored on
     python scripts/challenge_eval.py cavity_dls_p13m5/spatial_gram_rollout_galerkin ...
     python scripts/challenge_eval.py --check-dmd dmd_matlab.h5   # port vs MATLAB (scripts/challenge/dmd_check.m)
     python scripts/challenge_eval.py --plot                      # figures/challenge_heldout.pdf
+    python scripts/challenge_eval.py --members 32 <diffusion run>  # ensemble size; key gets ' (M=32)'
 """
 import json
 import logging
@@ -49,9 +52,9 @@ OUT = 'results/cavity_challenge_eval.json'
 REPORT = (1, 2, 5, 10, 20, 30)
 INNER = (151, 49)               # region the historical (truncated) DLS mesh covers
 PLOT_KEYS = ['persistence', 'mean', 'DMD-25', 'cavity_dls_p13m5/local_gram',
-             'cavity_dls_p13m5_fc/spatial_gram_rollout_galerkin_fc_all', 'DLS floor (cavity_dls_p13m5_fc)']
+             'cavity_dls_p13m5_fca0_1odd/spatial_gram_rollout_galerkin_fc_all_d128_ca0_1', 'DLS floor (cavity_dls_p13m5_fca0_1odd)']
 PLOT_LABELS = ['persistence', 'mean flow', 'DMD, 25 modes', 'element-local temporal transformer',
-               'spatial transformer, Galerkin', 'DLS floor (p13m5, full grid)']
+               'element-token transformer, mass-weighted (1.9M, seed 1)', 'DLS projection (floor)']
 
 
 def dmd_forecast(Q, n_modes=25, n_fore=N_OUT):
@@ -117,7 +120,7 @@ def plot(keys, labels, out='figures/challenge_heldout'):
     ax.set_xlabel('forecast step')
     ax.set_ylabel('NMSE')
     ax.grid(visible=True, which='both', linestyle='--', linewidth=0.3)
-    ax.legend(frameon=False, fontsize=7, loc='lower right')
+    ax.legend(frameon=False, fontsize=7, loc='lower right', bbox_to_anchor=(1.0, 0.14))
     fig.tight_layout()
     fig.savefig(out + '.pdf', bbox_inches='tight')
     fig.savefig(out + '.png', dpi=200, bbox_inches='tight')
@@ -130,15 +133,39 @@ def _to_grid(Q, shape):
     return np.pad(Q, pad)
 
 
-def model_forecasts(spec, starts, shape):
-    """(n_seq, 30, nx, ny, 2) decoded forecasts of a trained run on the full grid, seeded from the given frames."""
+def model_forecasts(spec, starts, shape, members=None):
+    """Decoded forecasts of a trained run on the full grid, seeded from the given frames.
+
+    Returns ({key suffix: (n_seq, 30, nx, ny, 2)}, model_type, time_lag); the
+    suffix is '' for the run's point forecast.
+    """
     import torch  # noqa: F401  (runner needs CUDA)
     from lib.runner import runner
+    import lib.diffusion as diffusion
     latent, run = spec.split('/')
-    c = json.load(open(f'results/{latent}/{run}/{run}.json'))
-    c.update(overwrite='x', mode='eval', name=run, log='terminal', distributed=False, device='cuda')
+    # the run directory turns dots into underscores (..._ca0_01); its config keeps them (..._ca0.01.json)
+    cfg, = [f for f in os.listdir(f'results/{latent}/{run}') if f.endswith('.json')]
+    c = json.load(open(f'results/{latent}/{run}/{cfg}'))
+    c.update(overwrite='x', mode='eval', name=cfg[:-5], log='terminal', distributed=False, device='cuda')
     r = runner(c)
     tl = c['model_params']['time_lag']
+
+    def decode(d):   # (30, 2, N) coefficients -> (30, nx, ny, 2) on the full grid
+        return _to_grid(r.dls.gfem_recon_flexible(config=r.l_config, dof_u=d[:, 0].astype(np.float32),
+                                                  dof_v=d[:, 1].astype(np.float32), rec_target=None), shape)
+
+    if diffusion.is_diffusion(r):
+        with h5py.File(r.paths_bib.latent_path, 'r') as f:
+            g = f[NAME]
+            seeds = [(g['dof_u'][s + N_IN - tl:s + N_IN], g['dof_v'][s + N_IN - tl:s + N_IN], None)
+                     for s in starts]
+        M = int(members or diffusion.settings(r)['members'])
+        P = diffusion.forecast(r, NAME, seeds, N_OUT, members=M)[:, :, tl:]   # (n_seq, M, 30, 2, N)
+        # decoding is linear: the decoded ensemble mean is the mean of the decoded members
+        tag = f' (M={members})' if members else ''
+        return ({tag: np.stack([decode(p.mean(0)) for p in P]),
+                 tag + ' [one sample]': np.stack([decode(p[0]) for p in P])},
+                c['model_params']['model_type'], tl)
     out = []
     with h5py.File(r.paths_bib.latent_path, 'r') as f:
         g = f[NAME]
@@ -150,7 +177,7 @@ def model_forecasts(spec, starts, shape):
             Q = r.dls.gfem_recon_flexible(config=r.l_config, dof_u=pu[tl:].astype(np.float32),
                                           dof_v=pv[tl:].astype(np.float32), rec_target=None)
             out.append(_to_grid(Q, shape))
-    return np.stack(out), c['model_params']['model_type'], tl
+    return {'': np.stack(out)}, c['model_params']['model_type'], tl
 
 
 def summarize(e):
@@ -162,7 +189,7 @@ def summarize(e):
                 first_step_above_1=int(above[0]) + 1 if len(above) else -1)
 
 
-def main(specs):
+def main(specs, members=None):
     logging.basicConfig(level=logging.WARNING)
     a, b = BLOCK
     starts = np.arange(a, b - (N_IN + N_OUT) + 1, STRIDE)
@@ -187,12 +214,20 @@ def main(specs):
         Q = hist.transpose(0, 3, 1, 2).reshape(N_IN, -1).T
         dmd.append(dmd_forecast(Q).T.reshape(N_OUT, 2, *shape).transpose(0, 2, 3, 1))
     F['DMD-25'] = np.stack(dmd)
+    import pickle
+    import lib.dls_2d as dls
     for latent in sorted({sp.split('/')[0] for sp in specs}):
-        with h5py.File(f'results/{latent}/{NAME}_codec_ref_rec.h5', 'r') as f:
-            F[f'DLS floor ({latent})'] = np.stack([_to_grid(f['Q_rec'][s + N_IN:s + N_IN + N_OUT].astype(np.float64), shape)
-                                                   for s in starts])
+        # the latent's projection of the true future frames, decoded from its coefficients
+        cfg = pickle.load(open(f'results/{latent}/latent_config.pkl', 'rb'))
+        with h5py.File(f'results/{latent}/latent_coeff.h5', 'r') as f:
+            g = f[NAME]
+            F[f'DLS floor ({latent})'] = np.stack([
+                _to_grid(dls.decode_fields(cfg, g['dof_u'][s + N_IN:s + N_IN + N_OUT],
+                                           g['dof_v'][s + N_IN:s + N_IN + N_OUT]).astype(np.float64), shape)
+                for s in starts])
     for sp in specs:
-        F[sp], mtype, tl = model_forecasts(sp, starts, shape)
+        fc, mtype, tl = model_forecasts(sp, starts, shape, members)
+        F.update({sp + k: v for k, v in fc.items()})
         res.setdefault('_runs', {})[sp] = dict(model_type=mtype, time_lag=tl)
     E, Ei = {}, {}
     for k, f in F.items():
@@ -220,4 +255,10 @@ if __name__ == '__main__':
     elif '--plot' in sys.argv:
         plot(PLOT_KEYS, PLOT_LABELS)
     else:
-        main([a for a in sys.argv[1:] if not a.startswith('-')])
+        args = sys.argv[1:]
+        members = None
+        if '--members' in args:
+            i = args.index('--members')
+            members = int(args[i + 1])
+            del args[i:i + 2]
+        main([a for a in args if not a.startswith('-')], members)

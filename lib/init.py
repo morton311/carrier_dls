@@ -37,6 +37,11 @@ class pathsBib:
             if config['latent_params'].get('full_cover', False):
                 # the mesh covers the whole grid: a different latent space
                 self.latent_id += '_fc'
+                # outside points fit to an edge extension with this weight: another latent
+                if config['latent_params'].get('cut_weight', 0):
+                    self.latent_id += f"a{config['latent_params']['cut_weight']:g}"
+                    if config['latent_params'].get('cut_extension', 'edge') != 'edge':
+                        self.latent_id += config['latent_params']['cut_extension']
         elif config['latent_params']['type'] == 'bvae':
             filters_str = '_'.join(str(f) for f in config['latent_params']['filters'])
             lins_str = '_'.join(str(l) for l in config['latent_params']['linear'])
@@ -44,6 +49,8 @@ class pathsBib:
             self.latent_id = source_name + '_bvae_l' + str(config['latent_params']['latent_dim']) + '_b' + str(config['latent_params']['beta']) + '_f_' + filters_str + '_lin_' + lins_str
         elif config['latent_params']['type'] == 'pod':
             self.latent_id = source_name + '_pod_m' + str(config['latent_params']['num_modes'])
+            if config['latent_params'].get('fit_train_only', False):
+                self.latent_id += '_tr'
         else:
             self.latent_id = source_name + '_pod'
         self.latent_id = self.latent_id.replace('.', '_')

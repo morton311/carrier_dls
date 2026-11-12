@@ -19,7 +19,7 @@ os.chdir(ROOT)
 LAT = 'results/ldc_15k_dls_p99m10/'
 RECIPES = {
     'nodal average': ('spatial_gram_rollout_heldout_s{}', '#2a78d6', '-'),
-    'Galerkin, trained in the loop': ('spatial_gram_rollout_galerkin_heldout_s{}', '#1baf7a', '-.'),
+    'mass-weighted projection, trained in the loop': ('spatial_gram_rollout_galerkin_heldout_s{}', '#1baf7a', '-.'),
 }
 
 
@@ -56,7 +56,7 @@ def main():
     ax.set_xlabel('forecast step')
     ax.set_ylabel(r'$\|\mathbf{u}-\hat{\mathbf{u}}\|/\|\mathbf{u}\|$')
     ax.grid(visible=True, which='both', linestyle='--', linewidth=0.3)
-    ax.legend(frameon=False, fontsize=7, loc='upper left')
+    ax.legend(frameon=False, fontsize=7, loc='lower right')
     fig.tight_layout()
     os.makedirs('figures', exist_ok=True)
     fig.savefig('figures/multistart_heldout.pdf', bbox_inches='tight')

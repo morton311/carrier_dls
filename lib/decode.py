@@ -27,38 +27,52 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 # Identity blend for the Gram metric. 0 is pure field energy but leaves the
-# codec's null space unconstrained; 1e-2 keeps the gradient within ~11 degrees
-# of the field-energy gradient (vs ~89 for the raw latent metric) while giving
-# the weakest direction ~3.5e-4 relative weight instead of ~4e-11.
+# codec's null space unconstrained; 1e-2 gives the weakest direction ~3.5e-4
+# relative weight instead of ~4e-11. The ridge is not small in practice: true
+# coefficients are large along ill-conditioned directions, so at 1e-2 it holds
+# 75-88% of the truth's metric norm on the Challenge cavity latents and
+# 99.6-99.8% on the p99m10 LDC latents, and on trained models' forecast errors
+# the gradient is 39-51 (Challenge) and 73-84 (LDC) degrees from the
+# field-energy gradient (measured 2026-11-10; an earlier ~11 degrees does not hold).
 GRAM_LAMBDA = 1e-2
 
 
-def element_gram_roots(modemat: np.ndarray, masks: np.ndarray, lam: float = 0.0) -> np.ndarray:
-    """(E, n, n) Gram roots, one per element, from that element's in-domain points.
+def element_gram_roots(modemat: np.ndarray, masks: np.ndarray, lam: float = 0.0,
+                       full_trace: bool = False) -> np.ndarray:
+    """(E, n, n) Gram roots, one per element, from that element's weighted points.
 
     masks is dls_2d.element_masks: 1 where an element's grid point lies inside the
-    domain. Interior elements share one root; elements that overhang the grid
-    (full_cover) count only their points inside it.
+    domain, 0 (or the cut weight) outside. Interior elements share one root;
+    elements that overhang the grid (full_cover) weight their points by it.
+    full_trace scales every element's ridge by the full element's trace, as the
+    assembly does, so weakly observed cut-element directions are held as firmly
+    as interior ones; otherwise a cut element's ridge follows its own (smaller)
+    trace, as before.
     """
+    B = np.asarray(modemat, dtype=np.float64)
+    ref = np.trace(B.T @ B) / B.shape[1] if full_trace else None
     cache = {}
-    out = np.empty((masks.shape[0], modemat.shape[1], modemat.shape[1]))
+    out = np.empty((masks.shape[0], B.shape[1], B.shape[1]))
     for e, m in enumerate(masks):
         key = m.tobytes()
         if key not in cache:
-            cache[key] = element_gram_sqrt(modemat[m > 0], lam)
+            cache[key] = element_gram_sqrt(B * np.sqrt(m)[:, None], lam, ref)
         out[e] = cache[key]
     return out
 
 
-def element_masks_for(runner):
-    """dls_2d.element_masks for the runner's latent when its mesh overhangs the grid, else None."""
+def element_masks_for(runner, strict=False):
+    """dls_2d.element_masks for the runner's latent when its mesh overhangs the grid, else None.
+
+    strict=True: the 0/1 domain indicator, for scores of in-domain error.
+    """
     dls = runner.dls
     if runner.dim != 2 or not hasattr(dls, 'is_cut') or not dls.is_cut(runner.l_config):
         return None
-    return dls.element_masks(runner.l_config)
+    return dls.element_masks(runner.l_config, strict=strict)
 
 
-def element_gram_sqrt(modemat: np.ndarray, lam: float = 0.0) -> np.ndarray:
+def element_gram_sqrt(modemat: np.ndarray, lam: float = 0.0, ref_trace: float = None) -> np.ndarray:
     """Symmetric square root W of the regularized Gram matrix.
 
         M_reg = B^T B + lam * (trace(B^T B) / n) * I
@@ -77,7 +91,9 @@ def element_gram_sqrt(modemat: np.ndarray, lam: float = 0.0) -> np.ndarray:
     B = np.asarray(modemat, dtype=np.float64)
     M = B.T @ B
     if lam:
-        M = M + lam * (np.trace(M) / M.shape[0]) * np.eye(M.shape[0])
+        # ref_trace: the per-DOF trace to scale the ridge by (default: this M's own)
+        scale = np.trace(M) / M.shape[0] if ref_trace is None else ref_trace
+        M = M + lam * scale * np.eye(M.shape[0])
     evals, evecs = np.linalg.eigh(0.5 * (M + M.T))
     evals = np.clip(evals, 0.0, None)
     return (evecs * np.sqrt(evals)) @ evecs.T
@@ -148,11 +164,14 @@ class ElementGramMetric(nn.Module):
                 f"localized={self.localized}, per_element={self.per_element}")
 
 
-def build_gram_metric(runner, name: str):
+def build_gram_metric(runner, name: str, lam: float = None, scale: float = None):
     """Build the field-energy metric for `runner`'s latent config, or None.
 
     Returns None for POD (already orthonormal) and for any config where the
-    per-element mode matrices are unavailable.
+    per-element mode matrices are unavailable. `lam` overrides
+    model_params.gram_lambda; `scale` reuses another metric's normalization
+    (its .scale), so lam=0 with the loss metric's scale gives exactly the field
+    part of the loss, in the loss's units.
     """
     lp = runner.config['latent_params']
     if lp['type'] != 'dls':
@@ -165,10 +184,13 @@ def build_gram_metric(runner, name: str):
     if runner.dim == 3:
         mats.append(l_config.modemat_local_w)
 
-    lam = float(runner.config['model_params'].get('gram_lambda', GRAM_LAMBDA))
+    if lam is None:
+        lam = float(runner.config['model_params'].get('gram_lambda', GRAM_LAMBDA))
     W = np.stack([element_gram_sqrt(m, lam) for m in mats])  # (dim, dof_elem, dof_elem)
     masks = element_masks_for(runner)
-    We = None if masks is None else np.stack([element_gram_roots(m, masks, lam) for m in mats])
+    # a regularized cut-element latent (cut_weight > 0) also takes the full-element ridge
+    full = float(getattr(l_config, 'cut_weight', 0.0)) > 0
+    We = None if masks is None else np.stack([element_gram_roots(m, masks, lam, full) for m in mats])
 
     std = runner.dof_std[name].double()
     dof_elem = l_config.dof_elem
@@ -197,7 +219,8 @@ def build_gram_metric(runner, name: str):
             sc = std[c * num_dofs:(c + 1) * num_dofs].numpy()[lltogl.numpy()]
             energy += float(((W[c] ** 2)[None] * (sc ** 2)[:, None, :]).sum())
         n_terms = W.shape[0] * lltogl.shape[0] * dof_elem
-    scale = np.sqrt(n_terms / max(energy, 1e-30))
+    if scale is None:
+        scale = np.sqrt(n_terms / max(energy, 1e-30))
     W = W * scale
     # the interior scale for every element: cut elements then weigh exactly their
     # share of the field energy relative to full ones
@@ -205,6 +228,7 @@ def build_gram_metric(runner, name: str):
 
     metric = ElementGramMetric(torch.from_numpy(W).float(), std.float(),
                                lltogl, dof_elem, elem_weights=We)
+    metric.scale = float(scale)
     logger.info("Field-energy (Gram) loss metric built: %s, lambda %g, "
                 "normalization scale %.4g", metric, lam, scale)
     return metric.to(runner.device)

@@ -5,3 +5,7 @@ lib/__pycache__*
 *.pkl
 results/*
 papers/*
+# Python byte code anywhere
+__pycache__/
+# SLICK Python port: unlicensed upstream code, cross-check only, never commit
+scripts/slick_baseline.py

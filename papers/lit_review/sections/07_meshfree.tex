@@ -1,0 +1,91 @@
+% ======================================================================
+\section{Mesh-agnostic and operator-based representations}
+\label{sec:meshfree}
+% ======================================================================
+
+Most methods discussed so far assume that every snapshot lives on the same
+discretization, a structured grid in the case of CAEs. Engineering CFD relies on
+unstructured, adapted, and moving meshes, and experimental data come on sensor
+layouts that change between campaigns. Interpolating such data onto a Cartesian
+grid degrades near-wall resolution and couples the learned representation to
+an arbitrary choice of grid. This section reviews representations that relax
+this assumption, and operator-learning architectures whose internal latent
+spaces play the role of a reduced representation.
+
+\subsection{Graph autoencoders}
+
+Graph neural networks operate directly on mesh connectivity. The
+encode--process--decode architecture of MeshGraphNets \parencite{pfaff2021meshgraphnets}
+showed that message passing on simulation meshes can learn accurate dynamics
+for a range of physical systems. It does not, however, reduce the number of
+degrees of freedom. Graph autoencoders add pooling (graph coarsening) and
+unpooling stages to obtain a genuine bottleneck. \textcite{gruber2022comparison}
+found that a graph-convolutional AE is advantageous on data with irregular
+connectivity when the latent space is sufficiently large.
+\textcite{pichi2024gca} developed graph-convolutional AEs for model order
+reduction of parametrized PDEs on unstructured meshes, and
+\textcite{barwey2023multiscale} designed multiscale graph AEs whose adaptive
+graph-reduction stages identify the spatial regions most relevant to the
+dynamics, which provides a form of interpretability. Graph AEs are local by
+construction, since each message-passing step aggregates information from a
+neighbourhood. They are therefore the unstructured-mesh analogue of both CAEs
+and the localized bases of \cref{sec:local}.
+
+\subsection{Implicit neural representations}
+\label{sec:inr}
+
+An implicit neural representation (INR), or neural field, represents a flow
+field as a coordinate network $\q(\bm{x})\approx g_{\omega}(\bm{x};\z)$
+conditioned on a latent code $\z$. Because the decoder can be queried at any
+point, the representation is independent of discretization. Encoding is done
+either by an encoder network acting on point clouds or by ``auto-decoding'',
+which optimizes $\z$ for each snapshot. Coordinate networks suffer severely
+from spectral bias, which is mitigated by periodic activations
+\parencite{sitzmann2020siren} or random Fourier features \parencite{tancik2020fourier}.
+
+Neural implicit flow (NIF) \parencite{pan2023nif} introduced a mesh-agnostic
+DR paradigm for spatio-temporal fluid data. A hypernetwork maps time and
+parameters to the weights of a coordinate network, and the hypernetwork
+bottleneck serves as the latent space. CROM \parencite{chen2023crom} uses an
+INR decoder to build continuous reduced-order models whose latent dynamics
+follow from the governing PDE, independent of the training discretization.
+DINo \parencite{yin2023dino} evolves the INR latent code with a neural ODE,
+giving forecasts that are continuous in space and time. CORAL
+\parencite{serrano2023coral} performs operator learning entirely in INR latent
+spaces on general geometries. AROMA \parencite{serrano2024aroma} replaces the
+single global code with a set of spatially anchored latent tokens decoded by
+\emph{local} neural fields and processed by a transformer, so the latent space
+preserves spatial structure. This design echoes, in a learned setting, the
+local-basis philosophy of DLS. For generative modeling of turbulence,
+CoNFiLD \parencite{du2024cnf} trains a latent diffusion model on
+conditional-neural-field latents, producing stochastic, spatiotemporally
+coherent turbulent fields in irregular geometries.
+
+\subsection{Neural operators and their implicit reduction}
+
+Neural operators learn maps between function spaces
+\parencite{kovachki2023neural} and are not usually described as DR methods, yet
+most of them contain an explicit or implicit low-dimensional representation.
+PCA-Net \parencite{bhattacharya2021pcanet} is explicit: it applies PCA to input
+and output functions and learns a map between the coefficients. DeepONet
+\parencite{lu2021deeponet} expresses the output as
+$\sum_{j=1}^{p}b_j(\text{input})\,t_j(\bm{x})$. Its trunk network $t_j$ is a
+learned set of basis functions and its branch network $b_j$ supplies their
+coefficients, the same structure as a linear reduced basis with a nonlinear
+coefficient map. The Fourier neural operator \parencite{li2021fno} truncates
+each layer to a fixed number of Fourier modes, which is a linear spectral
+reduction applied repeatedly inside a nonlinear network.
+\textcite{kontolati2024latent} made the reduction explicit by training
+DeepONets in the latent space of an autoencoder (L-DeepONet), which improved
+accuracy and efficiency for high-dimensional, multiscale problems including
+fluid flows. Several recent architectures learn \emph{adaptive}
+reductions inside attention-based operators. The latent neural operator
+\parencite{wang2024lno} maps inputs to a learned latent space by cross-attention.
+Transolver \parencite{wu2024transolver} softly assigns mesh points to a small
+number of learned ``physical-state slices'' and applies attention among them.
+Universal physics transformers \parencite{alkin2024upt} encode arbitrary
+particle or mesh data into a fixed set of latent tokens, propagate them, and
+decode at arbitrary query points. The distinction between ``dimensionality
+reduction followed by a dynamics model'' and ``end-to-end operator learning''
+is therefore increasingly one of emphasis. The same questions of latent size,
+locality, generalization, and accuracy saturation apply to both.

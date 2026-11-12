@@ -1,0 +1,139 @@
+% ======================================================================
+\section{Comparative assessment}
+\label{sec:assessment}
+% ======================================================================
+
+\subsection{Summary of properties}
+
+\Cref{tab:summary} summarizes the families reviewed above against the
+properties (P1)--(P7) of \cref{sec:desiderata}. The entries are qualitative and
+reflect typical behaviour reported in the literature and in our computed
+examples; any given implementation can do better or worse.
+
+\begin{table}[tbp]
+\centering
+\caption{Qualitative comparison of dimensionality reduction families for
+fluid-dynamics machine learning. Columns: \emph{Dec.}\ explicit, cheap decoder;
+\emph{Transp.}\ latent size needed for transport-dominated or multi-scale flows
+(slowly decaying Kolmogorov $n$-width); \emph{Data} number of snapshots needed
+to build the representation; \emph{Scal.}\ cost and memory for large $N$ and
+mesh flexibility; \emph{Interp.}\ interpretability; \emph{Acc.}\ attainable
+accuracy as the latent size grows. $+$ favourable, $\circ$ intermediate,
+$-$ unfavourable.}
+\label{tab:summary}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{4.3cm} *{6}{c} >{\raggedright\arraybackslash}X@{}}
+\toprule
+Family & Dec. & Transp. & Data & Scal. & Interp. & Acc. & Representative fluid uses \\
+\midrule
+POD / PCA & $+$ & $-$ & $\circ$ & $+$ & $+$ & $+$ & Galerkin ROMs, POD--LSTM/transformer, OpInf \\
+DMD, SPOD, balanced POD & $+$ & $-$ & $\circ$ & $+$ & $+$ & $+$ & Modal analysis, Koopman models, control \\
+Transport-adapted linear & $+$ & $\circ$ & $\circ$ & $\circ$ & $+$ & $+$ & Shocks, fronts, traveling waves \\
+Sparse, clustered, local ROBs & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $+$ & $+$ & Multi-scale Galerkin ROMs, regime switching \\
+Domain decomposition, GFEM, DLS & $+$ & $\circ$ & $+$ & $+$ & $+$ & $+$ & Extreme-scale ROMs, turbulent latent spaces \\
+Kernel / graph manifold learning & $-$ & $+$ & $\circ$ & $-$ & $\circ$ & $\circ$ & Manifold identification, regime analysis \\
+Quadratic manifolds & $+$ & $\circ$ & $\circ$ & $+$ & $\circ$ & $+$ & Projection ROMs beyond linear subspaces \\
+MLP / convolutional AE & $+$ & $+$ & $-$ & $\circ$ & $-$ & $-$ & Nonlinear ROMs, AE--LSTM/transformer \\
+VAE, $\beta$-VAE, VQ-VAE & $+$ & $+$ & $-$ & $\circ$ & $\circ$ & $-$ & Disentangled modes, compression, generation \\
+Graph autoencoders & $+$ & $+$ & $-$ & $\circ$ & $\circ$ & $-$ & Unstructured meshes \\
+Implicit neural representations & $+$ & $+$ & $-$ & $\circ$ & $-$ & $-$ & Mesh-agnostic ROMs, generative turbulence \\
+Latent neural operators & $+$ & $+$ & $-$ & $\circ$ & $-$ & $-$ & Parametric surrogates, general geometries \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Two broad patterns emerge. First, representations with linear, explicit
+encoders and decoders (POD, DMD, GFEM/DLS) are cheap, reproducible, and reach
+arbitrarily high accuracy as the latent size grows. They are the natural choice
+when training data are limited or when accuracy of small scales matters.
+Learned nonlinear decoders achieve much smaller latent spaces for
+transport-dominated and low-intrinsic-dimension problems but saturate in
+accuracy and require more data and tuning. Second, the right choice depends on
+the \emph{flow}, not only on the method. \Cref{fig:ldc_pod} shows that the
+$\mathrm{Re}=15{,}000$ cavity is dominated by a few coherent modes, so global
+POD is close to optimal for reconstructing it at a fixed latent size
+(\cref{fig:dls_compare}a). The same is not true for the advected pulse of
+\cref{fig:nwidth,fig:ae_vs_pod} or, by extension, for strongly convective or
+broadband turbulent flows.
+
+\subsection{Evidence from comparative studies}
+
+Systematic comparisons remain scarce, and their conclusions are nuanced.
+\textcite{csala2022comparing} and \textcite{mendez2023linear} found that
+nonlinear methods can represent canonical flows with fewer coordinates than
+PCA, but that the advantage depends on the flow, the arrangement of the data,
+and the task (filtering, pattern identification, or compression).
+\textcite{gruber2022comparison} showed that no single autoencoder architecture
+dominates: the best choice depends on latent size and data structure.
+\textcite{swischuk2019projection} compared several regression methods on POD
+coefficients and argued for retaining the projection structure.
+\textcite{fresca2022poddlrom} showed that a linear POD stage before the
+autoencoder reduces training cost substantially without sacrificing accuracy.
+For forecasting, \textcite{eivazi2021koopman} found a Koopman framework as
+accurate as an LSTM in long-term statistics at lower cost, and
+\textcite{morton2026scitech} found that transformers performed well on a
+localized DLS latent space but poorly on a POD latent space of the same flow.
+A common thread is that linear and nonlinear, global and local
+representations are complementary. Hybrids that combine a linear or local
+backbone with nonlinear corrections often perform best
+\parencite{linot2020inertial,fresca2022poddlrom,diaz2024ddnm}.
+
+\subsection{Baselines, benchmarks, and metrics}
+
+\textcite{mcgreivy2024weak} documented that weak baselines and reporting biases
+lead to systematic over-optimism in ML for fluid-related PDEs. For DR the
+corresponding risks are comparing a tuned nonlinear model against an untuned
+linear one, reporting training rather than held-out error, and choosing
+latent sizes that favour one method. Based on the studies reviewed here, we
+recommend the following practices.
+\begin{enumerate}[leftmargin=2em,itemsep=2pt]
+  \item Always report a POD baseline at the \emph{same} latent dimension and,
+  for dynamics, a POD--based model with the same sequence architecture. Report
+  POD error as a function of $r$, not at a single truncation.
+  \item Evaluate reconstruction on held-out data that are separated in time
+  from the training data and, where relevant, at unseen parameters or
+  operating conditions (P1). Report training-data requirements (P4) alongside
+  accuracy, as in \cref{fig:dls_compare}b.
+  \item Report the full storage cost (latent coefficients \emph{and} basis or
+  network parameters) when claiming compression, and the latent dimension seen
+  by the dynamics model when claiming learnability.
+  \item Beyond pointwise error, report second-order statistics (Reynolds
+  stresses, turbulent kinetic energy), spectra, and, for forecasts, long-time
+  statistics and error growth over rollouts. Small-scale fidelity is where
+  methods differ most.
+  \item Report variability over random initializations for learned
+  representations.
+\end{enumerate}
+Common benchmark resources support such comparisons. They include the
+Johns Hopkins turbulence databases \parencite{li2008jhtdb}, PDEBench
+\parencite{takamoto2022pdebench}, The Well \parencite{ohana2024well}, and the
+community challenge of \textcite{schmidt2026challenge}. The last has
+separate tracks for compression, forecasting, and sensing of aerospace flows,
+among them experimental time-resolved PIV of a Mach 0.6 cavity flow of the type
+analysed by \textcite{zhang2020samm}.
+
+\subsection{Practical guidance}
+
+The choice of representation can be organized around four questions.
+\begin{enumerate}[leftmargin=2em,itemsep=2pt]
+  \item \emph{How fast does the POD spectrum decay?} If a few percent of the
+  snapshots' rank captures the required energy on held-out data, POD (or DMD
+  or SPOD for spectral content) is hard to beat and should be the default.
+  \item \emph{Is the difficulty transport or multi-scale content?} Transport of a
+  few coherent features favours transport-adapted linear methods or nonlinear
+  autoencoders with small latent spaces. Broadband, multi-scale content over a
+  large domain favours localized representations (domain decomposition, DLS,
+  graph or local-token architectures) whose cost grows with the domain rather
+  than with the number of distinct global patterns.
+  \item \emph{How much data is there, and on what discretization?} Limited
+  snapshots favour linear and local bases, since local bases draw many
+  training samples from each snapshot. Unstructured or changing
+  discretizations favour graph AEs and implicit neural representations.
+  \item \emph{What will the latent space be used for?} Galerkin projection
+  needs an explicit, differentiable decoder; control benefits from balanced or
+  Koopman coordinates; long-horizon forecasting benefits from smooth,
+  Markovian, and possibly localized coordinates; and generative modeling
+  benefits from compact, well-regularized latent spaces.
+\end{enumerate}

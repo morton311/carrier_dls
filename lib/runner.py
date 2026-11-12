@@ -19,9 +19,11 @@ import lib.pod as pod
 import lib.models as models
 import lib.datas as datas
 import lib.decode as decode
+import lib.diffusion as diffusion
 import lib.losses as losses
 import lib.multistart as multistart
 import lib.plotting as pl
+import lib.recfield as recfield
 from lib.metrics import l2_err_norm
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,9 @@ class runner(nn.Module):
             self.config['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
         if 'distributed' not in self.config:
             self.config['distributed'] = False
+        # store decoded fields (*_pred_rec.h5, codec references) on disk? By default
+        # only the coefficients are stored and eval decodes on demand (lib/recfield)
+        self.save_rec = bool(self.config.get('save_rec', False))
 
         self.device = config['device']
         self.paths_bib = self._init_paths_and_logging(config)
@@ -243,14 +248,16 @@ class runner(nn.Module):
         """
         lp = self.config['latent_params']
         max_snaps = self._compress_limit(data_path)
-        if max_snaps is not None and (lp['type'] != 'dls' or self.dim == 3):
-            raise NotImplementedError("latent_params.compress_used_only is implemented for 2D DLS only")
+        if max_snaps is not None and (lp['type'] not in ('dls', 'pod') or self.dim == 3):
+            raise NotImplementedError("latent_params.compress_used_only is implemented for 2D DLS and POD only")
         if lp['type'] == 'dls':
             extra = {} if max_snaps is None else {'max_snaps': max_snaps}
             if lp.get('full_cover', False):
                 if self.dim == 3:
                     raise NotImplementedError("latent_params.full_cover is implemented for 2D DLS only")
                 extra['full_cover'] = True
+                extra['cut_weight'] = float(lp.get('cut_weight', 0.0))
+                extra['cut_extension'] = lp.get('cut_extension', 'edge')
             return self.dls.gfem_compress_flexible(
                 data_source=data_path,
                 field_name='UV',
@@ -273,6 +280,8 @@ class runner(nn.Module):
                 latent_target=self.paths_bib.latent_path,
                 batch_size=lp['batch_size'],
                 pod_config=latent_config,
+                max_snaps=max_snaps,
+                fit_snaps=self._pod_fit_limit(data_path) if latent_config is None else None,
             )
         else:
             raise ValueError(f"latent_params.type '{lp['type']}' not recognized. Use 'dls' or 'pod'.")
@@ -298,7 +307,7 @@ class runner(nn.Module):
             latent_config = self._compress_data(
                 data_path=self.paths_bib.source_path,
                 group_name=source_name,
-                latent_config=None,
+                latent_config=self._basis_from(),
             )
             with open(self.paths_bib.latent_config_path, 'wb') as f:
                 pickle.dump(latent_config, f)
@@ -334,6 +343,27 @@ class runner(nn.Module):
                             latent_config=latent_config,
                         )
         
+
+    def _basis_from(self):
+        """latent_params.basis_from: reuse another latent's local modes (its latent_config.pkl).
+
+        The local modes come from random patches of one snapshot, so two
+        compressions of the same data get slightly different bases. Reusing one
+        isolates a change of the mesh treatment (e.g. cut_weight) from a change
+        of basis. The mesh settings of this config (full_cover, cut_weight) apply.
+        """
+        path = self.config['latent_params'].get('basis_from')
+        if not path:
+            return None
+        import dataclasses
+        with open(path, 'rb') as f:
+            base = pickle.load(f)
+        lp = self.config['latent_params']
+        cfg = dataclasses.replace(base, full_cover=bool(lp.get('full_cover', False)),
+                                  cut_weight=float(lp.get('cut_weight', 0.0)),
+                                  cut_extension=lp.get('cut_extension', 'edge'))
+        logger.info(f"Local modes reused from {path}")
+        return cfg
 
     def _latent_split(self):
         # Load existing splits if available
@@ -386,7 +416,8 @@ class runner(nn.Module):
                                                         train_split=source['train_split'],
                                                         test_split=source['test_split'],
                                                         sample_train=source.get('sample_train', 0),
-                                                        sample_test=source.get('sample_test', 0))
+                                                        sample_test=source.get('sample_test', 0),
+                                                        fold=source.get('train_fold'))
                         elif data_source == 'eval_data':
                             indices = self._split_indices(snaps[data_source][data_name]['total'], 
                                                         train_split=1-source['pred_split'])
@@ -437,6 +468,25 @@ class runner(nn.Module):
         limit = max(limits)
         return None if limit >= total else limit
 
+    def _pod_fit_limit(self, data_path):
+        """Snapshots a POD basis is fit to: the training block [0, a) of the split.
+
+        Only with latent_params.fit_train_only. Unlike DLS, whose local modes come
+        from one snapshot, POD fit to the whole record would see the test and
+        validation blocks. Uses the train_data entry that reads data_path.
+        """
+        if not self.config['latent_params'].get('fit_train_only', False):
+            return None
+        with h5py.File(data_path, 'r') as f:
+            total = f['UV'].shape[0]
+        srcs = [src for src in self.config.get('train_data') or []
+                if self.paths_bib.data_dir + src.get('path') + '.h5' == data_path]
+        if not srcs:
+            raise ValueError("latent_params.fit_train_only needs a train_data entry reading the latent source")
+        src = srcs[0]
+        b = int(self._limit_snapshots(total, src, src.get('name'), log=False) * src.get('train_split', 0.8))
+        return b - int(b * src.get('test_split', 0.1))
+
     def _limit_snapshots(self, total, source, name, log=True):
         """Cap how much of a record is used, per data source.
 
@@ -467,7 +517,8 @@ class runner(nn.Module):
     # recorded with each run's split and metrics; see _split_indices
     SPLIT_VERSION = 2
 
-    def _split_indices(self, total_snaps, train_split=0.8, test_split=0.1, sample_train=0, sample_test=0):
+    def _split_indices(self, total_snaps, train_split=0.8, test_split=0.1, sample_train=0, sample_test=0,
+                       fold=None):
         """Contiguous train / test / validation blocks of a record.
 
         The record [0, total) splits into training [0, a), test [a, b) and
@@ -476,6 +527,11 @@ class runner(nn.Module):
         (time_lag + train_ahead) window that fits inside their own block, so no
         test window touches a training snapshot or the reverse; validation holds
         every snapshot id of its block (eval rolls out from them).
+
+        fold = [k, n] (train_data[].train_fold) keeps only the training windows
+        that lie wholly inside the k-th of n contiguous blocks of [0, a); test and
+        validation are unchanged. Used to fit models whose out-of-fold errors
+        stand in for held-out errors (diffusion.mean_model_folds).
 
         Version 1 (before 2026-10-13) let the training windows run through the
         test block and started the test windows at 0, inside the training data,
@@ -489,6 +545,11 @@ class runner(nn.Module):
         b = int(total_snaps * train_split)
         a = b - int(b * test_split)
         train = np.sort(datas.sample_series_indices(a, sample_train, **window))
+        if fold is not None:
+            k, n = fold
+            lo, hi = a * k // n, a * (k + 1) // n
+            train = train[(train >= lo) & (train + mp['time_lag'] + mp['train_ahead'] <= hi)]
+            logger.info(f"Training fold {k} of {n}: windows inside [{lo}, {hi})")
         test = a + np.sort(datas.sample_series_indices(b - a, sample_test, **window))
         val = np.arange(b, total_snaps)
         if test_split > 0 and len(test) == 0:
@@ -568,10 +629,28 @@ class runner(nn.Module):
                         num_freqs=mp.get('coord_freqs', 6),
                         residual=mp.get('residual', False),
                         )
+        elif self.config['model_params']['model_type'] == 'tr_spatial_diff':
+            mp = self.config['model_params']
+            self.model = models.DiffusionSpatialTransformer(
+                        # residual mode conditions on the mean forecast as one more frame; a
+                        # 'state' model (thermalizer) conditions on no frame at all
+                        time_lag=(0 if diffusion.settings(self)['target'] == 'state'
+                                  else mp['time_lag'] + (1 if diffusion.settings(self)['mean_model'] else 0)),
+                        input_dim=mp['input_dim'],
+                        d_model=mp['d_model'],
+                        ff_dim=mp.get('ff_dim', 3 * mp['d_model']),
+                        nhead=mp['nhead'],
+                        num_layers=mp['num_layers'],
+                        activation=mp.get('activation', 'swiglu'),
+                        spatial_dim=self.dim,
+                        num_freqs=mp.get('coord_freqs', 6),
+                        dropout=mp.get('dropout', 0.1),
+                        ema=diffusion.settings(self)['ema_decay'] > 0,
+                        )
         elif self.config['model_params']['model_type'] == 'f_extrap':
             self.model = None
         else:
-            raise ValueError(f"Model {self.config['model_params']['model_type']} not recognized. Please use 'tr_enc', 'tr_encdec', 'tr_spatial', or 'lstm'.")
+            raise ValueError(f"Model {self.config['model_params']['model_type']} not recognized. Please use 'tr_enc', 'tr_encdec', 'tr_spatial', 'tr_spatial_diff', or 'lstm'.")
         
         # Load the model weights if they exist and overwrite is not set to 'l' or 'm'
         if os.path.exists(self.paths_bib.model_path) and not self.config['overwrite'] in ['l', 'm']:
@@ -580,7 +659,8 @@ class runner(nn.Module):
                 weights = {k.replace('module.', '', 1) if k.startswith('module.') else k: v for k, v in weights.items()}
             self.model.load_state_dict(weights)
         if self.model is not None:
-            self.num_params = sum(p.numel() for p in self.model.parameters())
+            # trainable only: a diffusion model's weight EMA is a frozen copy
+            self.num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             logger.info(f"Model initialized with {self.num_params} parameters")
 
             # print model summary
@@ -589,7 +669,7 @@ class runner(nn.Module):
             else:
                 input_size = (self.config['model_params']['batch_size'], self.config['model_params']['time_lag'], self.config['model_params']['input_dim'])
 
-            if self.config['model_params']['model_type'] not in ('tr_encdec', 'tr_spatial'):
+            if self.config['model_params']['model_type'] not in ('tr_encdec', 'tr_spatial', 'tr_spatial_diff'):
                 try:
                     from torchinfo import summary
                 except ImportError:
@@ -669,7 +749,11 @@ class runner(nn.Module):
                 mode='min',
                 factor=self.config['model_params'].get('lr_factor', 0.5),
                 patience=self.config['model_params'].get('lr_patience', 5),
-                min_lr=self.config['model_params'].get('lr_min', 1e-6)
+                min_lr=self.config['model_params'].get('lr_min', 1e-6),
+                # relative gain that counts as progress for the LR schedule. The
+                # torch default (1e-4) never fires on a loss that creeps down
+                # steadily, as a diffusion loss does, so the LR is never reduced
+                threshold=self.config['model_params'].get('lr_threshold', 1e-4),
             )
             # torch.amp.GradScaler exists from torch 2.3; fall back for older versions
             # growth_interval bounds how fast the loss scale climbs. The default
@@ -690,7 +774,7 @@ class runner(nn.Module):
             logger.info("Reassembly projection: " + ("average of shared nodal copies" if lam is None
                                                       else f"regularized Galerkin, lambda={lam:g}"))
             logger.info(f"Optimizer: {self.optimizer}")
-            logger.info(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)})")
+            logger.info(f"Scheduler: ReduceLROnPlateau (factor={self.config['model_params'].get('lr_factor', 0.5)}, patience={self.config['model_params'].get('lr_patience', 5)}, threshold={self.config['model_params'].get('lr_threshold', 1e-4):g})")
             logger.info(f"Using mixed precision training with GradScaler: {self.scaler}")
 
             # Helper function to remap 'embed' keys to 'input_projection'
@@ -719,12 +803,22 @@ class runner(nn.Module):
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if 'lr_scheduler_state_dict' in checkpoint:
                     self.scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+                # the scheduler state carries its threshold; a configured one wins on resume
+                if 'lr_threshold' in mp_:
+                    self.scheduler.threshold = float(mp_['lr_threshold'])
                 if 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 self.epoch = checkpoint['epoch']
                 self.losses = checkpoint['losses']
                 self.test_losses = checkpoint['test_losses']
                 self.early_stop_counter = checkpoint['early_stop_counter']
+                # the best weights so far, which are not the checkpoint epoch's unless that epoch was the best
+                best = checkpoint.get('best_model')
+                if best is not None:
+                    best = remap_embed_keys(best)
+                    if not self.config['distributed']:
+                        best = {k.replace('module.', '', 1) if k.startswith('module.') else k: v for k, v in best.items()}
+                self.checkpoint_best = best
                 logger.info(f"Checkpoint loaded")
                 self.checkpointed = True
 
@@ -741,6 +835,15 @@ class runner(nn.Module):
             else:
                 logger.info(f"Model does not exist at {self.paths_bib.model_path}. Training from scratch.")
                 self.checkpointed = False
+                # model_params.init_from: fine-tune from another run's weights
+                # (results/<latent>/<run>/model.pth); optimizer and schedule start fresh
+                init_from = mp_.get('init_from')
+                if init_from:
+                    state_dict = torch.load(init_from, weights_only=True, map_location=self.device)
+                    state_dict = {k.replace('module.', '', 1) if k.startswith('module.') else k: v
+                                  for k, v in state_dict.items()}
+                    self.model.load_state_dict(state_dict)
+                    logger.info(f"Initialized from {init_from}")
 
 
 
@@ -778,7 +881,10 @@ class runner(nn.Module):
             logger.warning("loss_metric='gram' requested but unavailable; "
                            "falling back to the latent metric.")
             return
-        self.criterion = losses.MetricLoss(self.criterion, metric).to(self.device)
+        # energy terms that ask for it are scored in field energy alone, in the loss's units
+        field = (decode.build_gram_metric(self, name, lam=0.0, scale=metric.scale)
+                 if losses.wants_field_metric(self.criterion) else None)
+        self.criterion = losses.apply_metric(self.criterion, metric, field).to(self.device)
         self.loss_plan = losses.plan(self.criterion)
         logger.info(f"Loss re-expressed in field-energy coordinates: {self.criterion}")
 
@@ -852,7 +958,7 @@ class runner(nn.Module):
 
     def _get_train_data(self):
         """Get training and test data as torch tensors, minimizing memory usage."""
-        if self.config['model_params']['model_type'] in ('tr_encdec', 'tr_spatial'):
+        if self.config['model_params']['model_type'] in ('tr_encdec', 'tr_spatial', 'tr_spatial_diff'):
             return self._get_train_data_grouped()
         if self.model is not None:
             logger.info('Getting training and test data')
@@ -1252,10 +1358,14 @@ class runner(nn.Module):
 
     def _train_epoch(self, epoch: int, max_norm: float) -> float:
         """Single forward+backward pass over all training loaders. Returns mean epoch loss."""
+        if diffusion.is_diffusion(self):
+            return diffusion.run_epoch(self, epoch, train=True, max_norm=max_norm)
         return self._rollout_epoch(epoch, train=True, max_norm=max_norm)
 
     def _validate_epoch(self) -> float:
         """Single forward pass over all test loaders. Returns mean test loss."""
+        if diffusion.is_diffusion(self):
+            return diffusion.run_epoch(self, 0, train=False)
         return self._rollout_epoch(0, train=False)
 
     ## ======================= Global-local encoder-decoder (tr_encdec) ==========================
@@ -1401,7 +1511,7 @@ class runner(nn.Module):
             Ainv = np.linalg.pinv(A, hermitian=True) if lam == 0 else np.linalg.inv(A)
             if Mr_e is not None:
                 Mr = Mr_e            # (E, n, n): applied per element below
-            ops.append({'Mr': Mr, 'Ainv': Ainv,
+            ops.append({'Mr': Mr, 'Ainv': Ainv, 'A': A,
                         'Mr_t': torch.from_numpy(Mr).float().to(self.device),
                         'Ainv_t': torch.from_numpy(Ainv).float().to(self.device)})
         logger.info(f"Regularized Galerkin assembly: lambda={lam:g}, {E} elements, {N} nodal DOFs "
@@ -1561,12 +1671,17 @@ class runner(nn.Module):
     def _model_fit(self):
         if self.model is not None:
             if self.checkpointed:
-                best_epoch = self.epoch
                 losses = self.losses
                 test_losses = self.test_losses
-                best_model = copy.deepcopy(self.model.state_dict())
                 early_stop_counter = self.early_stop_counter
-                best_test_loss = min(test_losses)
+                # best weights are tracked from the third epoch on (below); restore them from the
+                # checkpoint, since the checkpoint epoch's own weights are usually not the best
+                tracked = test_losses[2:]
+                best_idx = 2 + int(np.argmin(tracked)) if tracked else len(test_losses) - 1
+                best_epoch = best_idx + 1
+                best_test_loss = test_losses[best_idx]
+                best_model = (self.checkpoint_best if getattr(self, 'checkpoint_best', None) is not None
+                              else copy.deepcopy(self.model.state_dict()))
             else:
                 losses = []
                 test_losses = []
@@ -1585,9 +1700,22 @@ class runner(nn.Module):
             lr_floor_patience = mp.get('lr_floor_patience', LR_FLOOR_PATIENCE)
             lr_min = mp.get('lr_min', 1e-6)
             patience_ref = best_test_loss
+            if self.checkpointed:
+                # replay the patience reference the run had reached, not just its best loss
+                patience_ref = float('inf')
+                for t in test_losses[2:]:
+                    if t < patience_ref * (1.0 - min_delta):
+                        patience_ref = t
+            # Epochs before es_start_epoch neither count toward patience nor step the
+            # LR schedule; the best weights are still tracked. With a backprop-depth
+            # ramp (rollout.ramp_epochs) the objective keeps deepening until the ramp
+            # ends, so a loss that plateaus there is not converged: set
+            # es_start_epoch to the ramp length. 0 (default) is the historical behavior.
+            es_start = int(mp.get('es_start_epoch', 0))
             logger.info(f"Gradient clip max norm: {max_norm}")
             logger.info(f"Early stopping: patience={mp['patience']}, min_delta={min_delta:.2%}"
-                        f", lr_floor_patience={lr_floor_patience}")
+                        f", lr_floor_patience={lr_floor_patience}"
+                        + (f", held (with the LR schedule) until epoch {es_start}" if es_start else ""))
 
             first_epoch = len(losses)
             for epoch in range(first_epoch, self.config['model_params']['num_epochs']):
@@ -1598,7 +1726,9 @@ class runner(nn.Module):
                 test_loss = self._validate_epoch()
                 test_losses.append(test_loss)
 
-                self.scheduler.step(test_loss)
+                holding = epoch + 1 <= es_start
+                if not holding:
+                    self.scheduler.step(test_loss)
                 new_lr = self.optimizer.param_groups[0]['lr']
 
                 if epoch > 1:
@@ -1621,6 +1751,8 @@ class runner(nn.Module):
                     if test_loss < patience_ref * (1.0 - min_delta):
                         patience_ref = test_loss
                         early_stop_counter = 0
+                    elif holding:
+                        pass
                     else:
                         early_stop_counter += 1
                         # once the scheduler has bottomed out there is nothing
@@ -1713,6 +1845,8 @@ class runner(nn.Module):
                                                      total_steps, ids)
         if self.config['model_params']['model_type'] == 'tr_spatial':
             return self._predict_dofs_forward_spatial(name, dof_u, dof_v, dof_w, total_steps)
+        if diffusion.is_diffusion(self):
+            return self._predict_dofs_forward_diffusion(name, dof_u, dof_v, dof_w, total_steps, ids)
         time_lag = self.config['model_params']['time_lag']
         if total_steps is None:
             total_steps = dof_u.shape[0]
@@ -1953,6 +2087,24 @@ class runner(nn.Module):
         return self._assemble_dof_preds(predictions, geom)
 
 
+    def _predict_dofs_forward_diffusion(self, name, dof_u, dof_v, dof_w=None, total_steps=None,
+                                        ids=None):
+        """One sampled rollout of the diffusion model (lib/diffusion.py).
+
+        The sampler is seeded from diffusion.seed and the first snapshot id, so a
+        forecast is reproducible and forecasts from different starts draw
+        different noise. Returns (total_steps, num_dofs) per component.
+        """
+        tl = self.config['model_params']['time_lag']
+        total_steps = dof_u.shape[0] if total_steps is None else total_steps
+        if total_steps < tl:
+            raise ValueError(f"total_steps ({total_steps}) must be >= time_lag ({tl})")
+        seed = (dof_u[:tl], dof_v[:tl], None if dof_w is None else dof_w[:tl])
+        offset = 0 if ids is None else int(np.asarray(ids)[0])
+        traj = diffusion.forecast(self, name, [seed], total_steps - tl, members=1,
+                                  seed_offset=offset)[0, 0].astype(np.float64)   # (T, dim, N)
+        return traj[:, 0], traj[:, 1], (traj[:, 2] if self.dim == 3 else None)
+
     def _pred_sources(self):
         """(source, split_key) pairs that pred() and eval() cover.
 
@@ -2064,15 +2216,26 @@ class runner(nn.Module):
     def _pred_rec(self):
         """
         Reconstruct the full field predictions from the predicted dofs and save to HDF5.
+
+        Only with config['save_rec']; otherwise eval decodes from the stored
+        coefficients on demand (lib/recfield), and any decoded file or cached
+        statistics left from an earlier prediction are removed as stale.
         """
+        pred_sources = self._pred_sources()
+        if not self.save_rec:
+            for source, split_key in pred_sources:
+                source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
+                recfield.clear(self.paths_bib.pred_dir + source.get('name') + f'_{source_group}_pred_rec.h5')
+            logger.info("Decoded predictions are not stored (save_rec false); eval decodes on demand")
+            return
         logger.info(f"{'#'*20}\t{'Reconstructing predictions...':<20}\t{'#'*20}")
         # get all files in pred directory and loop through them
-        pred_sources = self._pred_sources()
         for id, (source, split_key) in enumerate(pred_sources):
             name = source.get('name')
             source_group = 'train_data' if split_key == 'train_indices' else 'eval_data'
             pred_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred.h5'
             ids = self.indices[source_group][name][split_key]
+            recfield.clear(pred_path.replace('.h5', '_rec.h5'))
             logger.info(f"Reconstructing for {name} from {pred_path}...")
             with h5py.File(pred_path, 'r') as f:
                 dof_u_pred = f['dof_u'][:]
@@ -2125,14 +2288,38 @@ class runner(nn.Module):
         branch against a perfect global branch -- an upper bound on the hybrid,
         which is what a first feasibility test wants.
         """
+        with h5py.File(rec_path, 'r+') as f:
+            n_rec = f['Q_rec'].shape[0]
+            field = self._global_pod_field(np.asarray(ids)[:n_rec], f['Q_rec'].shape[1:])
+            if field is None:
+                return
+            # rec row i is snapshot ids[i] (the seeded window included)
+            f['Q_rec'][:] = f['Q_rec'][:] + field
+        logger.info("Restored the POD global field onto %s", os.path.basename(rec_path))
+
+    def _global_pod_field(self, snap_ids, frame_shape):
+        """Global POD field of snapshots `snap_ids`, cropped to `frame_shape`; None without one.
+
+        See _add_global_pod. Loaded once per run and cached.
+        """
         stem = self.config['latent_params'].get('global_pod')
         if not stem:
-            return
+            return None
+        if not hasattr(self, '_global_pod_cache'):
+            self._global_pod_cache = self._load_global_pod(stem)
+        if self._global_pod_cache is None:
+            return None
+        modes, coeffs = self._global_pod_cache
+        field = np.tensordot(coeffs[np.asarray(snap_ids)], modes, axes=([1], [modes.ndim - 1]))
+        crop = tuple(slice(0, n) for n in frame_shape)
+        return field[(slice(None),) + crop]
+
+    def _load_global_pod(self, stem):
         pod_path = self.paths_bib.data_dir + stem + '.h5'
         if not os.path.exists(pod_path):
             logger.warning("global_pod file %s not found; leaving the residual "
                            "reconstruction unmodified.", pod_path)
-            return
+            return None
 
         # 'coeffs' are the true coefficients (an upper bound on the hybrid, since
         # the global branch is then free); 'coeffs_pred' are a forecast from
@@ -2145,18 +2332,8 @@ class runner(nn.Module):
                 key = 'coeffs'
             modes = f['modes'][:]                    # (nx, ny[, nz], nv, K)
             coeffs = f[key][:]                       # (num_snaps, K)
-        logger.info("Global POD branch: using '%s'", key)
-
-        with h5py.File(rec_path, 'r+') as f:
-            n_rec = f['Q_rec'].shape[0]
-            idx = np.asarray(ids)[:n_rec]
-            # rec row i is snapshot ids[i] (the seeded window included), so the
-            # same rows index the coefficient record
-            field = np.tensordot(coeffs[idx], modes, axes=([1], [modes.ndim - 1]))
-            crop = tuple(slice(0, n) for n in f['Q_rec'].shape[1:])
-            f['Q_rec'][:] = f['Q_rec'][:] + field[(slice(None),) + crop]
-        logger.info("Restored POD-%d global field onto %s",
-                    coeffs.shape[1], os.path.basename(rec_path))
+        logger.info("Global POD branch: using '%s' (POD-%d)", key, coeffs.shape[1])
+        return modes, coeffs
 
     def _codec_reference(self, name, source_group, ids):
         """Reconstruct the TRUE latent coefficients over `ids`, cached to disk.
@@ -2172,12 +2349,66 @@ class runner(nn.Module):
         """
         ref_path = os.path.join(
             self.paths_bib.pred_dir, f"{name}_{source_group}_codec_ref_rec.h5")
+        if recfield.is_lazy(ref_path):          # decoded on demand (save_rec false)
+            return ref_path
         try:
             return codec_ref.link(ref_path, codec_ref.shared_path(self.paths_bib.latent_dir, name),
                                   ids, lambda lo, hi: self._reconstruct_true(name, lo, hi))
         except Exception:
             logger.exception("Could not build codec reference for %s %s", name, source_group)
             return None
+
+    def _decode(self, dof_u, dof_v, dof_w=None):
+        """Fields (T, *spatial, num_vars) of coefficient arrays, by the latent's own decoder."""
+        if self.config['latent_params']['type'] == 'pod':
+            return pod.pod_recon(rec_target=None, config=self.l_config, dof_u=dof_u, dof_v=dof_v,
+                                 dof_w=dof_w, batch_size=self.config['latent_params'].get('batch_size', 100))
+        if self.dim == 3:
+            return self.dls.gfem_recon_flexible(rec_target=None, config=self.l_config, dof_u=dof_u,
+                                                dof_v=dof_v, dof_w=dof_w,
+                                                batch_size=self.config['latent_params'].get('batch_size', 100))
+        return self.dls.decode_fields(self.l_config, dof_u, dof_v)
+
+    def _register_lazy(self, name, source_group, ids):
+        """Serve this source's decoded prediction and codec reference by decoding on demand.
+
+        Registers, under the paths a save_rec run would have written, lazy views
+        that the TKE/RMS code and the plotting read through recfield.open_rec.
+        Prediction row i is snapshot ids[i] (rows 0..time_lag-1 are the seed), so
+        the global POD branch, if any, is restored for ids[rows]; the codec
+        reference holds the true coefficients of ids[rows], as _reconstruct_true.
+        Returns the two registered paths.
+        """
+        keys = ['dof_u', 'dof_v'] + (['dof_w'] if self.dim == 3 else [])
+        pred_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred.h5'
+        rec_path = pred_path.replace('.h5', '_rec.h5')
+        ref_path = os.path.join(self.paths_bib.pred_dir, f"{name}_{source_group}_codec_ref_rec.h5")
+        ids = np.asarray(ids)
+
+        def from_file(path, group, row_ids, add_pod):
+            def decode_rows(rows):
+                idx = row_ids[rows]
+                # a contiguous run reads as one slice (HDF5 list indexing is slow)
+                sel = slice(int(idx[0]), int(idx[-1]) + 1) if np.all(np.diff(idx) == 1) else idx
+                with h5py.File(path, 'r') as f:
+                    g = f[group] if group else f
+                    dofs = [g[k][sel] for k in keys]
+                q = self._decode(*dofs)
+                if add_pod:
+                    extra = self._global_pod_field(ids[rows], q.shape[1:])
+                    if extra is not None:
+                        q = q + extra
+                return q
+            return decode_rows
+
+        with h5py.File(pred_path, 'r') as f:
+            n_pred = f['dof_u'].shape[0]
+        decode_pred = from_file(pred_path, None, np.arange(n_pred), add_pod=True)
+        frame = decode_pred(np.array([0])).shape[1:]
+        recfield.register(rec_path, recfield.LazyField(decode_pred, n_pred, frame))
+        decode_ref = from_file(self.paths_bib.latent_path, name, ids, add_pod=False)
+        recfield.register(ref_path, recfield.LazyField(decode_ref, len(ids), decode_ref(np.array([0])).shape[1:]))
+        return rec_path, ref_path
 
     def _reconstruct_true(self, name, lo, hi):
         """Field reconstruction of the true latent coefficients of snapshots lo..hi-1."""
@@ -2210,7 +2441,9 @@ class runner(nn.Module):
             'name': self.config.get('name'),
             'latent_id': self.paths_bib.latent_id,
             'model_type': mp.get('model_type'),
+            'time_lag': mp.get('time_lag'),
             'train_ahead': mp.get('train_ahead'),
+            'es_start_epoch': mp.get('es_start_epoch', 0),
             'loss': mp.get('loss', 'mse'),
             'rollout': mp.get('rollout', {'mode': 'detached'}),
             'grad_clip': mp.get('grad_clip', GRAD_CLIP_MAX_NORM),
@@ -2253,6 +2486,8 @@ class runner(nn.Module):
             
             os.makedirs(self.paths_bib.pred_fig_dir, exist_ok=True)
             rec_path = self.paths_bib.pred_dir + name + f'_{source_group}_pred_rec.h5'
+            if not self.save_rec:
+                self._register_lazy(name, source_group, ids)
             # with a POD-residual source the model trains on the residual
             # but is scored against the original field
             gt_stem = self.config['latent_params'].get('full_source', source.get('path'))
@@ -2424,17 +2659,18 @@ class runner(nn.Module):
             weights = weights[:nx, :ny]
 
 
-        with h5py.File(rec_path, 'r+') as f:
+        with recfield.open_rec(rec_path, 'r+') as f:
             if 'TKE_rec' in f:
                 logger.info(f"TKE for reconstructed already computed and found in {rec_path}. Skipping computation...")
                 TKE_rec = f['TKE_rec'][:]
             else:
                 logger.info(f"TKE for reconstructed not found in {rec_path}. Computing TKE...")
-                Q_rec = f['Q_rec'][:] # shape: (snaps, ..., dim)
-                Q_rec_weighted = Q_rec * weights[np.newaxis, ..., np.newaxis] # shape: (snaps, ..., dim)
-                Q_rec_weighted = Q_rec_weighted.reshape(Q_rec_weighted.shape[0], -1) 
-                
-                TKE_rec = 0.5 * np.sum(Q_rec_weighted**2, axis=-1) # shape: (snaps, ...)
+                Q = f['Q_rec']
+                TKE_rec = np.empty(Q.shape[0])
+                for lo in range(0, Q.shape[0], 256):        # streamed: bounded memory
+                    Q_rec_weighted = Q[lo:lo + 256] * weights[np.newaxis, ..., np.newaxis]
+                    Q_rec_weighted = Q_rec_weighted.reshape(Q_rec_weighted.shape[0], -1)
+                    TKE_rec[lo:lo + 256] = 0.5 * np.sum(Q_rec_weighted**2, axis=-1)
                 f.create_dataset('TKE_rec', data=TKE_rec)
 
             
@@ -2468,14 +2704,19 @@ class runner(nn.Module):
 
         print(f"nx: {nx}, ny: {ny}, nz: {nz}")
 
-        with h5py.File(rec_path, 'r+') as f:
+        with recfield.open_rec(rec_path, 'r+') as f:
             if 'RMS_rec' in f:
                 logger.info(f"RMS for reconstructed already computed and found in {rec_path}. Skipping computation...")
                 RMS_rec = f['RMS_rec'][:]
             else:
                 logger.info(f"RMS for reconstructed not found in {rec_path}. Computing RMS...")
-                Q_rec = f['Q_rec'][time_lag:] # shape: (snaps, ..., dim)
-                RMS_rec = np.sqrt(np.mean(Q_rec**2, axis=0)) # shape: (snaps, ...)
+                Q = f['Q_rec']
+                sq, n = 0.0, 0
+                for lo in range(time_lag, Q.shape[0], 256):  # streamed: bounded memory
+                    q = Q[lo:lo + 256].astype(np.float64)
+                    sq = sq + np.sum(q**2, axis=0)
+                    n += q.shape[0]
+                RMS_rec = np.sqrt(sq / n).astype(np.float32)  # shape: (..., dim)
                 f.create_dataset('RMS_rec', data=RMS_rec)
 
 

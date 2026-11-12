@@ -1,0 +1,83 @@
+{
+    "model_params": {
+        "model_name": "spatial_tr",
+        "model_type": "tr_spatial",
+        "time_lag": 4,
+        "train_ahead": 16,
+        "num_layers": 4,
+        "nhead": 4,
+        "d_model": 128,
+        "ff_dim": 384,
+        "coord_freqs": 6,
+        "residual": true,
+        "reassemble": true,
+        "reassemble_lambda": 0.01,
+        "lr": 0.001,
+        "lr_factor": 0.5,
+        "lr_min": 1e-06,
+        "lr_patience": 5,
+        "grad_clip": 1.0,
+        "loss": {
+            "type": "combo",
+            "terms": [
+                {
+                    "type": "mse",
+                    "weight": 1.0
+                },
+                {
+                    "type": "frame_energy",
+                    "weight": 1.0,
+                    "metric": "field"
+                }
+            ]
+        },
+        "batch_size": 64,
+        "num_epochs": 5000,
+        "patience": 10,
+        "activation": "swiglu",
+        "prenorm": true,
+        "rollout": {
+            "mode": "bptt",
+            "chunk": 8,
+            "checkpoint": true,
+            "ramp_epochs": 20,
+            "reassemble": true
+        },
+        "es_min_delta": 0.01,
+        "lr_floor_patience": 20,
+        "loss_metric": "gram",
+        "norm": "per_dof",
+        "amp_growth_interval": 10000,
+        "seed": 1,
+        "es_start_epoch": 20
+    },
+    "latent_params": {
+        "type": "dls",
+        "patch_size": 13,
+        "num_modes": 5,
+        "localized": true,
+        "source_name": "cavity",
+        "source_path": "Challenge2_1_train",
+        "batch_size": 1000,
+        "full_cover": true,
+        "cut_weight": 0.1,
+        "basis_from": "results/cavity_dls_p13m5_fc/latent_config.pkl",
+        "cut_extension": "odd"
+    },
+    "train_data": [
+        {
+            "name": "cavity",
+            "path": "Challenge2_1_train",
+            "train_split": 0.9,
+            "test_split": 0.1
+        }
+    ],
+    "eval_data": [
+        {
+            "name": "cavity",
+            "path": "Challenge2_1_train",
+            "pred_split": 0.1
+        }
+    ],
+    "eval_train_split": false
+}

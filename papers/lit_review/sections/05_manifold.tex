@@ -1,0 +1,93 @@
+% ======================================================================
+\section{Classical nonlinear manifold learning}
+\label{sec:manifold}
+% ======================================================================
+
+Before neural autoencoders became practical, a family of nonlinear DR methods
+was developed in machine learning to recover low-dimensional coordinates for
+data lying near curved manifolds. These methods work directly with the data
+set, often through a similarity graph or kernel matrix, and learn an
+\emph{embedding} of the training points. Most do not provide a decoder, which
+has limited their use as reduced representations for dynamics but made them
+valuable for analysis and for estimating intrinsic dimension.
+
+\subsection{Kernel principal component analysis}
+
+Kernel PCA \parencite{scholkopf1998kpca} performs PCA in a feature space defined
+implicitly by a positive-definite kernel $k(\bm{x},\bm{x}')$, for example a
+Gaussian or polynomial kernel. The embedding coordinates follow from the
+eigenvectors $\bm{\alpha}_j$ of the centered $T\times T$ kernel matrix,
+$z_j(\bm{x})=\sum_{i}\alpha_{j,i}\,k(\bm{x}_i,\bm{x})$, so kernel PCA is the
+nonlinear analogue of the method of snapshots and has the same cost scaling.
+Reconstruction requires solving a \emph{pre-image} problem, finding a state
+whose feature-space image is close to a given point, which is ill-posed and
+usually solved approximately by fixed-point iteration or regression
+\parencite{mika1999preimage}. \textcite{salvador2021kpod} used kernel POD to
+build reduced spaces for parametrized PDEs and trained neural networks to
+predict the reduced coefficients. They obtained more accurate snapshot
+approximations with fewer coordinates than POD at similar online cost.
+
+\subsection{Graph-based spectral embeddings}
+
+Isomap \parencite{tenenbaum2000isomap} approximates geodesic distances on the
+manifold by shortest paths in a nearest-neighbour graph and embeds them with
+multidimensional scaling. Locally linear embedding (LLE)
+\parencite{roweis2000lle} computes weights that reconstruct each point from its
+neighbours and finds low-dimensional coordinates that preserve those weights.
+Laplacian eigenmaps \parencite{belkin2003laplacian} and diffusion maps
+\parencite{coifman2006diffusion} use eigenvectors of a graph Laplacian or of a
+Markov diffusion operator on the data. Diffusion maps add a time parameter
+that exposes the geometry at multiple scales. All of these methods preserve
+local neighbourhoods and can unfold manifolds that linear projections fold
+onto themselves.
+
+In fluid dynamics, \textcite{farzamnik2023snapshots} combined Isomap as an
+encoder with a $k$-nearest-neighbour decoder. For the fluidic pinball they
+described both the pitchfork bifurcation and the chaotic regime with only
+three coordinates, linked to vortex-shedding phases and force coefficients.
+For the wake of tandem cylinders, Isomap separated two shedding regimes that
+appear as a single circle in the plane of the first two POD amplitudes.
+\textcite{csala2022comparing} compared four manifold-learning and two
+autoencoder methods with PCA on canonical laminar and turbulent flows and on
+biomedical flows. They discussed the influence of arranging data temporally
+versus spatially and concluded that nonlinear DR is promising for reduced-order
+modeling. \textcite{mendez2023linear} placed kernel PCA, Isomap, and LLE in a
+common framework with autoencoders and benchmarked them for filtering,
+identification of oscillatory patterns, and compression.
+\textcite{loiseau2018sparse} lifted sensor signals to a feature space by time
+delays, identified sparse dynamics on it, and reconstructed the velocity field
+with a local linear map from features to flow. This is another way to supply
+the decoder that spectral embeddings lack.
+
+The limitations of these methods for reduced-order modeling are well
+recognized \parencite{mojgani2021registration}. There is no explicit map from
+latent coordinates back to the physical space, and out-of-sample points need
+Nystr\"om-type extensions. The embeddings depend on neighbourhood parameters,
+and the coordinates are often hard to interpret. Cost and memory scale with
+$T^{2}$. Visualization methods such as t-SNE \parencite{vandermaaten2008tsne}
+and UMAP \parencite{mcinnes2018umap} are useful for exploring the structure of
+flow data sets, but they deliberately distort global geometry and are not
+suitable as coordinates for dynamics models. Manifold-learning estimates of
+intrinsic dimension, such as the maximum-likelihood estimator of
+\textcite{levina2004intrinsic}, remain useful for choosing latent sizes of the
+autoencoders discussed next.
+
+\subsection{Polynomial and quadratic manifolds}
+
+A simple way to curve a linear subspace while keeping an explicit decoder is
+to add polynomial corrections,
+\begin{equation}
+  \q\approx\bar{\q}+\bm{V}\z+\bm{H}\,(\z\otimes\z),
+  \label{eq:quadratic}
+\end{equation}
+where $\bm{V}$ is usually a POD basis and $\bm{H}$ is fitted to the residual.
+Quadratic manifolds were introduced for nonlinear structural dynamics
+\parencite{jain2017quadratic}. They were later developed to mitigate the
+Kolmogorov barrier in projection-based model reduction
+\parencite{barnett2022quadratic} and combined with operator inference for
+non-intrusive models \parencite{geelen2023quadratic}. The decoder
+\eqref{eq:quadratic} is cheap and differentiable, the encoder can remain a
+linear projection, and the construction is a small step from standard POD
+workflows. The expressiveness is limited compared with deep networks, but
+quadratic manifolds provide a useful intermediate baseline between linear and
+fully learned trial manifolds.

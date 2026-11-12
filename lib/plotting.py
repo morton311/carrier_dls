@@ -17,6 +17,7 @@ from matplotlib.ticker import FuncFormatter
 
 from lib.metrics import l2_err_norm
 import lib.metrics as l_metrics
+import lib.recfield as recfield
 
 import logging
 logger = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def plot_loss(runner) -> None:
 
 
 def plot_TKE(runner, rec_path: str, gt_path: str, name: str, source: str, ids) -> None:
-    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+    with recfield.open_rec(rec_path) as f_rec, h5py.File(gt_path, 'r') as f_gt:
         time_lag = runner.config['model_params']['time_lag']
         val_id = ids
         TKE_rec = f_rec['TKE_rec'][:]
@@ -225,7 +226,7 @@ def plot_RMS(runner, rec_path: str, gt_path: str, name: str, source: str,
     elif x_slice is not None:
         slice_axis, slice_val = 'x', x_slice
 
-    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+    with recfield.open_rec(rec_path) as f_rec, h5py.File(gt_path, 'r') as f_gt:
         RMS_rec = f_rec['RMS_rec'][:]
         # the truth RMS compute_RMS scored against: keyed by snapshot window, not latent
         RMS_gt = runner._to_xy(f_gt[runner.rms_gt_keys[(name, source)]][:], 0)
@@ -345,7 +346,7 @@ def plot_slice_compare(runner, rec_path: str, gt_path: str, name: str, ids, indx
     val_id = ids
     indx = indx + 1
 
-    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+    with recfield.open_rec(rec_path) as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
         Q_gt = runner._to_xy(f_gt['UV'][val_id[time_lag + indx]] - mean, 0)
         Q_rec = f_rec['Q_rec'][time_lag + indx]
@@ -472,7 +473,7 @@ def q_criterion(runner, rec_path: str, gt_path: str, name: str, ids, indx: int) 
     val_id = ids
     time_lag = runner.config['model_params']['time_lag']
     indx = indx + 1
-    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+    with recfield.open_rec(rec_path) as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
         Q_gt = f_gt['UV'][val_id[time_lag + indx]] - mean
         Q_rec = f_rec['Q_rec'][time_lag + indx]
@@ -535,7 +536,7 @@ def anim_q_criterion(runner, rec_path: str, gt_path: str, name: str, ids) -> Non
     os.makedirs(q_dir, exist_ok=True)
     val_id = ids
     time_lag = runner.config['model_params']['time_lag']
-    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+    with recfield.open_rec(rec_path) as f_rec, h5py.File(gt_path, 'r') as f_gt:
         mean = f_gt['mean'][:]
         Q_rec = f_rec['Q_rec'][:]
         Q_gt = f_gt['UV'][val_id[time_lag:Q_rec.shape[0]]] - mean
@@ -678,7 +679,7 @@ def _pred_index(runner, rec_path, ids):
     rec[i] corresponds to gt[ids[i]] (the alignment plot_TKE uses).
     """
     time_lag = runner.config['model_params']['time_lag']
-    with h5py.File(rec_path, 'r') as f:
+    with recfield.open_rec(rec_path) as f:
         n_rec = f['Q_rec'].shape[0]
     n = min(n_rec, len(ids))
     return np.arange(time_lag, n), np.asarray(ids[time_lag:n])
@@ -698,7 +699,7 @@ def _load_pair(runner, rec_path, gt_path, ids, frac=None, max_snaps=_STAT_MAX_SN
         # the codec reference is reconstructed over `ids` directly, so its row i
         # is ids[i]; drop the same leading time_lag rows the prediction drops
         time_lag = runner.config['model_params']['time_lag']
-        with h5py.File(rec_path, 'r') as f:
+        with recfield.open_rec(rec_path) as f:
             n_ref = f['Q_rec'].shape[0]
         n = min(n_ref, len(ids))
         rec_idx = np.arange(time_lag, n)
@@ -716,7 +717,7 @@ def _load_pair(runner, rec_path, gt_path, ids, frac=None, max_snaps=_STAT_MAX_SN
     nx, ny = runner.l_config.nx_t, runner.l_config.ny_t
     nz = runner.l_config.nz_t if runner.dim == 3 else None
 
-    with h5py.File(rec_path, 'r') as f:
+    with recfield.open_rec(rec_path) as f:
         Q_rec = f['Q_rec'][rec_idx]
 
     with h5py.File(gt_path, 'r') as f:
@@ -793,7 +794,7 @@ def plot_energy_retention(runner, rec_path, gt_path, name, source, ids):
     headline number is the ratio over the final tenth of the rollout.
     """
     time_lag = runner.config['model_params']['time_lag']
-    with h5py.File(rec_path, 'r') as f_rec, h5py.File(gt_path, 'r') as f_gt:
+    with recfield.open_rec(rec_path) as f_rec, h5py.File(gt_path, 'r') as f_gt:
         TKE_rec = f_rec['TKE_rec'][:]
         TKE_gt = f_gt['TKE_gt_' + runner.latent_id + '_' + name + source][:]
 

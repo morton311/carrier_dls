@@ -1,0 +1,72 @@
+{
+    "model_params": {
+        "model_name": "spatial_diff",
+        "model_type": "tr_spatial_diff",
+        "time_lag": 4,
+        "train_ahead": 1,
+        "num_layers": 4,
+        "nhead": 4,
+        "d_model": 256,
+        "ff_dim": 768,
+        "coord_freqs": 6,
+        "dropout": 0.1,
+        "reassemble_lambda": 0.01,
+        "lr": 0.0003,
+        "lr_factor": 0.5,
+        "lr_min": 1e-06,
+        "lr_patience": 15,
+        "grad_clip": 1.0,
+        "loss": "mse",
+        "batch_size": 64,
+        "num_epochs": 3000,
+        "patience": 40,
+        "es_min_delta": 0.002,
+        "lr_floor_patience": 30,
+        "activation": "swiglu",
+        "norm": "per_dof",
+        "amp_growth_interval": 10000,
+        "seed": 1,
+        "diffusion": {
+            "space": "dof",
+            "weighting": "snr1_trunc",
+            "gamma": 5.0,
+            "sample_steps": 20,
+            "eta": 0.0,
+            "members": 8,
+            "ema_decay": 0.999,
+            "mean_model": "results/ldc_30k_10k_dls_p99m10/spatial_gram_rollout_galerkin_30k_10k"
+        },
+        "lr_threshold": 0.005
+    },
+    "latent_params": {
+        "type": "dls",
+        "patch_size": 99,
+        "num_modes": 10,
+        "localized": true,
+        "source_name": "ldc_30k_10k",
+        "source_path": "ldc_30k_60ksnaps",
+        "batch_size": 250,
+        "skipx": 1,
+        "skipy": 1,
+        "skipz": 1,
+        "compress_used_only": true
+    },
+    "train_data": [
+        {
+            "name": "ldc_30k_10k",
+            "path": "ldc_30k_60ksnaps",
+            "train_split": 0.8,
+            "test_split": 0.1,
+            "max_snapshots": 10000
+        }
+    ],
+    "eval_data": [
+        {
+            "name": "ldc_30k_10k",
+            "path": "ldc_30k_60ksnaps",
+            "pred_split": 0.2,
+            "max_snapshots": 10000
+        }
+    ],
+    "eval_train_split": false
+}

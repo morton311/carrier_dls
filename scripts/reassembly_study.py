@@ -4,7 +4,7 @@ Four settings of one recipe (configs/ldc/spatial_gram_rollout*.json):
 
     none                 trained on raw element outputs; no reassembly in the rollout
     average              trained raw; each node's copies averaged after every step
-    Galerkin (inference) trained raw; regularized Galerkin projection after every step
+    Galerkin (inference) trained raw; mass-weighted projection after every step
     Galerkin (trained)   the same projection inside the training rollout and at inference
 
 For every trained run of a setting it records the inter-element disagreement at
@@ -117,11 +117,14 @@ def compute():
             del r
             torch.cuda.empty_cache()
 
-    # compression floor: the codec reconstruction of the true coefficients, same window
-    # (the shared reference is indexed by snapshot id)
+    # compression floor: the codec reconstruction of the true coefficients, same window,
+    # decoded from the latent (decoded fields are no longer stored)
+    import lib.dls_2d as dls
     tl = json.load(open(f'configs/ldc/{RAW_RUNS[0]}.json'))['model_params']['time_lag']
-    with h5py.File(f'results/{LATENT}/{NAME}_codec_ref_rec.h5', 'r') as f:
-        Q = f['Q_rec'][int(ids[tl]):int(ids[-1]) + 1]
+    cfg = pickle.load(open(f'results/{LATENT}/latent_config.pkl', 'rb'))
+    lo, hi = int(ids[tl]), int(ids[-1]) + 1
+    with h5py.File(f'results/{LATENT}/latent_coeff.h5', 'r') as f:
+        Q = dls.decode_fields(cfg, f[NAME]['dof_u'][lo:hi], f[NAME]['dof_v'][lo:hi])
     rms = np.sqrt((Q.astype(np.float64) ** 2).mean(0)); g = rms_truth(tl)
     k = tuple(slice(0, min(a, b)) for a, b in zip(rms.shape, g.shape))
     results['_floor_rms'] = float(100 * np.linalg.norm(rms[k] - g[k]) / np.linalg.norm(g[k]))
@@ -140,12 +143,13 @@ def plot():
     style = {
         'none': dict(color='0.55', ls='-', label='no reassembly'),
         'average': dict(color='#2a78d6', ls='-', label='nodal average'),
-        'Galerkin (inference)': dict(color='#eb6834', ls='--', label='Galerkin, inference only'),
-        'Galerkin (trained)': dict(color='#1baf7a', ls='-.', label='Galerkin, trained in the loop'),
+        'Galerkin (inference)': dict(color='#eb6834', ls='--', label='mass-weighted, inference only'),
+        'Galerkin (trained)': dict(color='#1baf7a', ls='-.', label='mass-weighted, trained in the loop'),
     }
     settings = [s for s in style if s in res]
-    short = {'none': 'none', 'average': 'average', 'Galerkin (inference)': 'Galerkin',
-             'Galerkin (trained)': 'Galerkin, trained'}
+    # display names; the 'Galerkin (...)' keys are the setting names stored in the results JSON
+    short = {'none': 'none', 'average': 'average', 'Galerkin (inference)': 'mass-weighted',
+             'Galerkin (trained)': 'mass-weighted, trained'}
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(pl.width, 0.55 * pl.width),
                                    gridspec_kw=dict(width_ratios=[1.6, 1]))
 
@@ -183,7 +187,8 @@ def plot():
     ax2.set_ylim(0, None)
     ax2.set_xlim(-0.5, len(settings) - 0.2)
     ax2.set_xticks(range(len(settings)))
-    ax2.set_xticklabels(['none', 'average', 'Galerkin\ninference', 'Galerkin\ntrained'][:len(settings)], fontsize=7)
+    ax2.set_xticklabels(['none', 'average', 'mass-\nweighted,\ninference', 'mass-\nweighted,\ntrained'][:len(settings)],
+                        fontsize=7)
     ax2.set_ylabel(r'long-run RMS error (\%)')
     ax2.set_title('(b) statistics over 500 steps', fontsize=9)
     ax2.grid(visible=True, axis='y', linestyle='--', linewidth=0.4)

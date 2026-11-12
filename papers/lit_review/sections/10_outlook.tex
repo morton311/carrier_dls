@@ -1,0 +1,103 @@
+% ======================================================================
+\section{Open challenges and outlook}
+\label{sec:outlook}
+% ======================================================================
+
+\paragraph{Scaling to high-Reynolds-number, three-dimensional flows.}
+Most demonstrations of learned representations use two-dimensional or
+low-Reynolds-number flows, for which global bases or small autoencoders
+suffice. Operationally relevant flows are different in kind. Ship airwakes,
+for example, are massively separated flows at Reynolds numbers of order
+$10^{7}$--$10^{8}$ that must be predicted over many wind-over-deck conditions
+for flight simulation and flight-deck safety analysis
+\parencite{polsky2016safedi}. At this scale even storing global snapshots
+strains memory, dense encoders are infeasible, and the number of
+distinct flow patterns grows with domain size and Reynolds number.
+Representations whose cost and training data grow with the \emph{local}
+complexity of the flow rather than its global complexity are therefore
+attractive. These include domain-decomposed and GFEM-enriched bases
+\parencite{hoang2021ddlspg,diaz2024ddnm,deshmukh2020dls}, graph and
+local-token architectures \parencite{barwey2023multiscale,serrano2024aroma},
+and in situ compression \parencite{glaws2020insitu}. Whether forecasting
+itself can be posed locally without losing long-range coupling is an open
+question. So is how locality interacts with the global pressure field of
+incompressible flow.
+
+\paragraph{Generalization across parameters and conditions.}
+Interpolating between training parameters works well for smooth parametric
+dependence \parencite{amsallem2008grassmann,fries2022lasdi}, but extrapolation to
+new geometries, Reynolds numbers, or operating conditions remains the weakest
+point of learned representations. Local bases may generalize better because
+local flow features (shear layers, boundary layers, vortices) recur across
+conditions even when their global arrangement changes. This hypothesis
+deserves systematic testing.
+
+\paragraph{Experimental and sparse data.}
+Experimental data are noisy, gappy, and often not time-resolved. Classical
+tools include gappy POD \parencite{everson1995gappy}, spectral estimation from
+non-time-resolved PIV synchronized with pressure sensors
+\parencite{zhang2020samm}, and sparse-sensor reconstruction
+\parencite{manohar2018sensor,callaham2019robust,erichson2020shallow}. They need to
+be integrated with learned representations, for example by training encoders
+that accept partial observations or by using generative latent models for
+conditional reconstruction \parencite{du2024cnf}.
+
+\paragraph{Uncertainty, statistics, and generative modeling.}
+For chaotic flows, point forecasts beyond a few Lyapunov times are
+meaningless. What matters is whether a model reproduces the statistics and the
+distribution of future states. Probabilistic latent spaces and latent
+diffusion models \parencite{kohl2023acdm,gao2024bayesian,du2024cnf} are promising
+but expensive, and their evaluation calls for statistical and spectral metrics
+rather than pointwise error.
+
+\paragraph{Interpretability and physical consistency.}
+Linear and local bases offer interpretable modes and simple error estimates.
+Learned representations offer compactness at the cost of both. Continued work
+on ordered and disentangled latent variables
+\parencite{fukami2020hierarchical,eivazi2022betavae}, on relating latent
+coordinates to invariant solutions and physical mechanisms
+\parencite{page2021revealing,farzamnik2023snapshots}, and on hard physical
+constraints \parencite{lee2021deepconservation,mohan2020embedding} will be needed
+before learned representations are trusted in engineering practice.
+
+\paragraph{Foundation models and tokenization.}
+Pretrained models for PDEs \parencite{mccabe2024mpp,herde2024poseidon} and large
+multi-physics data collections \parencite{ohana2024well} raise a new version of
+the representation question: how should heterogeneous flow data be tokenized?
+Patch tokens \parencite{dosovitskiy2021vit}, learned slices
+\parencite{wu2024transolver}, latent tokens \parencite{alkin2024upt}, and
+physically structured local bases \parencite{deshmukh2020dls} embody different
+answers. The DR literature reviewed here, with its emphasis on optimality,
+locality, and multi-scale structure, is directly relevant to that choice.
+
+% ======================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+% ======================================================================
+
+Dimensionality reduction is the foundation on which data-driven models of
+fluid flows are built. It fixes the information available to the dynamics
+model, the cost of training and inference, and the difficulty of the learning
+problem. Linear modal decompositions remain the indispensable baseline: they are
+optimal among linear subspaces, cheap, interpretable, and, for flows dominated
+by a few coherent structures, hard to beat. Their limitations for transport and
+multi-scale turbulence are well understood through the Kolmogorov $n$-width.
+Two broad responses have emerged. Nonlinear manifold methods, from kernel and
+graph embeddings to deep and variational autoencoders and implicit neural
+representations, achieve compact latent spaces when the intrinsic dimension is
+low, at the cost of data, tuning, and an accuracy ceiling. Localized
+representations, from domain decomposition to GFEM enrichment and data-informed
+local subspaces, keep linear, sparse encoders and decoders with guaranteed
+continuity. They learn from few snapshots and scale with the local rather than
+global complexity of the flow, at the cost of larger latent spaces when the
+flow is globally simple.
+
+The literature increasingly suggests that these choices are complementary,
+and that representations should be judged by how well they support learning
+the dynamics: whether the latent state is sufficient, smooth, stable, and
+statistically faithful, not only by reconstruction error. Progress toward
+high-Reynolds-number, three-dimensional, and parametrically varying flows of
+engineering interest will depend on representations that respect the
+multi-scale and local structure of turbulence. It will also depend on
+evaluation against strong baselines, held-out conditions, and statistical
+metrics.

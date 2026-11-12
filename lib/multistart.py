@@ -16,6 +16,13 @@ decoded. Checked against the full 491x491 reconstructions on the LDC p99m10
 encdec rollout: median deviation 0.36% over 500 steps. POD modes are
 orthonormal, so there the coefficient norm already is the field norm.
 
+A diffusion model (model_type 'tr_spatial_diff') is scored as an ensemble of
+diffusion.members sampled forecasts per start: 'ms_err' is the error of the
+ensemble mean, which is what a point forecast is compared on, and the members
+are scored on their own as well ('ms_member_*'), together with the ensemble
+spread and the spread-skill ratio, sqrt((M+1)/M) * spread / error of the mean,
+which is 1 for an ensemble whose spread matches its error (Fortin et al. 2014).
+
 model_params keys:
     horizon       forecast length in steps (default 30, shared with pred())
     eval_starts   number of forecasts per split (default 50)
@@ -26,6 +33,7 @@ import h5py
 import numpy as np
 
 import lib.decode as decode
+import lib.diffusion as diffusion
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +76,8 @@ def field_energy_fn(runner):
     # lam = 0: exact field energy. The regularized metric used for training
     # deliberately departs from it, which is right for a loss but not a score.
     lltogl = runner._compute_lltogl_mat()
-    masks = decode.element_masks_for(runner)
+    # scores count in-domain points only, whatever weight cut elements carry outside
+    masks = decode.element_masks_for(runner, strict=True)
     if masks is None:
         W = [decode.element_gram_sqrt(m, 0.0) for m in mats]
 
@@ -136,6 +145,8 @@ def evaluate(runner, name: str, ids, horizon: int = None, num_starts: int = None
 
     energy = field_energy_fn(runner)
     keys = ['dof_u', 'dof_v'] + (['dof_w'] if runner.dim == 3 else [])
+    if diffusion.is_diffusion(runner):
+        return _evaluate_ensemble(runner, name, ids, starts, horizon, energy, keys)
     model_err = np.zeros((len(starts), horizon))
     persist_err = np.zeros((len(starts), horizon))
 
@@ -163,4 +174,65 @@ def evaluate(runner, name: str, ids, horizon: int = None, num_starts: int = None
                 scalars['ms_err_start_std'], scalars['ms_persist_mean'], scalars['ms_skill'])
     arrays = {'ms_err': model_err, 'ms_persist': persist_err,
               'ms_start_ids': ids[starts]}
+    return scalars, arrays
+
+
+def _evaluate_ensemble(runner, name, ids, starts, horizon, energy, keys):
+    """evaluate() for a diffusion model: diffusion.members sampled forecasts per start."""
+    tl = runner.config['model_params']['time_lag']
+    window = tl + horizon
+    M = int(diffusion.settings(runner)['members'])
+    with h5py.File(runner.paths_bib.latent_path, 'r') as f:
+        group = f[name]
+        trues = [[group[key][ids[i]:ids[i + window - 1] + 1, :] for key in keys] for i in starts]
+    seeds = [tuple([t[:tl] for t in tr] + [None] * (3 - len(tr))) for tr in trues]
+    pred = diffusion.forecast(runner, name, seeds, horizon, members=M)   # (S, M, window, dim, N)
+
+    S = len(starts)
+    model_err = np.zeros((S, horizon))
+    persist_err = np.zeros((S, horizon))
+    member_err = np.zeros((S, M, horizon))
+    spread = np.zeros((S, horizon))
+    for k, tr in enumerate(trues):
+        future = [t[tl:] for t in tr]
+        last = [t[tl - 1:tl] for t in tr]
+        members = [pred[k, :, tl:, c].astype(np.float64) for c in range(len(keys))]   # (M, H, N)
+        mean = [m.mean(axis=0) for m in members]
+        denom = np.maximum(energy(future), 1e-30)
+        model_err[k] = np.sqrt(energy([m - t for m, t in zip(mean, future)]) / denom)
+        persist_err[k] = np.sqrt(energy([l - t for l, t in zip(last, future)]) / denom)
+        member_err[k] = np.sqrt(energy([m - t[None] for m, t in zip(members, future)]) / denom)
+        if M > 1:
+            var = energy([m - mu[None] for m, mu in zip(members, mean)]).sum(axis=0) / (M - 1)
+            spread[k] = np.sqrt(var / denom)
+
+    scalars = summarize(model_err, persist_err)
+    persist = max(persist_err.mean(), 1e-30)
+    member_mean = member_err.mean(axis=1)
+    scalars.update({
+        'ms_members': M,
+        'ms_member_err_mean': float(member_err.mean()),
+        'ms_member_err_start_std': float(member_mean.mean(axis=1).std()),
+        'ms_member_skill': float(1.0 - member_err.mean() / persist),
+    })
+    if M > 1:
+        # per step over the starts, then averaged over the window
+        ssr = np.sqrt((M + 1) / M * (spread ** 2).mean(axis=0)) / np.sqrt(
+            np.maximum((model_err ** 2).mean(axis=0), 1e-30))
+        scalars['ms_spread_mean'] = float(spread.mean())
+        scalars['ms_ssr'] = float(ssr.mean())
+        for h in sorted({*_REPORT_STEPS, horizon}):
+            if h <= horizon:
+                scalars[f'ms_member_err_at{h}_mean'] = float(member_err[:, :, h - 1].mean())
+                scalars[f'ms_spread_at{h}_mean'] = float(spread[:, h - 1].mean())
+                scalars[f'ms_ssr_at{h}'] = float(ssr[h - 1])
+    logger.info("Multi-start %s: %d starts x %d members x %d steps | ensemble-mean error %.4f "
+                "(forecast-to-forecast %.4f) | member error %.4f | spread %.4f | spread-skill %.2f "
+                "| persistence %.4f | skill %.3f (members %.3f)",
+                name, S, M, horizon, scalars['ms_err_mean'], scalars['ms_err_start_std'],
+                scalars['ms_member_err_mean'], scalars.get('ms_spread_mean', 0.0),
+                scalars.get('ms_ssr', float('nan')), scalars['ms_persist_mean'],
+                scalars['ms_skill'], scalars['ms_member_skill'])
+    arrays = {'ms_err': model_err, 'ms_persist': persist_err, 'ms_start_ids': ids[starts],
+              'ms_err_member': member_err, 'ms_spread': spread}
     return scalars, arrays

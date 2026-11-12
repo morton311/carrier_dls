@@ -1,0 +1,220 @@
+% ======================================================================
+\section{Problem setting, notation, and taxonomy}
+\label{sec:formulation}
+% ======================================================================
+
+\subsection{Snapshots, encoders, and decoders}
+
+Let $\q(t)\in\R^{N}$ denote the discretized flow state at time $t$, for example
+the velocity components at all grid points of a simulation or all vectors of a
+PIV field. The state may also depend on parameters $\bm{\mu}$ such as the
+Reynolds number, geometry, or operating condition. A data set of $T$ snapshots
+is collected in the matrix
+\begin{equation}
+  \X = \bigl[\,\q_1-\bar{\q},\;\q_2-\bar{\q},\;\dots,\;\q_T-\bar{\q}\,\bigr]\in\R^{N\times T},
+  \label{eq:snapshots}
+\end{equation}
+where $\bar{\q}$ is usually the temporal mean, so that $\X$ contains
+fluctuations. Distances are measured in a weighted inner product
+$\langle \bm{a},\bm{b}\rangle_{\W}=\bm{a}^{\top}\W\bm{b}$, where $\W$ holds
+quadrature weights (and, for compressible flows, energy-consistent scalings of
+the different variables). With this norm the squared norm of a velocity
+fluctuation is (twice) its kinetic energy.
+
+A dimensionality reduction consists of an \emph{encoder}
+$\enc:\R^{N}\to\R^{r}$ and a \emph{decoder} $\dec:\R^{r}\to\R^{N}$ with
+$r\ll N$. They define latent coordinates $\z=\enc(\q)$ and a reconstruction
+$\hat{\q}=\dec(\enc(\q))$. The image of the decoder,
+$\M=\{\dec(\z):\z\in\R^{r}\}$, is the \emph{trial manifold} on which
+reconstructions live. The generic learning problem is
+\begin{equation}
+  \min_{\enc,\dec}\;\frac{1}{T}\sum_{k=1}^{T}\bigl\|\q_k-\bar\q-\dec\bigl(\enc(\q_k-\bar\q)\bigr)\bigr\|_{\W}^{2}
+  \;+\;\lambda\,\mathcal{R}(\enc,\dec),
+  \label{eq:generic}
+\end{equation}
+where $\mathcal{R}$ is a regularizer (sparsity, smoothness, a prior on $\z$,
+or a dynamics loss). Linear methods restrict $\dec(\z)=\Phib\z$ with
+$\Phib\in\R^{N\times r}$, so that $\M$ is an $r$-dimensional subspace. Nonlinear
+methods allow $\M$ to be a curved manifold. Some methods have no explicit
+decoder (Isomap, t-SNE); others define the encoder only implicitly, through a
+projection or an optimization problem. Examples of the latter are Galerkin
+projection, the global mass-matrix solve in finite element enrichment
+(\cref{sec:dls}), and auto-decoders for implicit neural representations
+(\cref{sec:inr}).
+
+\subsection{How well can a subspace do? The Kolmogorov \texorpdfstring{$n$}{n}-width}
+
+For a set $\mathcal{S}$ of states (for instance all snapshots over time and
+parameters), the best possible worst-case error of any $r$-dimensional linear
+subspace is measured by the Kolmogorov $n$-width
+\parencite{kolmogorov1936,pinkus1985nwidths}:
+\begin{equation}
+  d_{r}(\mathcal{S})=\inf_{\substack{V_r\subset\R^{N}\\ \dim V_r=r}}\;
+  \sup_{\q\in\mathcal{S}}\;\inf_{\bm{v}\in V_r}\;\|\q-\bm{v}\|.
+  \label{eq:nwidth}
+\end{equation}
+In the mean-square sense, POD attains the analogous optimum for a given data
+set (\cref{sec:pod}). For diffusion-dominated problems with smooth parameter
+dependence, $d_r$ typically decays exponentially and linear reduction is very
+effective. For transport-dominated problems $d_r$ can decay as slowly as
+$r^{-1/2}$ \parencite{ohlberger2016reduced,greif2019decay}. This is the case
+for moving fronts and shocks, advected vortices, and the broadband multi-scale
+content of high-Reynolds-number turbulence, and it holds even when the
+solution set has a small \emph{intrinsic} dimension. A traveling pulse
+$g(x-ct)$ is described by a single parameter but requires many Fourier-like
+modes. The gap between intrinsic dimension and $n$-width, sometimes called the
+\emph{Kolmogorov barrier} \parencite{peherstorfer2022breaking}, is the central
+motivation for nonlinear and local reduction and recurs throughout this review
+(\cref{fig:nwidth,fig:ae_vs_pod}).
+
+\subsection{What makes a reduced representation good for learning?}
+\label{sec:desiderata}
+
+Reconstruction error alone is an incomplete criterion when the latent
+coordinates will be used to train a model of the dynamics. We collect here the
+properties that recur in the literature and that we use to compare methods in
+\cref{sec:assessment}.
+\begin{enumerate}[label=(P\arabic*),leftmargin=3.2em,itemsep=2pt]
+  \item \textbf{Accuracy and generalization.} Low reconstruction error on
+  \emph{held-out} states, including unseen times and parameters, not only on
+  the training snapshots.
+  \item \textbf{Compactness.} A small latent dimension $r$, or more generally a
+  small number of learnable degrees of freedom seen by the dynamics model.
+  \item \textbf{Dynamical regularity.} Latent trajectories that are smooth in
+  time, approximately Markovian (the current latent state determines its
+  future), and free of spurious fast scales, so that a forecasting model can
+  be stable over long rollouts.
+  \item \textbf{Data efficiency.} Reliable construction from limited snapshots,
+  which is essential for expensive simulations and experiments.
+  \item \textbf{Scalability.} Tractable cost and memory for $N\sim10^{6}$--$10^{9}$,
+  compatibility with streaming or in situ processing, and independence of the
+  mesh or sensor layout.
+  \item \textbf{Interpretability and physical consistency.} Coordinates
+  associated with identifiable structures or energies, and respect for
+  conservation laws, boundary conditions, and symmetries.
+  \item \textbf{Invertibility and decoder cost.} A cheap, stable decoder, and
+  for intrusive models a decoder whose Jacobian is available.
+\end{enumerate}
+These properties conflict. Linear bases offer (P5)--(P7) but weak (P2) for
+transport-dominated flows. Deep autoencoders offer (P2) at the cost of (P4),
+(P5), and often (P1) at high accuracy. Localized bases trade a larger $r$ for
+improved (P1), (P4), and (P5). Much of the recent literature can be read as a
+search for better compromises among (P1)--(P7).
+
+\subsection{Intrusive and non-intrusive use of reduced coordinates}
+
+Once $\enc$ and $\dec$ are fixed, the latent dynamics can be obtained in two
+ways. In \emph{intrusive} (projection-based) ROMs the governing equations
+$\dot{\q}=\bm{f}(\q)$ are projected onto the trial manifold. For a linear
+basis with $\W$-orthonormal columns, Galerkin projection gives
+$\dot{\z}=\Phib^{\top}\W\bm{f}(\bar{\q}+\Phib\z)$
+\parencite{holmes2012turbulence,benner2015survey}. Nonlinear manifolds lead to
+manifold Galerkin or least-squares Petrov--Galerkin formulations that involve
+the decoder Jacobian \parencite{lee2020cae}. In \emph{non-intrusive}
+(data-driven) ROMs, which are the main subject here, a model
+$\z_{k+1}=\mathcal{F}_{\theta}(\z_k,\z_{k-1},\dots;\bm{\mu})$ or
+$\dot{\z}=\bm{f}_{\theta}(\z;\bm{\mu})$ is regressed directly from the encoded
+training trajectories. Examples include operator inference, sparse regression,
+Koopman embeddings, recurrent networks, transformers, neural ordinary
+differential equations, and latent generative models (\cref{sec:dynamics}).
+\Cref{fig:pipeline} summarizes this generic compress--evolve--reconstruct
+pipeline.
+
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    box/.style={draw=cink2, line width=0.5pt, rounded corners=2pt, align=center,
+                minimum height=1.25cm, inner sep=4pt, fill=white},
+    lat/.style={box, fill=cneutral, minimum width=1.5cm},
+    arr/.style={-{Stealth[length=2.2mm]}, line width=0.6pt, draw=cink2},
+    note/.style={font=\scriptsize, text=cink2, align=center}
+  ]
+  \node[box, minimum width=2.1cm] (data) {Flow states\\$\q_k\in\R^{N}$\\[-1pt]{\scriptsize CFD, PIV}};
+  \node[box, right=0.55cm of data, minimum width=2.1cm, draw=cblue, line width=0.8pt] (enc) {Encoder\\$\enc$};
+  \node[lat, right=0.55cm of enc] (z) {Latent\\$\z_k\in\R^{r}$};
+  \node[box, right=0.55cm of z, minimum width=2.4cm, draw=corange, line width=0.8pt] (dyn) {Latent dynamics\\$\z_{k+1}=\mathcal{F}_\theta(\z_{k},\dots)$};
+  \node[box, right=0.55cm of dyn, minimum width=2.1cm, draw=cblue, line width=0.8pt] (dec) {Decoder\\$\dec$};
+  \node[box, below=0.95cm of dec, minimum width=2.1cm] (out) {Forecast\\$\hat{\q}_{k+1}$};
+
+  \draw[arr] (data) -- (enc);
+  \draw[arr] (enc) -- (z);
+  \draw[arr] (z) -- (dyn);
+  \draw[arr] (dyn) -- (dec);
+  \draw[arr] (dec) -- (out);
+  \draw[arr, draw=corange] (dyn.north) to[out=110, in=70, looseness=4.5]
+      node[note, above, pos=0.5] {autoregressive rollout} (dyn.north east);
+
+  \node[note, below=0.12cm of enc] {POD / DMD projection\\GFEM (DLS) projection\\CNN, GNN, INR encoder};
+  \node[note, below=0.12cm of dyn] {Galerkin, OpInf, SINDy\\Koopman, LSTM, Transformer\\Neural ODE, diffusion};
+
+  \node[note, anchor=north west, align=left] at ($(data.south west)+(0,-1.25)$) {Training losses: $\mathcal{L}_{\mathrm{rec}}=\|\q-\dec(\enc(\q))\|^{2}$ (\cref{eq:generic}),\\ and/or $\mathcal{L}_{\mathrm{dyn}}=\|\z_{k+1}-\mathcal{F}_\theta(\z_k)\|^{2}$ or $\|\q_{k+1}-\hat{\q}_{k+1}\|^{2}$};
+\end{tikzpicture}
+\caption{Generic compress--evolve--reconstruct pipeline for data-driven modeling
+of fluid flows. The encoder and decoder (blue) define the reduced
+representation; the latent dynamics model (orange) is either derived by
+projecting the governing equations (intrusive) or learned from encoded
+trajectories (non-intrusive), and is iterated autoregressively at prediction
+time. The two components can be trained sequentially (reconstruction loss,
+then dynamics loss) or jointly.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{A taxonomy}
+
+\Cref{fig:taxonomy} organizes the methods reviewed here along two axes: whether
+the trial manifold is linear or nonlinear, and whether the representation is
+global or spatially localized. Linear global bases (POD and its spectral
+relatives, \cref{sec:linear}) remain the default. Sparse, clustered, and local
+bases (\cref{sec:local}) keep linearity within a patch, cluster, or subdomain
+but assemble a representation that is nonlinear or multi-scale overall.
+Nonlinear manifold learning methods, both classical (\cref{sec:manifold}) and
+neural (\cref{sec:autoencoders}), learn curved trial manifolds. Mesh-agnostic
+and operator-based approaches (\cref{sec:meshfree}) relax the assumption of a
+fixed discretization.
+
+\begin{figure}[tbp]
+\centering
+\begin{forest}
+  for tree={
+    grow'=east, anchor=west, child anchor=west, parent anchor=east,
+    draw=cink2, line width=0.4pt, rounded corners=1.5pt,
+    font=\scriptsize, inner sep=2.5pt, l sep=4mm, s sep=1.0mm,
+    edge={draw=cink2, line width=0.4pt},
+    forked edges,
+  },
+  where level=0{font=\small\bfseries, align=center, fill=cneutral}{},
+  where level=1{font=\footnotesize\bfseries, node options={text width=3.25cm, align=left}}{},
+  where level=2{node options={text width=10.0cm, align=left}}{},
+  [{DR for\\fluid ML}
+    [{Linear subspace\\{\normalfont(\S\ref{sec:linear})}}, draw=cblue, line width=0.8pt
+      [{POD/PCA, method of snapshots, randomized and streaming SVD}]
+      [{DMD, Koopman/EDMD, SPOD, balanced POD, resolvent, mPOD}]
+      [{Transport-adapted: shifted POD, registration, transported snapshots}]
+    ]
+    [{Sparse, clustered, local\\{\normalfont(\S\ref{sec:local})}}, draw=caqua, line width=0.8pt
+      [{Sparse coding, dictionary learning, compressed sensing}]
+      [{Clustered and local bases in state/parameter/time (local ROBs, cluster-based ROM)}]
+      [{Spatial localization: RB element, DD-ROM, DD-LSPG, GFEM enrichment, DLS}]
+    ]
+    [{Classical manifold\\learning {\normalfont(\S\ref{sec:manifold})}}, draw=corange, line width=0.8pt
+      [{Kernel PCA / kernel POD (pre-image problem)}]
+      [{Isomap, LLE, Laplacian eigenmaps, diffusion maps; t-SNE, UMAP}]
+      [{Polynomial and quadratic manifolds}]
+    ]
+    [{Neural autoencoders\\{\normalfont(\S\ref{sec:autoencoders})}}, draw=cviolet, line width=0.8pt
+      [{MLP and convolutional AEs, mode-decomposing and hierarchical AEs}]
+      [{VAE, $\beta$-VAE, VQ-VAE; rank-minimizing and dimension-discovering AEs}]
+      [{Physics-constrained AEs, manifold Galerkin/LSPG}]
+    ]
+    [{Mesh-agnostic and\\operator {\normalfont(\S\ref{sec:meshfree})}}, draw=cmagenta, line width=0.8pt
+      [{Graph autoencoders (multiscale, graph-convolutional)}]
+      [{Implicit neural representations (NIF, CROM, DINo, CORAL, AROMA)}]
+      [{Latent neural operators (PCA-Net, DeepONet, FNO, L-DeepONet, Transolver)}]
+    ]
+  ]
+\end{forest}
+\caption{Taxonomy of dimensionality reduction techniques used for machine learning
+in fluid dynamics, with the section in which each family is reviewed.}
+\label{fig:taxonomy}
+\end{figure}

@@ -524,6 +524,132 @@ class SpatialTransformer(nn.Module):
         return out
 
 
+## ================================ Diffusion Spatial Transformer ================================
+class DiffusionTimeEmbedding(nn.Module):
+    """Sinusoidal features of the diffusion time t in [0, 1], then a 2-layer MLP (as in DiT)."""
+    def __init__(self, d_model, freq_dim=256):
+        super().__init__()
+        half = freq_dim // 2
+        self.register_buffer('freqs', torch.exp(-math.log(10000.0) * torch.arange(half) / half))
+        self.mlp = nn.Sequential(nn.Linear(2 * half, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+
+    def forward(self, t):
+        ang = (1000.0 * t.float()).unsqueeze(-1) * self.freqs
+        return self.mlp(torch.cat([torch.cos(ang), torch.sin(ang)], dim=-1))
+
+
+def _modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class AdaLNBlock(nn.Module):
+    """Pre-norm transformer block whose norms are modulated by the time embedding (adaLN-Zero).
+
+    The shift, scale and residual gates come from the conditioning vector c and
+    start at zero, so every block starts as the identity (Peebles & Xie 2023).
+    x: (G, E, d_model), c: (G, d_model).
+    """
+    def __init__(self, d_model, nhead, ff_dim, activation='swiglu', dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        if activation == 'swiglu':
+            self.ffn = FFN_SwiGLU(d_model, ff_dim)
+        else:
+            act = nn.ReLU() if activation == 'relu' else nn.GELU()
+            self.ffn = nn.Sequential(nn.Linear(d_model, ff_dim), act, nn.Linear(ff_dim, d_model))
+        self.drop = nn.Dropout(dropout)
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model))
+        nn.init.zeros_(self.ada[1].weight)
+        nn.init.zeros_(self.ada[1].bias)
+
+    def forward(self, x, c):
+        sh1, sc1, g1, sh2, sc2, g2 = self.ada(c).chunk(6, dim=-1)
+        h = _modulate(self.norm1(x), sh1, sc1)
+        a, _ = self.attn(h, h, h, need_weights=False)
+        x = x + g1.unsqueeze(1) * self.drop(a)
+        x = x + g2.unsqueeze(1) * self.drop(self.ffn(_modulate(self.norm2(x), sh2, sc2)))
+        return x
+
+
+class _DiffusionCore(nn.Module):
+    def __init__(self, time_lag, input_dim, d_model, ff_dim, nhead, num_layers, activation,
+                 spatial_dim, num_freqs, dropout):
+        super().__init__()
+        # one token per element: its conditioning frames and its slice of the noisy increment
+        self.token_proj = nn.Linear(input_dim * (time_lag + 1), d_model)
+        self.coord_embed = CoordinateEmbedding(d_model, spatial_dim, num_freqs)
+        self.time_embed = DiffusionTimeEmbedding(d_model)
+        self.blocks = nn.ModuleList([
+            AdaLNBlock(d_model, nhead, ff_dim, activation, dropout) for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 2 * d_model))
+        self.fc = nn.Linear(d_model, input_dim)
+        for lin in (self.ada[1], self.fc):
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+
+    def forward(self, cond, z, t, coords):
+        G, E, tl, F_dim = cond.shape
+        x = self.token_proj(torch.cat([cond.reshape(G, E, tl * F_dim), z], dim=-1))
+        x = x + self.coord_embed(coords).unsqueeze(0)
+        c = self.time_embed(t)
+        for block in self.blocks:
+            x = block(x, c)
+        shift, scale = self.ada(c).chunk(2, dim=-1)
+        return self.fc(_modulate(self.norm(x), shift, scale))
+
+
+class DiffusionSpatialTransformer(nn.Module):
+    """Denoiser for the conditional diffusion model (lib/diffusion.py).
+
+    Spatial attention over the GFEM element tokens, as in SpatialTransformer,
+    with each token also carrying its slice of the noisy next-frame increment,
+    and every block conditioned on the diffusion time through adaLN-Zero.
+
+    cond: (G, E, time_lag, input_dim) normalized frames, z: (G, E, input_dim)
+    noisy increment, t: (G,) diffusion time, coords: (E, spatial_dim)
+    -> (G, E, input_dim) element-local v prediction.
+
+    With ema, an exponential moving average of the weights is kept as `ema` (no
+    gradients; updated by update_ema after each optimizer step) and is what
+    eval mode runs. It lives in the state dict, so checkpoints and the saved
+    model carry it.
+    """
+    def __init__(self, time_lag, input_dim, d_model=256, ff_dim=768, nhead=4, num_layers=4,
+                 activation='swiglu', spatial_dim=2, num_freqs=6, dropout=0.1, ema=True):
+        super().__init__()
+        self.net = _DiffusionCore(time_lag, input_dim, d_model, ff_dim, nhead, num_layers,
+                                  activation, spatial_dim, num_freqs, dropout)
+        self.ema = None
+        if ema:
+            import copy
+            self.ema = copy.deepcopy(self.net)
+            for p in self.ema.parameters():
+                p.requires_grad_(False)
+            self.register_buffer('ema_steps', torch.zeros((), dtype=torch.long))
+
+    def forward(self, cond, z, t, coords):
+        net = self.ema if (self.ema is not None and not self.training) else self.net
+        return net(cond, z, t, coords)
+
+    @torch.no_grad()
+    def update_ema(self, decay):
+        if self.ema is None:
+            return
+        # warm-up: early on the average follows the weights closely. decay 0
+        # keeps the copy equal to the weights, so eval mode runs them unaveraged
+        n = int(self.ema_steps)
+        d = 0.0 if decay <= 0 else min(decay, (1 + n) / (10 + n))
+        for pe, p in zip(self.ema.parameters(), self.net.parameters()):
+            pe.lerp_(p, 1.0 - d)
+        for be, b in zip(self.ema.buffers(), self.net.buffers()):
+            be.copy_(b)
+        self.ema_steps += 1
+
+
 ## ====================================== LSTM Model ============================================
 class LSTMModel(nn.Module):
     def __init__(self, time_lag, input_dim, hidden_dim=256, num_layers=2, batch_size = 256):

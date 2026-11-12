@@ -93,6 +93,51 @@ class EnergyMatchLoss(nn.Module):
         return f"eps={self.eps}"
 
 
+class FrameEnergyLoss(nn.Module):
+    """Squared mismatch of the whole-frame field norm, (|pred| - |target|)^2, in MSE units.
+
+    For one frame, with E = |pred|^2/|target|^2 and c the pattern correlation,
+    NMSE = 1 + E - 2 c sqrt(E) exactly. Adding beta (sqrt(E) - 1)^2 to the NMSE
+    moves the per-frame optimum at fixed c from sqrt(E) = c (the conditional
+    mean) to sqrt(E) = (c + beta) / (1 + beta), so beta walks the forecast along
+    the error-energy tradeoff (docs/tradeoff_study.md). Dividing by the
+    per-sample element count puts the term in the units of nn.MSELoss, so
+    mse + beta * frame_energy equals |target|^2 / n * [NMSE + beta (sqrt(E) - 1)^2]
+    frame by frame and the analytic reference holds for the combined loss.
+
+    Unlike EnergyMatchLoss (traj_energy), which matches each token's energy in
+    L1, this scores one norm per sample over every non-batch axis, so energy may
+    move between elements.
+
+    metric='field' (default): under loss_metric 'gram', apply_metric scores this
+    term in pure field energy (gram_lambda 0, the loss metric's scale) while the
+    other terms keep the regularized metric. metric='loss' scores it in the
+    regularized metric like the rest, which at the default gram_lambda 1e-2 is
+    mostly ridge (lib/decode.py); the term then inflates the visible field
+    instead (cavity, beta 1: 1.8x the true energy). Runs before 2026-11-11 used
+    'loss'.
+    """
+
+    def __init__(self, eps: float = 1e-12, metric: str = 'field'):
+        super(FrameEnergyLoss, self).__init__()
+        if metric not in ('field', 'loss'):
+            raise ValueError(f"frame_energy metric '{metric}' not recognized. Use 'field' or 'loss'.")
+        self.eps = eps
+        self.metric = metric
+
+    def forward(self, pred, target):
+        pred = pred.float()
+        target = target.float()
+        dims = tuple(range(1, pred.dim()))
+        n = pred[0].numel()
+        norm_p = (pred.pow(2).sum(dim=dims) + self.eps).sqrt()
+        norm_t = (target.pow(2).sum(dim=dims) + self.eps).sqrt()
+        return (norm_p - norm_t).pow(2).mean() / n
+
+    def extra_repr(self):
+        return f"eps={self.eps}, metric={self.metric}"
+
+
 class VarianceMatchLoss(nn.Module):
     """Relative error in per-feature standard deviation.
 
@@ -258,6 +303,11 @@ class MetricLoss(nn.Module):
         return fn(self.metric(pred), self.metric(target))
 
     @property
+    def deferred(self):
+        """A wrapped trajectory term stays deferred inside a CombinedLoss."""
+        return getattr(self.base, 'deferred', False)
+
+    @property
     def last_terms(self):
         return getattr(self.base, 'last_terms', None)
 
@@ -269,12 +319,37 @@ class MetricLoss(nn.Module):
         return 'metric=field_energy'
 
 
+def _wants_field(term) -> bool:
+    return isinstance(term, FrameEnergyLoss) and term.metric == 'field'
+
+
+def wants_field_metric(criterion) -> bool:
+    """True if any term asks to be scored in pure field energy."""
+    return any(_wants_field(m) for m in criterion.modules())
+
+
+def apply_metric(criterion, metric, field_metric=None):
+    """Wrap a criterion in the loss metric.
+
+    Terms that ask for field energy (frame_energy with metric='field') get
+    field_metric instead; every other term keeps `metric`. Without such terms
+    this is MetricLoss(criterion, metric), unchanged.
+    """
+    if field_metric is None or not wants_field_metric(criterion):
+        return MetricLoss(criterion, metric)
+    if isinstance(criterion, CombinedLoss):
+        criterion.terms = nn.ModuleList(
+            [MetricLoss(t, field_metric if _wants_field(t) else metric) for t in criterion.terms])
+        return criterion
+    return MetricLoss(criterion, field_metric)
+
+
 # Short labels for the per-term columns of the training table, so a combo loss
 # does not push the epoch line past a terminal width.
 TERM_ABBREV = {
     'mse': 'mse', 'l2': 'mse', 'mae': 'mae', 'l1': 'mae', 'huber': 'hub',
     'smooth_l1': 'sl1', 'logcosh': 'lch', 'rel_l2': 'rl2',
-    'traj_energy': 'nrg', 'traj_var': 'var', 'traj_dt': 'dt',
+    'traj_energy': 'nrg', 'traj_var': 'var', 'traj_dt': 'dt', 'frame_energy': 'fen',
 }
 
 
@@ -299,6 +374,8 @@ def _build_simple(loss_type: str, params: dict) -> nn.Module:
         return RelativeL2Loss(eps=params.get('eps', 1e-8))
     elif loss_type == 'traj_energy':
         return EnergyMatchLoss(eps=params.get('eps', 1e-8))
+    elif loss_type == 'frame_energy':
+        return FrameEnergyLoss(eps=params.get('eps', 1e-12), metric=params.get('metric', 'field'))
     elif loss_type == 'traj_dt':
         return IncrementMatchLoss(base=params.get('base', 'mse'),
                                   eps=params.get('eps', 1e-8),
@@ -309,7 +386,7 @@ def _build_simple(loss_type: str, params: dict) -> nn.Module:
     else:
         raise ValueError(
             f"Loss '{loss_type}' not recognized. Use 'mse', 'mae', 'huber', "
-            "'smooth_l1', 'logcosh', 'rel_l2', 'traj_energy', 'traj_var', "
+            "'smooth_l1', 'logcosh', 'rel_l2', 'traj_energy', 'traj_var', 'frame_energy', "
             "'traj_dt', or 'combo'."
         )
 

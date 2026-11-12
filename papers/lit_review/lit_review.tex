@@ -1,0 +1,141 @@
+\documentclass[11pt]{article}
+
+% ---------------------------------------------------------------- packages
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{graphicx}
+\usepackage{booktabs,tabularx,multirow,array,makecell}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit,calc,backgrounds}
+\usepackage[edges]{forest}
+\usepackage[
+  backend=biber,
+  style=authoryear-comp,
+  maxcitenames=2,
+  mincitenames=1,
+  maxbibnames=8,
+  minbibnames=6,
+  uniquelist=false,
+  uniquename=false,
+  giveninits=true,
+  doi=true,
+  url=false,
+  isbn=false,
+  eprint=true,
+  dashed=false,
+  sorting=nyt
+]{biblatex}
+\addbibresource{references.bib}
+\DeclareFieldFormat[article,inproceedings,incollection,misc]{title}{#1}
+\renewbibmacro{in:}{\ifentrytype{article}{}{\printtext{\bibstring{in}\intitlepunct}}}
+\usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}
+\usepackage[capitalise,nameinlink]{cleveref}
+
+% ------------------------------------------------------------------ colors
+% Categorical slots shared with the Python figures (code/style.py).
+\definecolor{linkblue}{HTML}{1C5CAB}
+\definecolor{cblue}{HTML}{2A78D6}
+\definecolor{corange}{HTML}{EB6834}
+\definecolor{caqua}{HTML}{1BAF7A}
+\definecolor{cviolet}{HTML}{4A3AA7}
+\definecolor{cmagenta}{HTML}{E87BA4}
+\definecolor{cink}{HTML}{0B0B0B}
+\definecolor{cink2}{HTML}{52514E}
+\definecolor{cneutral}{HTML}{F0EFEC}
+
+% ------------------------------------------------------------ float setup
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.75}
+\setcounter{topnumber}{3}
+\setcounter{totalnumber}{4}
+\setlength{\emergencystretch}{1.5em}
+
+% ---------------------------------------------------------------- notation
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\q}{\bm{q}}
+\newcommand{\z}{\bm{z}}
+\newcommand{\X}{\bm{X}}
+\newcommand{\W}{\bm{W}}
+\newcommand{\Phib}{\bm{\Phi}}
+\newcommand{\enc}{\mathcal{E}}
+\newcommand{\dec}{\mathcal{D}}
+\newcommand{\M}{\mathcal{M}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\spn}{span}
+
+\title{\textbf{Dimensionality Reduction for Machine Learning\\ in Fluid Dynamics: A Review}}
+\author{Caleb A. Morton\\[2pt]
+  \small Department of Mechanical \& Aerospace Engineering, The Ohio State University}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+High-fidelity simulations and time-resolved measurements of fluid flows produce
+state vectors with $10^{5}$--$10^{9}$ degrees of freedom, yet the dynamics they
+record are often confined to far fewer effective coordinates. Nearly every
+machine-learning model of a fluid system therefore begins by compressing the flow
+into a low-dimensional representation, and the choice of that representation
+limits what the downstream model can learn. This review surveys dimensionality
+reduction from a fluid-dynamics perspective, covering four families.
+Linear modal decompositions include proper orthogonal decomposition, dynamic
+mode decomposition, and their spectral and balanced variants.
+Sparse, clustered, and spatially localized representations include domain
+decomposition, generalized finite element enrichment, and data-informed local
+subspaces. Nonlinear manifold learning is covered in both its kernel and graph
+forms and its neural-network form: autoencoders, variational autoencoders, graph
+autoencoders, and implicit neural representations. The last family is
+operator-learning architectures whose latent spaces play the same role. For
+each family we summarize the mathematical formulation, the properties that
+matter for learning dynamics, and representative fluid applications. We then
+examine how reduced coordinates are coupled to learned dynamics, including
+Galerkin and operator-inference models, sparse regression, Koopman embeddings,
+recurrent and attention-based sequence models, and latent generative models. We
+also discuss what makes a latent space good for forecasting rather than
+reconstruction alone. Computed examples on a lid-driven cavity at
+$\mathrm{Re}=15{,}000$ and on canonical transport problems illustrate the main
+trade-offs, including the Kolmogorov $n$-width barrier, the accuracy ceiling of
+learned nonlinear decoders, and the effect of spatial localization. We close
+with a comparative assessment, recommendations on baselines and metrics, and
+open challenges for high-Reynolds-number, three-dimensional, and
+parametrically varying flows.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\input{sections/01_introduction}
+\input{sections/02_formulation}
+\input{sections/03_linear}
+\input{sections/04_local}
+\input{sections/05_manifold}
+\input{sections/06_autoencoders}
+\input{sections/07_meshfree}
+\input{sections/08_dynamics}
+\input{sections/09_assessment}
+\input{sections/10_outlook}
+
+\section*{Reproducibility of figures}
+\addcontentsline{toc}{section}{Reproducibility of figures}
+All computed figures were generated by the scripts in \texttt{code/}.
+\Cref{fig:ldc_pod,fig:dls_compare,fig:dls_recon} use the $\mathrm{Re}=15{,}000$
+lid-driven cavity dataset (\texttt{ldc\_15k.h5}) and, for the DLS results, the
+project implementation of the generalized finite element compressor
+(\texttt{lib/dls\_2d.py}).
+\Cref{fig:nwidth,fig:ae_vs_pod} are self-contained one-dimensional experiments.
+The bibliography was checked against the Crossref and DataCite registries
+(\texttt{code/verify\_bib.py}).
+
+\printbibliography[heading=bibintoc,title={References}]
+
+\end{document}
